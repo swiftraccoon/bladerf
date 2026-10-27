@@ -399,9 +399,18 @@ pub(crate) fn capture(args: CaptureArgs) -> Result<()> {
             "Untimestamped SC16_Q11 output does not certify absence of dropped samples".into(),
         receive_api: "Rust soapysdr -> SoapyBladeRF -> libbladeRF".into(),
     };
-    let mut stream = device.rx_stream::<Complex<i16>>(&[args.radio.index()])?;
     let mut buffer = vec![Complex::new(0i16, 0); CHUNK_SAMPLES];
     let mut encoded = Vec::with_capacity(CHUNK_SAMPLES * 4);
+    // SoapyBladeRF enables RX during setupStream, before activate. Its default
+    // 32 x 4096 samples allow only 6.6 ms at 20 MSps for startup and scheduling.
+    // Reserve 8 MiB of native buffering; this absorbs brief stalls without
+    // converting overflow into silently discontinuous successful output.
+    let mut stream_args = soapysdr::Args::new();
+    stream_args.set("buffers", "128");
+    stream_args.set("buflen", "16384");
+    stream_args.set("transfers", "32");
+    let mut stream =
+        device.rx_stream_args::<Complex<i16>, _>(&[args.radio.index()], stream_args)?;
     let deadline = Instant::now() + Duration::from_secs_f64(duration.0 + 15.0);
     with_active_stream(&mut stream, |stream| {
         settings.gain_db = device.gain(Rx, args.radio.index())?;

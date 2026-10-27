@@ -1,0 +1,285 @@
+diff --git a/examples/wlan/Cargo.toml b/examples/wlan/Cargo.toml
+index f49c044a..36d504c9 100644
+--- a/examples/wlan/Cargo.toml
++++ b/examples/wlan/Cargo.toml
+@@ -2,7 +2,7 @@
+ name = "wlan"
+ version = "0.1.0"
+ edition = "2024"
+-default-run = "loopback"
++default-run = "rx"
+ 
+ [workspace]
+ 
+@@ -26,8 +26,9 @@ soapy = ["futuresdr/soapy"]
+ [dependencies]
+ anyhow = "1.0"
+ clap = { version = "4", features = ["derive"] }
++ctrlc = { version = "3.5", features = ["termination"] }
+ crc32fast = "1.5"
+-futuresdr = { path = "../..", features = ["seify"] }
++futuresdr = { path = "../..", default-features = false, features = ["seify", "tracing_release_max_level_info"] }
+ rand = "0.10"
+ rand_distr = "0.6"
+ 
+diff --git a/examples/wlan/src/bin/rx.rs b/examples/wlan/src/bin/rx.rs
+index 2f5e5b48..c2d6e8d8 100644
+--- a/examples/wlan/src/bin/rx.rs
++++ b/examples/wlan/src/bin/rx.rs
+@@ -3,11 +3,15 @@ use futuresdr::blocks::Apply;
+ use futuresdr::blocks::Combine;
+ use futuresdr::blocks::Delay;
+ use futuresdr::blocks::Fft;
+-use futuresdr::blocks::MessagePipe;
+-use futuresdr::blocks::WebsocketPmtSink;
+ use futuresdr::blocks::seify::Builder;
++use futuresdr::futures::future::{Either, select};
+ use futuresdr::prelude::*;
++use futuresdr::runtime::Timer;
++use futuresdr::seify::Args as DeviceArgs;
+ use futuresdr::seify::DynDevice;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::Duration;
+ 
+ use wlan::DcRemoval;
+ use wlan::Decoder;
+@@ -23,6 +27,12 @@ struct Args {
+     /// Antenna
+     #[clap(long)]
+     antenna: Option<String>,
++    /// Receive channel: 0 for RX1, 1 for RX2.
++    #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1))]
++    rx_channel: u32,
++    /// Local UDP destination for complete MPDUs including the received FCS.
++    #[clap(long, default_value_t = 55555, value_parser = clap::value_parser!(u16).range(1..))]
++    udp_port: u16,
+     /// Seify Args
+     #[clap(short, long)]
+     args: Option<String>,
+@@ -40,22 +50,91 @@ struct Args {
+ fn main() -> Result<()> {
+     let args = Args::parse();
+     println!("Configuration: {args:?}");
+-
+-    let rt = Runtime::new();
+-    let mut fg = Flowgraph::new();
+-
+-    let dev = DynDevice::from_args(args.args)?;
+-    let software_dc = match dev.rx(0)?.dc_offset().enable() {
++    let interrupted = Arc::new(AtomicBool::new(false));
++    let signal_flag = Arc::clone(&interrupted);
++    ctrlc::set_handler(move || signal_flag.store(true, Ordering::Relaxed))?;
++
++    anyhow::ensure!(
++        args.sample_rate == 20e6,
++        "this passive receiver requires 20 MSps"
++    );
++    anyhow::ensure!(
++        args.gain.is_finite() && args.gain >= 0.0,
++        "gain must be finite and nonnegative"
++    );
++    let mut device_args: DeviceArgs = args
++        .args
++        .as_deref()
++        .unwrap_or("driver=soapy,soapy_driver=bladerf")
++        .parse()?;
++    anyhow::ensure!(
++        device_args.get::<String>("driver")? == "soapy"
++            && device_args.get::<String>("soapy_driver")? == "bladerf",
++        "this passive profile requires driver=soapy,soapy_driver=bladerf"
++    );
++    for (key, _) in device_args.iter() {
++        anyhow::ensure!(
++            matches!(
++                key.as_str(),
++                "driver" | "soapy_driver" | "serial" | "instance" | "biastee_rx"
++            ),
++            "unsupported passive device argument: {key}"
++        );
++    }
++    // SoapyBladeRF applies this error-checked setting on the same native handle.
++    device_args.set("biastee_rx", "false");
++    device_args.set("loopback", "none");
++    let channel = args.rx_channel as usize;
++    let antenna = if channel == 0 { "RX1" } else { "RX2" };
++    if let Some(selected) = &args.antenna {
++        anyhow::ensure!(
++            selected.eq_ignore_ascii_case(antenna),
++            "antenna must match receive channel"
++        );
++    }
++
++    let dev = DynDevice::from_args(device_args)?;
++    dev.rx(channel)?.agc().disable()?;
++    let software_dc = match dev.rx(channel)?.dc_offset().enable() {
+         Ok(()) => false,
+         Err(error) if error.is_unsupported() => true,
+         Err(error) => return Err(error.into()),
+     };
+-    let src = Builder::from_dyn_device(dev)
++    let src = Builder::from_dyn_device(dev.clone())
++        .channel(channel)
+         .frequency(args.channel)
+         .sample_rate(args.sample_rate)
++        .bandwidth(args.sample_rate)
+         .gain(args.gain)
+-        .antenna(args.antenna)
+-        .build_source()?;
++        .antenna(antenna)
++        .build_source()?
++        .with_stream_args("buffers=128,buflen=16384,transfers=32".parse()?);
++    let actual_rate = dev.rx(channel)?.sample_rate().value()?;
++    anyhow::ensure!(
++        (actual_rate - args.sample_rate).abs() <= 1.0,
++        "sample rate readback mismatch"
++    );
++    let actual_frequency = dev.rx(channel)?.frequency().value()?;
++    anyhow::ensure!(
++        (actual_frequency - args.channel).abs() <= 1.0,
++        "frequency readback mismatch"
++    );
++    anyhow::ensure!(
++        dev.rx(channel)?.gain().range()?.contains(args.gain),
++        "gain is outside the device's receive range"
++    );
++    let actual_gain = dev.rx(channel)?.gain().value()?;
++    anyhow::ensure!(
++        actual_gain.is_some_and(|gain| (gain - args.gain).abs() <= 0.01),
++        "gain readback mismatch"
++    );
++    anyhow::ensure!(
++        !interrupted.load(Ordering::Relaxed),
++        "receiver interrupted during configuration"
++    );
++
++    let rt = Runtime::new();
++    let mut fg = Flowgraph::new();
+ 
+     connect!(fg, src);
+ 
+@@ -103,29 +182,31 @@ fn main() -> Result<()> {
+     // fft.set_tag_propagation(Box::new(copy_tag_propagation));
+     let frame_equalizer: FrameEqualizer = FrameEqualizer::new();
+     let decoder = Decoder::new();
+-    let symbol_sink = WebsocketPmtSink::new(9002);
+-    connect!(fg, sync_long > fft > frame_equalizer > decoder;
+-        frame_equalizer.symbols | r#in.symbol_sink);
+-
+-    let (tx_frame, rx_frame) = mpsc::channel::<Pmt>(100);
+-    let message_pipe = MessagePipe::new(tx_frame);
+-    let udp1 = futuresdr::blocks::BlobToUdp::new("127.0.0.1:55555");
+-    let udp2 = futuresdr::blocks::BlobToUdp::new("127.0.0.1:55556");
+-    connect!(fg, decoder.rx_frames | message_pipe;
+-                 decoder.rx_frames | udp1;
+-                 decoder.rftap | udp2);
+-
+-    let _running = rt.start(fg)?;
++    connect!(fg, sync_long > fft > frame_equalizer > decoder);
++
++    let udp1 = futuresdr::blocks::BlobToUdp::new(format!("127.0.0.1:{}", args.udp_port));
++    connect!(fg, decoder.rx_frames | udp1);
++
++    let running = rt.start(fg)?;
++    let handle = running.handle();
+     futuresdr::runtime::block_on(async move {
+-        while let Some(x) = rx_frame.recv().await {
+-            match x {
+-                Pmt::Blob(data) => {
+-                    println!("received frame ({:?} bytes)", data.len());
+-                }
+-                _ => break,
++        let stop = async move {
++            while !interrupted.load(Ordering::Relaxed) {
++                Timer::after(Duration::from_millis(25)).await;
++            }
++            handle.stop_and_wait().await
++        };
++        match select(Box::pin(stop), Box::pin(running.wait_async())).await {
++            Either::Left((stopped, completion)) => {
++                stopped?;
++                completion.await?;
++            }
++            Either::Right((completed, _)) => {
++                completed?;
+             }
+         }
+-    });
++        Ok::<(), futuresdr::runtime::Error>(())
++    })?;
+ 
+     Ok(())
+ }
+diff --git a/examples/wlan/src/decoder.rs b/examples/wlan/src/decoder.rs
+index 76b0e466..48ebe95b 100644
+--- a/examples/wlan/src/decoder.rs
++++ b/examples/wlan/src/decoder.rs
+@@ -157,7 +157,9 @@ where
+                 //     warn!("decoder: previous frame not complete, canceling.");
+                 // }
+                 let frame_param = any.downcast_ref::<FrameParam>().unwrap();
+-                if frame_param.n_symbols() <= MAX_SYM && frame_param.psdu_size() <= MAX_PSDU_SIZE {
++                if frame_param.n_symbols() <= MAX_SYM
++                    && (4..=MAX_PSDU_SIZE).contains(&frame_param.psdu_size())
++                {
+                     self.frame_param = frame_param.clone();
+                     self.copied = 0;
+                     self.frame_complete = false;
+@@ -196,8 +198,9 @@ where
+                     //     "decoded: {:?}",
+                     //     &self.out_bytes[0..self.frame_param.psdu_size() + 2]
+                     // );
+-                    let mut blob = vec![0; self.frame_param.psdu_size() - 4];
+-                    blob.copy_from_slice(&self.out_bytes[2..self.frame_param.psdu_size() - 2]);
++                    // Preserve the received FCS for independent verification downstream.
++                    let mut blob = vec![0; self.frame_param.psdu_size()];
++                    blob.copy_from_slice(&self.out_bytes[2..self.frame_param.psdu_size() + 2]);
+ 
+                     let mut rftap = vec![0; blob.len() + 12];
+                     rftap[0..4].copy_from_slice("RFta".as_bytes());
+diff --git a/src/blocks/seify/source.rs b/src/blocks/seify/source.rs
+index 1e8caf2d..133338c7 100644
+--- a/src/blocks/seify/source.rs
++++ b/src/blocks/seify/source.rs
+@@ -79,6 +79,7 @@ where
+     dev: Device<D>,
+     ctrl: DynDevice,
+     streamer: Option<D::RxStreamer>,
++    stream_args: seify::Args,
+     start_time: Option<i64>,
+     overflows: u64,
+ }
+@@ -108,10 +109,21 @@ where
+             ctrl,
+             start_time,
+             streamer: None,
++            stream_args: seify::Args::new(),
+             overflows: 0,
+         }
+     }
+ 
++    /// Set backend-specific RX stream arguments, applied before stream activation.
++    ///
++    /// These arguments configure the stream separately from device selection.
++    /// Argument interpretation depends on the backend. Stream creation errors
++    /// propagate during flowgraph startup.
++    pub fn with_stream_args(mut self, args: seify::Args) -> Self {
++        self.stream_args = args;
++        self
++    }
++
+     /// Clock changes can require stopping RX, while keeping the flowgraph alive.
+     fn apply_rate_config(&mut self, config: &Config) -> Result<Pmt> {
+         let streamer = self
+@@ -336,7 +348,10 @@ where
+     }
+ 
+     async fn init(&mut self, _mo: &mut MessageOutputs, _meta: &BlockMeta) -> Result<()> {
+-        self.streamer = Some(self.dev.rx_streamer(&self.channels)?);
++        self.streamer = Some(
++            self.dev
++                .rx_streamer_with_args(&self.channels, self.stream_args.clone())?,
++        );
+         self.streamer
+             .as_mut()
+             .context("no stream")?

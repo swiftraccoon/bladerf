@@ -13,7 +13,7 @@ The root `Cargo.toml` is a virtual workspace. Its default member,
 and GNU Radio flowgraphs.
 [`tools/bladerf-docs`](tools/bladerf-docs) validates the source-qualified fact
 catalog and reproduces its handbook reference without radio dependencies. The
-toolchain, `Cargo.lock`, native source checkouts, patches, and image hashes stay
+toolchain, `Cargo.lock`, upstream source checkouts, patches, and image hashes stay
 at the repository root. Cargo build output remains under root `target/`.
 See the [tool's own guide](tools/bladerf-lab/README.md) for its commands and
 component documentation.
@@ -27,6 +27,14 @@ The [Bluetooth monitor](projects/bluetooth-monitor) provides passive BLE and
 Classic Bluetooth capture, Wireshark-compatible files, decoded JSON records,
 and independent BLE CRC validation. Its guide describes decoder setup, receive
 connector selection, coverage limits and offline inspection.
+
+The [Wi-Fi monitor](projects/wifi-monitor) records bounded IQ captures and
+decodes legacy OFDM, DSSS/CCK and single-stream HT20. It preserves source IQ,
+writes Wireshark-compatible frames and JSON records, and independently checks
+the received FCS. An optional live engine covers legacy OFDM. Its guide explains
+the two workflows, decoder limits and replaying saved IQ.
+Channel surveys, saved-PCAP inventories and repeated captures aggregate
+observations while recording gaps and managing local retention.
 
 ## Use it
 
@@ -82,11 +90,14 @@ example has bias tees off, preserves the factory oscillator trim, and starts at
 | [repos/gr-bladeRF](repos/gr-bladeRF) | GNU Radio source/sink blocks and examples | Pinned Git commit plus [compatibility patch](patches/gr-bladeRF-fedora.patch) |
 | [repos/blue-dragon](repos/blue-dragon) | Rust BLE and Classic Bluetooth decoder | Pinned Git commit plus [RX setup patch](patches/blue-dragon-bladerf-rx-setup.patch) |
 | [repos/ice9-bluetooth-sniffer](repos/ice9-bluetooth-sniffer) | Optional BLE 1M reference decoder | Pinned Git commit plus [RX bias patch](patches/ice9-bluetooth-bladerf-rx-bias.patch) |
+| [repos/libcrafter](repos/libcrafter) | Rust Wi-Fi PHY library for bounded IQ replay | `crafter` 0.3.5 at [`f9ef000bc402`](https://github.com/pellegre/libcrafter/tree/f9ef000bc402eebc676f6b4708395aa8ac169450) |
+| [repos/FutureSDR](repos/FutureSDR) | Optional Rust live legacy OFDM receiver | [`42832f5473ec`](https://github.com/FutureSDR/FutureSDR/tree/42832f5473ec19ce641c58a4792befdc57945ff5) plus [passive RX/FCS patch](patches/futuresdr-wlan-passive-rx.patch) |
 
 These are Git submodules. Clone with `--recurse-submodules`, or run
 `git submodule update --init --recursive` in an existing checkout. Rust host setup
 applies the saved gr-bladeRF patch; that submodule reports intentional local
-modifications. The Bluetooth project guide covers its decoder patches and builds.
+modifications. The monitoring project guides cover their additional decoder
+patches and builds.
 
 ## Host setup and validation
 

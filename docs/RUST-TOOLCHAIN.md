@@ -8,8 +8,8 @@ the dependency resolution in [Cargo.lock](../Cargo.lock).
 The root [Cargo.toml](../Cargo.toml) is a virtual workspace with resolver 3,
 shared build profiles and a shared `target/` directory. Its default member is
 [`bladerf-lab`](../tools/bladerf-lab/README.md). Select an explicit package with
-`-p bladerf-lab`, `-p bladerf-docs` or `-p bluetooth-monitor`; use `--workspace`
-for all members.
+`-p bladerf-lab`, `-p bladerf-docs`, `-p bluetooth-monitor` or `-p wifi-monitor`;
+use `--workspace` for all members.
 
 ## Lab tool features and native libraries
 
@@ -71,3 +71,39 @@ same toolchain and lockfile. PCAP inspection has no native SDR prerequisite;
 live reception launches a separately built decoder. The project guide specifies
 the pinned decoder sources, compatibility patches and upstream lockfile needed
 for that build.
+
+## Wi-Fi monitor
+
+[`wifi-monitor`](../projects/wifi-monitor/README.md) uses the same stable
+toolchain and root lockfile. Its default `decode` feature enables the pinned
+`crafter` dependency's `radio` feature for offline legacy OFDM, DSSS/CCK and
+single-stream HT20 decoding. The dependency requires the platform's **libpcap
+development/link library**, even though this project feeds it saved IQ rather
+than a libpcap device. The dependency specifies an exact Git revision, matching
+the [libcrafter submodule](../repos/libcrafter); the submodule retains the source
+and independent waveform fixtures for review and upstream tests.
+
+```sh
+cargo build --locked -p wifi-monitor --release
+```
+
+Without `decode`, PCAP inspection and the optional live engine's orchestration
+do not compile or link libcrafter. Bounded IQ acquisition/replay requires
+`decode`. Native IQ capture launches the separately built `bladerf-lab` binary
+with its `radio` feature and the receive stack described above.
+
+```sh
+cargo build --locked -p wifi-monitor --no-default-features --release
+```
+
+The optional FutureSDR WLAN receiver is a separate upstream workspace requiring
+**nightly-2026-10-27**. That requirement is scoped to its native receiver build;
+the maintained Wi-Fi application and other workspace packages remain on stable.
+Its reproducibility inputs are
+[the separate toolchain selection](../config/wifi-decoder-toolchain.toml),
+[upstream dependency lock](../config/wifi-decoder.Cargo.lock),
+[pinned submodule](../repos/FutureSDR) and
+[passive receive/FCS patch](../patches/futuresdr-wlan-passive-rx.patch).
+Build it with explicit `--bin rx` and the `soapy` feature, using the
+[project instructions](../projects/wifi-monitor/README.md#build-the-optional-live-engine).
+Runtime reception requires SoapySDR, SoapyBladeRF and libbladeRF.

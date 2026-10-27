@@ -16,3 +16,9 @@
 [submodule "repos/blue-dragon"]
 	path = repos/blue-dragon
 	url = https://github.com/alphafox02/blue-dragon.git
+[submodule "repos/FutureSDR"]
+	path = repos/FutureSDR
+	url = https://github.com/FutureSDR/FutureSDR.git
+[submodule "repos/libcrafter"]
+	path = repos/libcrafter
+	url = https://github.com/pellegre/libcrafter.git
