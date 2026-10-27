@@ -1,0 +1,17 @@
+[workspace]
+default-members = ["tools/bladerf-lab"]
+members = ["tools/bladerf-docs", "tools/bladerf-lab"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
+rust-version = "1.99.1"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+debug = false
+lto = "thin"
+strip = "debuginfo"

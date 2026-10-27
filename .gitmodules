@@ -1,0 +1,12 @@
+[submodule "repos/bladeRF"]
+	path = repos/bladeRF
+	url = https://github.com/Nuand/bladeRF.git
+[submodule "repos/bladeRF-wiki"]
+	path = repos/bladeRF-wiki
+	url = https://github.com/Nuand/bladeRF.wiki.git
+[submodule "repos/SoapyBladeRF"]
+	path = repos/SoapyBladeRF
+	url = https://github.com/pothosware/SoapyBladeRF.git
+[submodule "repos/gr-bladeRF"]
+	path = repos/gr-bladeRF
+	url = https://github.com/Nuand/gr-bladeRF.git

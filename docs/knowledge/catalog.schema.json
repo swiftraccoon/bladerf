@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bladerf:knowledge:catalog:2",
+  "title": "Source-qualified bladeRF documentation catalog",
+  "description": "Reference records, not operational configuration validation or live device capabilities.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "purpose", "sources", "claims", "issues"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "purpose": {"const": "reference_only"},
+    "sources": {"type": "array", "minItems": 1, "maxItems": 500, "items": {"$ref": "#/$defs/source"}},
+    "claims": {"type": "array", "minItems": 1, "maxItems": 5000, "items": {"$ref": "#/$defs/claim"}},
+    "issues": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/issue"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,119}$"},
+    "text": {"type": "string", "minLength": 1, "maxLength": 3000, "pattern": "^[^\\r\\n]+$"},
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "https": {"type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2000},
+    "strings": {"type": "array", "maxItems": 40, "uniqueItems": true, "items": {"$ref": "#/$defs/text"}},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "title", "publisher", "revision", "url", "sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["pdf", "source_code", "web_page"]},
+        "title": {"$ref": "#/$defs/text"},
+        "publisher": {"$ref": "#/$defs/text"},
+        "revision": {"$ref": "#/$defs/text"},
+        "url": {"$ref": "#/$defs/https"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "page_count": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "pdf"}}}, "then": {"required": ["page_count"]}},
+        {"if": {"properties": {"kind": {"const": "source_code"}}}, "then": {"required": ["commit"]}}
+      ]
+    },
+    "unit": {"enum": ["Hz", "samples/s", "bytes", "bits", "mV", "dB", "dBm", "ohm", "component_counts", "count"]},
+    "value": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind", "value", "unit"], "properties": {"kind": {"const": "integer"}, "value": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}, "unit": {"$ref": "#/$defs/unit"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "minimum", "maximum", "unit"], "properties": {"kind": {"const": "integer_range"}, "minimum": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}, "maximum": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}, "unit": {"$ref": "#/$defs/unit"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": {"kind": {"const": "text"}, "value": {"$ref": "#/$defs/text"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": {"kind": {"const": "boolean"}, "value": {"type": "boolean"}}}
+      ]
+    },
+    "scope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["board_family", "fpga_variants", "pcb_revisions", "software", "mode"],
+      "properties": {
+        "board_family": {"const": "bladeRF 2.0 micro"},
+        "fpga_variants": {"$ref": "#/$defs/strings"},
+        "pcb_revisions": {"$ref": "#/$defs/strings"},
+        "software": {"type": "object", "maxProperties": 20, "additionalProperties": {"$ref": "#/$defs/text"}},
+        "mode": {"$ref": "#/$defs/id"}
+      }
+    },
+    "locator": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind", "page", "printed_label"], "properties": {"kind": {"const": "pdf_page"}, "page": {"type": "integer", "minimum": 1}, "printed_label": {"$ref": "#/$defs/text"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "symbol"], "properties": {"kind": {"const": "symbol"}, "symbol": {"$ref": "#/$defs/text"}, "fragment": {"type": "string", "pattern": "^L[0-9]+(-L[0-9]+)?$"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "section"], "properties": {"kind": {"const": "section"}, "section": {"$ref": "#/$defs/text"}, "fragment": {"type": "string", "pattern": "^[a-zA-Z0-9_.:-]+$", "maxLength": 200}}}
+      ]
+    },
+    "evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_id", "locator"],
+      "properties": {"source_id": {"$ref": "#/$defs/id"}, "locator": {"$ref": "#/$defs/locator"}}
+    },
+    "review": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "method"],
+      "properties": {
+        "status": {"enum": ["source_checked", "transcription_checked", "conflicted"]},
+        "method": {"enum": ["agent_assisted", "human", "automated"]}
+      }
+    },
+    "claim": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "statement", "property", "value", "scope", "conditions", "evidence_kind", "evidence", "review"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "title": {"$ref": "#/$defs/text"}, "statement": {"$ref": "#/$defs/text"},
+        "property": {"$ref": "#/$defs/id"}, "value": {"$ref": "#/$defs/value"}, "scope": {"$ref": "#/$defs/scope"},
+        "conditions": {"allOf": [{"$ref": "#/$defs/strings"}], "minItems": 1},
+        "evidence_kind": {"enum": ["pinned_implementation", "manufacturer_specification", "schematic", "derived"]},
+        "evidence": {"type": "array", "minItems": 1, "maxItems": 20, "items": {"$ref": "#/$defs/evidence"}},
+        "review": {"$ref": "#/$defs/review"}, "derivation": {"$ref": "#/$defs/text"}
+      },
+      "allOf": [{"if": {"properties": {"evidence_kind": {"const": "derived"}}}, "then": {"required": ["derivation"]}}]
+    },
+    "issue": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "title", "kind", "status", "summary", "claim_ids", "source_ids"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "title": {"$ref": "#/$defs/text"},
+        "kind": {"enum": ["source_disagreement", "coverage_gap"]}, "status": {"enum": ["open", "resolved"]},
+        "summary": {"$ref": "#/$defs/text"}, "decision": {"$ref": "#/$defs/text"},
+        "claim_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "source_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}
+      }
+    }
+  }
+}

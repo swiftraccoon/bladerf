@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="255" viewBox="0 0 1120 255" role="img" aria-labelledby="title description">
+  <title id="title">Conceptual bladeRF 2.0 micro signal path</title>
+  <desc id="description">Two receive and two transmit RF connectors connect to the AD9361 transceiver. Digital IQ and control pass through the Cyclone V FPGA and FX3 USB controller to host software. Arrows indicate receive and transmit directions. Matching, switching, power, and clock circuitry are omitted.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/></marker>
+  </defs>
+  <rect width="1120" height="255" rx="12" fill="#ffffff"/>
+  <g fill="#eff6ff" stroke="#334155" stroke-width="2">
+    <rect x="20" y="75" width="160" height="105" rx="8"/>
+    <rect x="230" y="75" width="180" height="105" rx="8"/>
+    <rect x="460" y="75" width="180" height="105" rx="8"/>
+    <rect x="690" y="75" width="170" height="105" rx="8"/>
+    <rect x="910" y="75" width="190" height="105" rx="8"/>
+  </g>
+  <g fill="#0f172a" text-anchor="middle" font-family="sans-serif" font-size="18">
+    <text x="100" y="118">RX1 / RX2</text><text x="100" y="147">TX1 / TX2</text>
+    <text x="320" y="118">AD9361</text><text x="320" y="147">RF transceiver</text>
+    <text x="550" y="118">Cyclone V</text><text x="550" y="147">FPGA</text>
+    <text x="775" y="118">FX3</text><text x="775" y="147">USB controller</text>
+    <text x="1005" y="118">Host software</text><text x="1005" y="147">libbladeRF / apps</text>
+    <text x="560" y="35" font-size="17">Receive → digital IQ toward the host</text>
+    <text x="560" y="221" font-size="17">Transmit ← digital IQ toward the RF outputs</text>
+  </g>
+  <g stroke="#334155" stroke-width="2.5" marker-start="url(#arrow)" marker-end="url(#arrow)">
+    <path d="M 188 127 H 222"/><path d="M 418 127 H 452"/>
+    <path d="M 648 127 H 682"/><path d="M 868 127 H 902"/>
+  </g>
+</svg>

@@ -1,0 +1,16 @@
+[package]
+name = "bladerf-docs"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Offline validation and handbook rendering for source-qualified bladeRF facts"
+
+[dependencies]
+anyhow = "1"
+clap = { features = ["derive"], version = "4.5" }
+jsonschema = { default-features = false, version = "=0.60.2" }
+serde = "1"
+serde_json = "1"
+tempfile = "3"
+url = "2.5.8"

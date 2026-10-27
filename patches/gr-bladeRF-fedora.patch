@@ -1,0 +1,169 @@
+diff --git a/include/bladeRF/ranges.h b/include/bladeRF/ranges.h
+index 77d5026..5516a56 100644
+--- a/include/bladeRF/ranges.h
++++ b/include/bladeRF/ranges.h
+@@ -18,8 +18,8 @@
+ #ifndef INCLUDED_OSMOSDR_RANGES_H
+ #define INCLUDED_OSMOSDR_RANGES_H
+ 
+-#include <osmosdr/api.h>
+-#include <osmosdr/pimpl.h>
++#include <bladeRF/api.h>
++#include <bladeRF/pimpl.h>
+ #include <string>
+ #include <vector>
+ 
+@@ -35,7 +35,7 @@ namespace osmosdr{
+      * A range object describes a set of discrete values of the form:
+      * y = start + step*n, where n is an integer between 0 and (stop - start)/step
+      */
+-    class OSMOSDR_API range_t{
++    class BLADERF_API range_t{
+     public:
+ 
+         /*!
+@@ -72,7 +72,7 @@ namespace osmosdr{
+     /*!
+      * A meta-range object holds a list of individual ranges.
+      */
+-    struct OSMOSDR_API meta_range_t : std::vector<range_t>{
++    struct BLADERF_API meta_range_t : std::vector<range_t>{
+ 
+         //! A default constructor for an empty meta-range
+         meta_range_t(void);
+diff --git a/include/bladeRF/time_spec.h b/include/bladeRF/time_spec.h
+index 13fbfd6..a6cf11c 100644
+--- a/include/bladeRF/time_spec.h
++++ b/include/bladeRF/time_spec.h
+@@ -18,7 +18,7 @@
+ #ifndef INCLUDED_OSMOSDR_TIME_SPEC_H
+ #define INCLUDED_OSMOSDR_TIME_SPEC_H
+ 
+-#include <osmosdr/api.h>
++#include <bladeRF/api.h>
+ #include <boost/operators.hpp>
+ #include <ctime>
+ 
+@@ -36,7 +36,7 @@ namespace osmosdr{
+      * This gives the fractional seconds enough precision to unambiguously
+      * specify a clock-tick/sample-count up to rates of several petahertz.
+      */
+-    class OSMOSDR_API time_spec_t : boost::additive<time_spec_t>, boost::totally_ordered<time_spec_t>{
++    class BLADERF_API time_spec_t : boost::additive<time_spec_t>, boost::totally_ordered<time_spec_t>{
+     public:
+ 
+         /*!
+@@ -123,10 +123,10 @@ namespace osmosdr{
+     };
+ 
+     //! Implement equality_comparable interface
+-    OSMOSDR_API bool operator==(const time_spec_t &, const time_spec_t &);
++    BLADERF_API bool operator==(const time_spec_t &, const time_spec_t &);
+ 
+     //! Implement less_than_comparable interface
+-    OSMOSDR_API bool operator<(const time_spec_t &, const time_spec_t &);
++    BLADERF_API bool operator<(const time_spec_t &, const time_spec_t &);
+ 
+     inline time_t time_spec_t::get_full_secs(void) const{
+         return this->_full_secs;
+diff --git a/lib/bladerf/bladerf_sink_c.cc b/lib/bladerf/bladerf_sink_c.cc
+index 173a719..ab6fafa 100644
+--- a/lib/bladerf/bladerf_sink_c.cc
++++ b/lib/bladerf/bladerf_sink_c.cc
+@@ -40,7 +40,7 @@
+ 
+ #include "arg_helpers.h"
+ #include "bladerf_sink_c.h"
+-#include "osmosdr/sink.h"
++#include "bladeRF/sink.h"
+ 
+ using namespace boost::assign;
+ 
+diff --git a/lib/bladerf/bladerf_sink_c.h b/lib/bladerf/bladerf_sink_c.h
+index 2600889..a7a31a4 100644
+--- a/lib/bladerf/bladerf_sink_c.h
++++ b/lib/bladerf/bladerf_sink_c.h
+@@ -24,7 +24,7 @@
+ #include "common_sync_block.h"
+ #include "bladerf_common.h"
+ 
+-#include "osmosdr/ranges.h"
++#include "bladeRF/ranges.h"
+ 
+ class bladerf_sink_c;
+ 
+diff --git a/lib/bladerf/bladerf_source_c.cc b/lib/bladerf/bladerf_source_c.cc
+index 75f3401..8d03a67 100644
+--- a/lib/bladerf/bladerf_source_c.cc
++++ b/lib/bladerf/bladerf_source_c.cc
+@@ -40,7 +40,7 @@
+ 
+ #include "arg_helpers.h"
+ #include "bladerf_source_c.h"
+-#include "osmosdr/source.h"
++#include "bladeRF/source.h"
+ 
+ using namespace boost::assign;
+ 
+@@ -433,14 +433,14 @@ std::string bladerf_source_c::get_antenna(size_t chan)
+ 
+ void bladerf_source_c::set_dc_offset_mode(int mode, size_t chan)
+ {
+-  if (osmosdr::source::DCOffsetOff == mode) {
++  if (gr::bladeRF::source::DCOffsetOff == mode) {
+     //_src->set_auto_dc_offset( false, chan );
+     /* reset to default for off-state */
+     set_dc_offset(std::complex<double>(0.0, 0.0), chan);
+-  } else if (osmosdr::source::DCOffsetManual == mode) {
++  } else if (gr::bladeRF::source::DCOffsetManual == mode) {
+     /* disable auto mode, but keep correcting with last known values */
+     //_src->set_auto_dc_offset( false, chan );
+-  } else if (osmosdr::source::DCOffsetAutomatic == mode) {
++  } else if (gr::bladeRF::source::DCOffsetAutomatic == mode) {
+     //_src->set_auto_dc_offset( true, chan );
+     BLADERF_WARNING("Automatic DC correction mode is not implemented.");
+   }
+@@ -460,14 +460,14 @@ void bladerf_source_c::set_dc_offset(const std::complex<double> &offset,
+ 
+ void bladerf_source_c::set_iq_balance_mode(int mode, size_t chan)
+ {
+-  if (osmosdr::source::IQBalanceOff == mode) {
++  if (gr::bladeRF::source::IQBalanceOff == mode) {
+     //_src->set_auto_iq_balance( false, chan );
+     /* reset to default for off-state */
+     set_iq_balance(std::complex<double>(0.0, 0.0), chan);
+-  } else if (osmosdr::source::IQBalanceManual == mode) {
++  } else if (gr::bladeRF::source::IQBalanceManual == mode) {
+     /* disable auto mode, but keep correcting with last known values */
+     //_src->set_auto_iq_balance( false, chan );
+-  } else if (osmosdr::source::IQBalanceAutomatic == mode) {
++  } else if (gr::bladeRF::source::IQBalanceAutomatic == mode) {
+     //_src->set_auto_iq_balance( true, chan );
+     BLADERF_WARNING("Automatic IQ correction mode is not implemented.");
+   }
+diff --git a/lib/bladerf/bladerf_source_c.h b/lib/bladerf/bladerf_source_c.h
+index 04b416b..b918ded 100644
+--- a/lib/bladerf/bladerf_source_c.h
++++ b/lib/bladerf/bladerf_source_c.h
+@@ -23,7 +23,7 @@
+ 
+ #include "common_sync_block.h"
+ #include "bladerf_common.h"
+-#include "osmosdr/ranges.h"
++#include "bladeRF/ranges.h"
+ 
+ class bladerf_source_c;
+ 
+diff --git a/lib/ranges.cc b/lib/ranges.cc
+index 09c1dae..8cc2657 100644
+--- a/lib/ranges.cc
++++ b/lib/ranges.cc
+@@ -15,7 +15,7 @@
+ // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ //
+ 
+-#include <osmosdr/ranges.h>
++#include <bladeRF/ranges.h>
+ #include <stdexcept>
+ #include <boost/math/special_functions/round.hpp>
+ #include <algorithm>

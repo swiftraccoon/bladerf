@@ -1,0 +1,10 @@
+/build/
+/target/
+/downloads/
+/captures/
+/artifacts/
+/dev-docs/
+/.venv/
+/AGENTS.override.md
+__pycache__/
+*.py[cod]

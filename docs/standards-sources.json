@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "policy": "Repository requirements take precedence; Rust Style Guide governs source/manifests, Rust API Guidelines governs applicable C-* entries, Google Rust is supplemental, Conventional Commits 1.0.0 governs commit syntax. Remote snapshots are pinned by immutable Git commit and file SHA256. Source texts are not vendored.",
+  "sources": [
+    {
+      "name": "rust-style",
+      "repository": "https://github.com/rust-lang/rust",
+      "commit": "0ef4e1154335de75d5c333bf61e192ec99758fb3",
+      "files": [
+        {
+          "path": "src/doc/style-guide/src/README.md",
+          "sha256": "387967fffd06320a1f4004c46740125baab3d5c0986340890f89e0f833a54566",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/README.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/README.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/SUMMARY.md",
+          "sha256": "9a1cc19ecec6e94b6c95293bd10f1c0bbfbdaaffaa4581f322af617ea8d49774",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/SUMMARY.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/SUMMARY.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/advice.md",
+          "sha256": "7ad729d9d75eb48a72c6066cde4447138f3b7a6786979a2e504804724dba43a4",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/advice.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/advice.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/cargo.md",
+          "sha256": "cdb5c4010ccaad7e1c2599b11a0764a7132383ff3cda47b8cbb0e49459ba07ba",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/cargo.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/cargo.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/editions.md",
+          "sha256": "8ab37dc141036aebd478f541194cad92a86846953ec7212521b2a8e1942ed2ed",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/editions.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/editions.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/expressions.md",
+          "sha256": "2777292a47906dac38ea67d5aecbb4e6fb7368ca299dae9413f8c55863d287a2",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/expressions.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/expressions.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/items.md",
+          "sha256": "57cbd21d469fa742349399bf27cf500c4cb9831ffc7ba43a1a164d7cd437bc04",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/items.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/items.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/nightly.md",
+          "sha256": "e82d3b08dc80468e93f13de44466b59d0bc2f843f734ed82a8f3249170476763",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/nightly.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/nightly.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/principles.md",
+          "sha256": "01c469c253c383a0fff47d234405204cd69cd4f51d5fa8d50ff903533e3ef80a",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/principles.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/principles.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/statements.md",
+          "sha256": "3a183212f7ba75ddda447cc5de106673d068dd1415b9ad8cba71a6a5d112681d",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/statements.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/statements.md"
+        },
+        {
+          "path": "src/doc/style-guide/src/types.md",
+          "sha256": "9862fd758e364c31dceb3e96392f305c8f8384ffbd5f006099d67fab3b5f30f5",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/rust/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/types.md",
+          "immutable_url": "https://github.com/rust-lang/rust/blob/0ef4e1154335de75d5c333bf61e192ec99758fb3/src/doc/style-guide/src/types.md"
+        }
+      ]
+    },
+    {
+      "name": "rust-api",
+      "repository": "https://github.com/rust-lang/api-guidelines",
+      "commit": "97a0969cb07fe4cabb0eed8a56234053f47d83dc",
+      "files": [
+        {
+          "path": "src/SUMMARY.md",
+          "sha256": "b3ad877e7824208a8c1c3b45762d75b8c89953ee34c224ba5c8ae5c2b0d43648",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/SUMMARY.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/SUMMARY.md"
+        },
+        {
+          "path": "src/checklist.md",
+          "sha256": "6e8afb1f55d7f079b9c48f48925ca80d52de78ea27beb8d0e5fadf91123f23b2",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/checklist.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/checklist.md"
+        },
+        {
+          "path": "src/naming.md",
+          "sha256": "36b3fcb3705867fc96cb6346a86d0ad3ef9ad97fe5a2741d1afc68063001c63a",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/naming.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/naming.md"
+        },
+        {
+          "path": "src/interoperability.md",
+          "sha256": "e795059bf83624252ee979c1e9672eb42600e0b7ea40a80026a975a2c0fb5d0d",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/interoperability.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/interoperability.md"
+        },
+        {
+          "path": "src/macros.md",
+          "sha256": "02b743de7c7a714b04096fcbe214145ea81edf9261367063ecb618146e79df4c",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/macros.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/macros.md"
+        },
+        {
+          "path": "src/documentation.md",
+          "sha256": "6ba5c33eef97d07710abd09098d02a6a6d200ee3173b96dad27bf47139742105",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/documentation.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/documentation.md"
+        },
+        {
+          "path": "src/predictability.md",
+          "sha256": "11e74c2710f3e9a62670e7e48d339404cbad3340e6cc10f7631ea57362ba61bf",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/predictability.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/predictability.md"
+        },
+        {
+          "path": "src/flexibility.md",
+          "sha256": "5565a393442c9dcaf73161584233060f4cb52f8de1b2c1abad5ccc95f61aed7d",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/flexibility.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/flexibility.md"
+        },
+        {
+          "path": "src/type-safety.md",
+          "sha256": "d2bfa67228eb1252e1f1e515e036766f3996c2e874dd7ba5ad1b4d8a566f51f5",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/type-safety.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/type-safety.md"
+        },
+        {
+          "path": "src/dependability.md",
+          "sha256": "e0e1c29e6b31ef0e13a2da17b7afa41f0f3fbf5aadae7ad51d39b9ae3caaddea",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/dependability.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/dependability.md"
+        },
+        {
+          "path": "src/debuggability.md",
+          "sha256": "f6eb09d8246fe6aafc3c0e7b0003c5876455e78d7806d9b43905f1b4080d52fc",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/debuggability.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/debuggability.md"
+        },
+        {
+          "path": "src/future-proofing.md",
+          "sha256": "467184d9e5f3e0f949db6ca6a5f4232574e342ec76648e46424f39c8c23f3ad7",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/future-proofing.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/future-proofing.md"
+        },
+        {
+          "path": "src/necessities.md",
+          "sha256": "b471e4dcfb48fd9cee26075e97dfcb61ccfb1c2c4b89d21531a03d0da6760fe8",
+          "source_url": "https://raw.githubusercontent.com/rust-lang/api-guidelines/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/necessities.md",
+          "immutable_url": "https://github.com/rust-lang/api-guidelines/blob/97a0969cb07fe4cabb0eed8a56234053f47d83dc/src/necessities.md"
+        }
+      ]
+    },
+    {
+      "name": "google-rust",
+      "repository": "https://github.com/google/styleguide",
+      "commit": "c775c0c2f73c110613243520c001577cdbc0034d",
+      "files": [
+        {
+          "path": "rustguide.md",
+          "sha256": "b740a8ba33505615bed9f63624ed325ff9eb8d4a73ce5b36c6833955926f72c4",
+          "source_url": "https://raw.githubusercontent.com/google/styleguide/c775c0c2f73c110613243520c001577cdbc0034d/rustguide.md",
+          "immutable_url": "https://github.com/google/styleguide/blob/c775c0c2f73c110613243520c001577cdbc0034d/rustguide.md"
+        }
+      ]
+    },
+    {
+      "name": "conventional-commits",
+      "repository": "https://github.com/conventional-commits/conventionalcommits.org",
+      "commit": "42b627eb4071345cca4f2a1628da93d3420dc645",
+      "files": [
+        {
+          "path": "content/v1.0.0/index.md",
+          "sha256": "f30a3f86406552215c480529e172b81e9bc291780a34a05af86ea4b3fac492b9",
+          "source_url": "https://raw.githubusercontent.com/conventional-commits/conventionalcommits.org/42b627eb4071345cca4f2a1628da93d3420dc645/content/v1.0.0/index.md",
+          "immutable_url": "https://github.com/conventional-commits/conventionalcommits.org/blob/42b627eb4071345cca4f2a1628da93d3420dc645/content/v1.0.0/index.md"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+[package]
+name = "bladerf-lab"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Receive-only bladeRF micro xA9 capture, analysis, and workspace tools"
+
+[features]
+analysis = ["dep:rustfft", "dep:plotters"]
+default = ["analysis", "radio"]
+radio = ["dep:ctrlc", "dep:soapysdr"]
+
+[dependencies]
+anyhow = "1"
+chrono = { default-features = false, features = ["clock", "std"], version = "0.4" }
+clap = { features = ["derive"], version = "4.5" }
+ctrlc = { features = ["termination"], optional = true, version = "3.4" }
+num-complex = "0.4"
+rustfft = { optional = true, version = "6" }
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+sha2 = "0.10"
+soapysdr = { optional = true, version = "=0.5.1" }
+tempfile = "3"
+
+[dependencies.plotters]
+default-features = false
+features = ["bitmap_backend", "bitmap_encoder", "ttf", "line_series"]
+optional = true
+version = "0.3.7"

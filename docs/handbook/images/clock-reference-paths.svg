@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="610" viewBox="0 0 1160 610" role="img" aria-labelledby="clock-title clock-description">
+  <title id="clock-title">Two external clock paths on the bladeRF micro</title>
+  <desc id="clock-description">REFIN J95 feeds the ADF4002 phase detector and divider loop. Its loop-filter control voltage or the AD5621 trim DAC controls the onboard 38.4 MHz VCTCXO. The Si53304 selects the VCTCXO or direct CLKIN J93. It distributes the selected source to board circuitry and CLKOUT J92, and provides the ADF4002 feedback clock. Clock source selection and clock output enable are separate controls. This is a conceptual diagram, not a wiring diagram.</desc>
+  <defs>
+    <marker id="clock-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#22577a"/></marker>
+    <style>
+      text { font-family: sans-serif; font-size: 17px; fill: #162b3a; }
+      .heading { font-size: 23px; font-weight: bold; }
+      .label { font-weight: bold; }
+      .small { font-size: 15px; }
+      .box { fill: #edf5fa; stroke: #22577a; stroke-width: 2; }
+      .control { fill: #fff4df; stroke: #8b621d; stroke-width: 2; }
+      .wire { fill: none; stroke: #22577a; stroke-width: 2.5; marker-end: url(#clock-arrow); }
+      .feedback { fill: none; stroke: #22577a; stroke-width: 2; stroke-dasharray: 8 5; marker-end: url(#clock-arrow); }
+    </style>
+  </defs>
+  <rect width="1160" height="610" fill="#ffffff"/>
+  <text x="25" y="32" class="heading">Reference discipline and direct clock selection are different paths</text>
+
+  <rect x="25" y="65" width="205" height="100" rx="8" class="box"/>
+  <text x="43" y="94" class="label">REFIN · J95</text>
+  <text x="43" y="122">External reference</text>
+  <text x="43" y="148" class="small">10 MHz default</text>
+
+  <rect x="285" y="65" width="235" height="100" rx="8" class="control"/>
+  <text x="303" y="94" class="label">ADF4002 · U26</text>
+  <text x="303" y="122">Dividers + phase detector</text>
+  <text x="303" y="148" class="small">clock_ref controls enable</text>
+  <path d="M230 115 H285" class="wire"/>
+
+  <rect x="735" y="65" width="280" height="100" rx="8" class="box"/>
+  <text x="753" y="94" class="label">Onboard VCTCXO</text>
+  <text x="753" y="122">38.4 MHz nominal</text>
+  <text x="753" y="148" class="small">Voltage controls fine frequency trim</text>
+  <path d="M520 115 H735" class="wire"/>
+  <text x="545" y="85" class="small">Filtered PLL control</text>
+
+  <rect x="355" y="205" width="250" height="90" rx="8" class="control"/>
+  <text x="373" y="235" class="label">AD5621 · U23</text>
+  <text x="373" y="263">12-bit trim DAC</text>
+  <path d="M605 250 H660 V115" class="wire"/>
+  <text x="679" y="219" class="small">Alternative trim actuator</text>
+  <text x="679" y="243" class="small">DAC disabled for PLL</text>
+
+  <rect x="25" y="340" width="240" height="105" rx="8" class="box"/>
+  <text x="43" y="370" class="label">CLKIN · J93</text>
+  <text x="43" y="399">Direct board-clock input</text>
+  <text x="43" y="426" class="small">38.4 MHz · 3.3 V CMOS</text>
+
+  <rect x="420" y="340" width="270" height="120" rx="8" class="box"/>
+  <text x="438" y="371" class="label">Si53304 · U94</text>
+  <text x="438" y="400">Clock selection + fanout</text>
+  <text x="438" y="430" class="small">clock_sel: onboard / external</text>
+  <path d="M265 392 H420" class="wire"/>
+  <text x="310" y="377" class="small">CLK1</text>
+  <path d="M875 165 V315 H555 V340" class="wire"/>
+  <text x="725" y="302" class="small">VCTCXO_OUT → CLK0</text>
+
+  <rect x="850" y="340" width="285" height="145" rx="8" class="box"/>
+  <text x="868" y="370" class="label">Distributed board clock</text>
+  <text x="868" y="399">RFIC · FPGA · FX3 · expansion</text>
+  <text x="868" y="431">CLKOUT · J92</text>
+  <text x="868" y="457" class="small">clock_out gates this external output</text>
+  <path d="M690 392 H850" class="wire"/>
+  <circle cx="772" cy="392" r="5" fill="#22577a"/>
+  <path d="M772 392 V525 H300 V185 H400 V165" class="feedback"/>
+  <text x="380" y="552" class="small">Selected-clock feedback: ADF_RFIN_A</text>
+  <text x="25" y="590" class="small">Conceptual synthesis of micro REV1.4/REV1.6 sheet 13. Optional parts, electrical details and physical layout are omitted.</text>
+</svg>

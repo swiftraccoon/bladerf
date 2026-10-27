@@ -1,0 +1,1231 @@
+{
+  "schema_version": 2,
+  "purpose": "reference_only",
+  "sources": [
+    {
+      "id": "micro-definitions",
+      "kind": "source_code",
+      "title": "Micro shared range and clock definitions",
+      "publisher": "Nuand",
+      "revision": "2025.10 / libbladeRF 2.6.0",
+      "url": "https://github.com/Nuand/bladeRF/blob/fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47/fpga_common/include/bladerf2_common.h",
+      "sha256": "76335006316c5a089b0e92bee3fedcce1156b13754368f2405ff7ff5b6d386a5",
+      "commit": "fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47"
+    },
+    {
+      "id": "native-header",
+      "kind": "source_code",
+      "title": "libbladeRF sample representation and API contracts",
+      "publisher": "Nuand",
+      "revision": "2025.10 / libbladeRF 2.6.0",
+      "url": "https://github.com/Nuand/bladeRF/blob/fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47/host/libraries/libbladeRF/include/libbladeRF.h",
+      "sha256": "49fff9b9c40a4e8f0341448e0a9ecc20d579ab598a6ba0241eac22fa28c9bf65",
+      "commit": "fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47"
+    },
+    {
+      "id": "micro-driver",
+      "kind": "source_code",
+      "title": "Micro board and clock-control implementation",
+      "publisher": "Nuand",
+      "revision": "2025.10 / libbladeRF 2.6.0",
+      "url": "https://github.com/Nuand/bladeRF/blob/fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47/host/libraries/libbladeRF/src/board/bladerf2/bladerf2.c",
+      "sha256": "ed134467d063f9108459d30b64ed590ebd5f44a314a449e2440d4cd36e0838f6",
+      "commit": "fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47"
+    },
+    {
+      "id": "micro-api",
+      "kind": "source_code",
+      "title": "Micro-specific public API contracts",
+      "publisher": "Nuand",
+      "revision": "2025.10 / libbladeRF 2.6.0",
+      "url": "https://github.com/Nuand/bladeRF/blob/fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47/host/libraries/libbladeRF/include/bladeRF2.h",
+      "sha256": "ab8862aad3aa7aa9fcbabfdd9002d3fe72ba70ba74e2474557c313a6afcc6abb",
+      "commit": "fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47"
+    },
+    {
+      "id": "rfic-host",
+      "kind": "source_code",
+      "title": "AD9361 host-control implementation",
+      "publisher": "Nuand",
+      "revision": "2025.10 / libbladeRF 2.6.0",
+      "url": "https://github.com/Nuand/bladeRF/blob/fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47/host/libraries/libbladeRF/src/board/bladerf2/rfic_host.c",
+      "sha256": "50b9cfb2cde62b358bc167a2c3ba608b57dd05c024f82c9cc79abcdefcdabd2b",
+      "commit": "fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47"
+    },
+    {
+      "id": "schematic-14",
+      "kind": "pdf",
+      "title": "bladeRF 2.0 micro schematics REV 1.4",
+      "publisher": "Nuand",
+      "revision": "REV 1.4",
+      "url": "https://www.nuand.com/bladeRF-2.0-micro-REV1.4.pdf",
+      "sha256": "9873badac468f9bc2b501c2b1ed633af64405a50246d572716d6bc408fb2ce3d",
+      "page_count": 17
+    },
+    {
+      "id": "schematic-16",
+      "kind": "pdf",
+      "title": "bladeRF 2.0 micro schematics REV 1.6",
+      "publisher": "Nuand",
+      "revision": "REV 1.6",
+      "url": "https://www.nuand.com/bladeRF-2.0-micro-REV1.6.pdf",
+      "sha256": "c790c4859a12df55b997bffe8057b85078c543ed133bedc3ac36eb6a8cbb9d07",
+      "page_count": 17
+    },
+    {
+      "id": "nuand-faq",
+      "kind": "web_page",
+      "title": "Nuand bladeRF FAQ",
+      "publisher": "Nuand",
+      "revision": "Unversioned web page",
+      "url": "https://www.nuand.com/frequently-asked-questions/",
+      "sha256": "6fd4b8823a2c4b2cbcf93f02ec16a8f87b81f704dce5417d26a8868b25d572ab"
+    },
+    {
+      "id": "nuand-micro-brief",
+      "kind": "web_page",
+      "title": "Nuand micro product description",
+      "publisher": "Nuand",
+      "revision": "Unversioned web page",
+      "url": "https://www.nuand.com/bladerf-2-0-micro/",
+      "sha256": "d3296b29c11af33ec6080fb411ee03769e1224fff67d943de8914eea28399cd6"
+    },
+    {
+      "id": "sync-tutorial",
+      "kind": "source_code",
+      "title": "Synchronous streaming tutorial",
+      "publisher": "Nuand",
+      "revision": "2025.10 / libbladeRF 2.6.0",
+      "url": "https://github.com/Nuand/bladeRF/blob/fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47/host/libraries/libbladeRF/doc/doxygen/sync_no_meta.dox",
+      "sha256": "bbf4e30c2aa2dcf347993101b5d20121c39e2fd47d2769a8cf5d9923600e4d89",
+      "commit": "fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47"
+    },
+    {
+      "id": "sync-implementation",
+      "kind": "source_code",
+      "title": "Synchronous streaming buffer implementation",
+      "publisher": "Nuand",
+      "revision": "2025.10 / libbladeRF 2.6.0",
+      "url": "https://github.com/Nuand/bladeRF/blob/fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47/host/libraries/libbladeRF/src/streaming/sync.c",
+      "sha256": "7fdfa93cd7d999c5a7907f1b6926834ba442429bd1faa465eefa65a743a550ba",
+      "commit": "fcf9423325ae49f5fdd2e5b52ab68bfc2576ad47"
+    }
+  ],
+  "claims": [
+    {
+      "id": "micro.rf.rx.tuning-range",
+      "title": "Receive tuning range",
+      "statement": "The pinned implementation gives RX a different lower tuning limit from TX.",
+      "property": "rf.rx.tuning_range",
+      "value": {
+        "kind": "integer_range",
+        "minimum": 70000000,
+        "maximum": 6000000000,
+        "unit": "Hz"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "This is the range declared by the pinned micro implementation, not a guarantee of RF performance or sustained host throughput."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-definitions",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_rx_frequency_range",
+            "fragment": "L549-L555"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.rf.tx.tuning-range",
+      "title": "Transmit tuning range",
+      "statement": "The pinned implementation defines the transmit tuning range independently from receive.",
+      "property": "rf.tx.tuning_range",
+      "value": {
+        "kind": "integer_range",
+        "minimum": 47000000,
+        "maximum": 6000000000,
+        "unit": "Hz"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "This is the range declared by the pinned micro implementation, not a guarantee of RF performance or sustained host throughput."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-definitions",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_tx_frequency_range",
+            "fragment": "L556-L563"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.sample-rate.base",
+      "title": "Base-mode sample-rate range",
+      "statement": "The normal feature mode selects the base sample-rate range.",
+      "property": "sample_rate.range",
+      "value": {
+        "kind": "integer_range",
+        "minimum": 520834,
+        "maximum": 61440000,
+        "unit": "samples/s"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "base"
+      },
+      "conditions": [
+        "This is the range declared by the pinned micro implementation, not a guarantee of RF performance or sustained host throughput.",
+        "Low rates can require RFIC interpolation/decimation filters; use actual readbacks."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-definitions",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_sample_rate_range_base",
+            "fragment": "L517-L524"
+          }
+        },
+        {
+          "source_id": "micro-driver",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_get_sample_rate_range",
+            "fragment": "L979-L992"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.sample-rate.oversample",
+      "title": "Extended-mode sample-rate range",
+      "statement": "The oversample feature selects a different rate range.",
+      "property": "sample_rate.range",
+      "value": {
+        "kind": "integer_range",
+        "minimum": 6250000,
+        "maximum": 122880000,
+        "unit": "samples/s"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "oversample"
+      },
+      "conditions": [
+        "This is the range declared by the pinned micro implementation, not a guarantee of RF performance or sustained host throughput.",
+        "Requires the oversample feature and compatible gateware/format configuration; this is not the ordinary mode or a sustained-streaming measurement."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-definitions",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_sample_rate_range_oversample",
+            "fragment": "L525-L532"
+          }
+        },
+        {
+          "source_id": "micro-driver",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_get_sample_rate_range",
+            "fragment": "L979-L992"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.bandwidth.base",
+      "title": "Declared base-mode bandwidth range",
+      "statement": "The shared micro definitions declare an analog bandwidth control range.",
+      "property": "analog_bandwidth.range",
+      "value": {
+        "kind": "integer_range",
+        "minimum": 200000,
+        "maximum": 56000000,
+        "unit": "Hz"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "base"
+      },
+      "conditions": [
+        "Applies as an implementation reference in base mode.",
+        "The pinned setter warns about bandwidth assignments in oversample mode; do not extend this claim to that mode."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-definitions",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_bandwidth_range",
+            "fragment": "L540-L547"
+          }
+        },
+        {
+          "source_id": "micro-driver",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_set_bandwidth",
+            "fragment": "L1210-L1230"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.sc16.component-range",
+      "title": "SC16 Q11 component range",
+      "statement": "Each signed I or Q value has a documented fixed-point range.",
+      "property": "sample_encoding.sc16q11.component_range",
+      "value": {
+        "kind": "integer_range",
+        "minimum": -2048,
+        "maximum": 2047,
+        "unit": "component_counts"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "SC16 Q11 signed, little-endian host representation; this is not an ADC resolution claim."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "native-header",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "BLADERF_FORMAT_SC16_Q11",
+            "fragment": "L2085-L2142"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.sc16.normalization",
+      "title": "SC16 Q11 normalization divisor",
+      "statement": "Divide each documented SC16 Q11 component by this divisor to normalize its amplitude.",
+      "property": "sample_encoding.sc16q11.normalization_divisor",
+      "value": {
+        "kind": "integer",
+        "value": 2048,
+        "unit": "component_counts"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "The resulting nominal normalized interval includes -1 and excludes +1."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "native-header",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "BLADERF_FORMAT_SC16_Q11",
+            "fragment": "L2085-L2142"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.sc16.host-bytes",
+      "title": "SC16 Q11 host sample size",
+      "statement": "One single-channel complex host sample occupies four bytes.",
+      "property": "sample_encoding.sc16q11.host_bytes_per_complex_sample",
+      "value": {
+        "kind": "integer",
+        "value": 4,
+        "unit": "bytes"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Single channel, I then Q, two signed 16-bit components.",
+        "Excludes file headers and metadata; do not infer wire packing or multi-channel API count conventions."
+      ],
+      "evidence_kind": "derived",
+      "evidence": [
+        {
+          "source_id": "native-header",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "BLADERF_FORMAT_SC16_Q11",
+            "fragment": "L2085-L2142"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      },
+      "derivation": "2 components per complex sample multiplied by 2 bytes per component equals 4 bytes."
+    },
+    {
+      "id": "micro.rx.shared-lo",
+      "title": "Receive channels share a local oscillator",
+      "statement": "The two receive channels share the receive local oscillator.",
+      "property": "rf.rx.shared_lo",
+      "value": {
+        "kind": "boolean",
+        "value": true
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Two receive paths do not provide independent simultaneous analog center frequencies.",
+        "The transmit direction has a separate RF synthesizer."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "rfic-host",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "_rfic_host_select_band",
+            "fragment": "L474-L500"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.bias.rx-shared",
+      "title": "Receive bias control is shared by direction",
+      "statement": "A channel argument does not establish independently switched receive bias power.",
+      "property": "rf.rx.bias_control_group",
+      "value": {
+        "kind": "text",
+        "value": "RX1 and RX2"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "The implementation selects one RX enable bit for either receive channel.",
+        "This record describes control sharing; it does not specify available accessory current."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-driver",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf_set_bias_tee",
+            "fragment": "L3022-L3050"
+          }
+        },
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 2,
+            "printed_label": "2"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 2,
+            "printed_label": "2"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.clock.onboard-frequency",
+      "title": "Nominal onboard clock frequency",
+      "statement": "The onboard VCTCXO reference is nominally 38.4 MHz.",
+      "property": "clock.onboard.nominal_frequency",
+      "value": {
+        "kind": "integer",
+        "value": 38400000,
+        "unit": "Hz"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Nominal frequency is not an accuracy, drift, phase-noise, or calibration measurement."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-definitions",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "BLADERF_VCTCXO_FREQUENCY",
+            "fragment": "L43-L54"
+          }
+        },
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.clock.refin-range",
+      "title": "Declared external PLL reference range",
+      "statement": "The micro implementation declares a PLL reference-input frequency range.",
+      "property": "clock.pll.reference_frequency_range",
+      "value": {
+        "kind": "integer_range",
+        "minimum": 5000000,
+        "maximum": 300000000,
+        "unit": "Hz"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "external_reference"
+      },
+      "conditions": [
+        "This is the range accepted by the pinned implementation, not a guarantee of all divider/waveform/lock combinations.",
+        "The REFIN input and direct CLKIN path have different roles."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-driver",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf2_pll_refclk_range",
+            "fragment": "L78-L85"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.clock.pll-dac-exclusion",
+      "title": "PLL and trim DAC control exclusion",
+      "statement": "Enabling the onboard reference PLL disables the trim DAC, and vice versa.",
+      "property": "clock.pll.excludes_trim_dac",
+      "value": {
+        "kind": "boolean",
+        "value": true
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {
+          "libbladeRF": "2.6.0"
+        },
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Describes control of the onboard VCTCXO.",
+        "Selecting an external clock input is a separate operation; this does not establish discipline of that external generator."
+      ],
+      "evidence_kind": "pinned_implementation",
+      "evidence": [
+        {
+          "source_id": "micro-api",
+          "locator": {
+            "kind": "symbol",
+            "symbol": "bladerf_set_pll_enable",
+            "fragment": "L285-L297"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.j1.label",
+      "title": "J1 RF connector label",
+      "statement": "The inspected schematics identify J1 as the SMA receive input labeled RX1.",
+      "property": "connector.j1.board_label",
+      "value": {
+        "kind": "text",
+        "value": "RX1"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Connector numbering does not group both receivers before both transmitters.",
+        "A connector role is not an electrical maximum rating or proof of assembly placement."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.j2.label",
+      "title": "J2 RF connector label",
+      "statement": "The inspected schematics identify J2 as the SMA transmit output labeled TX1.",
+      "property": "connector.j2.board_label",
+      "value": {
+        "kind": "text",
+        "value": "TX1"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Connector numbering does not group both receivers before both transmitters.",
+        "A connector role is not an electrical maximum rating or proof of assembly placement."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.j3.label",
+      "title": "J3 RF connector label",
+      "statement": "The inspected schematics identify J3 as the SMA receive input labeled RX2.",
+      "property": "connector.j3.board_label",
+      "value": {
+        "kind": "text",
+        "value": "RX2"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Connector numbering does not group both receivers before both transmitters.",
+        "A connector role is not an electrical maximum rating or proof of assembly placement."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.j4.label",
+      "title": "J4 RF connector label",
+      "statement": "The inspected schematics identify J4 as the SMA transmit output labeled TX2.",
+      "property": "connector.j4.board_label",
+      "value": {
+        "kind": "text",
+        "value": "TX2"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Connector numbering does not group both receivers before both transmitters.",
+        "A connector role is not an electrical maximum rating or proof of assembly placement."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 4,
+            "printed_label": "4"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.j92.label",
+      "title": "J92 clock connector label",
+      "statement": "The inspected schematics identify J92 as the U.FL clock-buffer output labeled CLKOUT.",
+      "property": "connector.j92.board_label",
+      "value": {
+        "kind": "text",
+        "value": "CLKOUT"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Match the physical assembly revision; the three clock connectors are not interchangeable."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.j93.label",
+      "title": "J93 clock connector label",
+      "statement": "The inspected schematics identify J93 as the U.FL alternative clock-buffer input labeled CLKIN.",
+      "property": "connector.j93.board_label",
+      "value": {
+        "kind": "text",
+        "value": "CLKIN"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Match the physical assembly revision; the three clock connectors are not interchangeable."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.j95.label",
+      "title": "J95 clock connector label",
+      "statement": "The inspected schematics identify J95 as the U.FL ADF4002 PLL reference input labeled REFIN.",
+      "property": "connector.j95.board_label",
+      "value": {
+        "kind": "text",
+        "value": "REFIN"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Match the physical assembly revision; the three clock connectors are not interchangeable."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 13,
+            "printed_label": "13"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.connector.usb.type",
+      "title": "USB host connector type",
+      "statement": "The micro schematic names its host connector as USB 3.0 Type-B.",
+      "property": "connector.usb.type",
+      "value": {
+        "kind": "text",
+        "value": "USB 3.0 Type-B"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "The connector designator is U21 in the inspected schematics.",
+        "The product name micro does not indicate a Micro-USB connector."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 11,
+            "printed_label": "11"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 11,
+            "printed_label": "11"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.power.dc.nominal",
+      "title": "Nominal external DC supply",
+      "statement": "Nuand describes a nominal 5 V external DC power option with automatic selection.",
+      "property": "power.external.nominal_voltage",
+      "value": {
+        "kind": "integer",
+        "value": 5000,
+        "unit": "mV"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Nominal supply description only, not an absolute maximum, switching threshold, or accessory current budget."
+      ],
+      "evidence_kind": "manufacturer_specification",
+      "evidence": [
+        {
+          "source_id": "nuand-micro-brief",
+          "locator": {
+            "kind": "section",
+            "section": "USB 3.0 SuperSpeed Support"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    },
+    {
+      "id": "micro.expansion.contacts",
+      "title": "Main expansion contact count",
+      "statement": "The inspected schematics show a 60-contact board-to-board expansion connector.",
+      "property": "connector.expansion.contact_count",
+      "value": {
+        "kind": "integer",
+        "value": 60,
+        "unit": "count"
+      },
+      "scope": {
+        "board_family": "bladeRF 2.0 micro",
+        "fpga_variants": [
+          "xA9"
+        ],
+        "pcb_revisions": [
+          "1.4",
+          "1.6"
+        ],
+        "software": {},
+        "mode": "not_asserted"
+      },
+      "conditions": [
+        "Designator U74; count includes power, ground and FPGA signals.",
+        "This is not a count of available independent GPIOs."
+      ],
+      "evidence_kind": "schematic",
+      "evidence": [
+        {
+          "source_id": "schematic-14",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 7,
+            "printed_label": "7"
+          }
+        },
+        {
+          "source_id": "schematic-16",
+          "locator": {
+            "kind": "pdf_page",
+            "page": 7,
+            "printed_label": "7"
+          }
+        }
+      ],
+      "review": {
+        "status": "source_checked",
+        "method": "agent_assisted"
+      }
+    }
+  ],
+  "issues": [
+    {
+      "id": "clock-output-designator",
+      "title": "FAQ and schematic clock-output designators differ",
+      "kind": "source_disagreement",
+      "status": "open",
+      "summary": "The FAQ calls CLKOUT U92, while both inspected schematics designate its connector J92.",
+      "decision": "Use the revision-qualified schematic designator J92 for this connector; retain the FAQ mismatch rather than silently merging the names.",
+      "claim_ids": [
+        "micro.connector.j92.label"
+      ],
+      "source_ids": [
+        "schematic-14",
+        "schematic-16",
+        "nuand-faq"
+      ]
+    },
+    {
+      "id": "sma-input-rating",
+      "title": "Absolute maximum micro SMA input power remains unestablished",
+      "kind": "coverage_gap",
+      "status": "open",
+      "summary": "The reviewed source set does not establish an absolute maximum at the assembled micro receive SMA connector. Typical CW transmit output and chip-pin ratings are different claims.",
+      "claim_ids": [],
+      "source_ids": [
+        "schematic-14",
+        "schematic-16",
+        "nuand-micro-brief"
+      ]
+    },
+    {
+      "id": "packed-alignment-documentation",
+      "title": "Streaming alignment descriptions need a source-specific resolution",
+      "kind": "source_disagreement",
+      "status": "open",
+      "summary": "The pinned synchronous tutorial, public header, and format-specific implementation express alignment differently. Do not turn one tutorial multiple into an unconditional setting rule.",
+      "claim_ids": [],
+      "source_ids": [
+        "native-header",
+        "sync-tutorial",
+        "sync-implementation"
+      ]
+    }
+  ]
+}

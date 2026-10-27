@@ -1,0 +1,4 @@
+# Unified-diff context lines include a single prefix space on blank lines.
+patches/*.patch -whitespace
+# Exact-byte drift checks must survive platform checkout settings.
+docs/handbook/fact-catalog.md text eol=lf

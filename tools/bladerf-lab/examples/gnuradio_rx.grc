@@ -1,0 +1,167 @@
+options:
+  parameters:
+    author: ''
+    catch_exceptions: 'True'
+    category: '[GRC Hier Blocks]'
+    description: Finite RX1 capture; generated code is an upstream GNU Radio artifact.
+    generate_options: no_gui
+    id: gnuradio_rx
+    output_language: python
+    run: 'True'
+    run_options: run
+    title: Finite bladeRF micro xA9 receive check
+  states:
+    coordinate: [8, 8]
+    rotation: 0
+    state: enabled
+blocks:
+- name: samples
+  id: parameter
+  parameters:
+    label: Complex sample count
+    type: intx
+    value: '200000'
+    short_id: ''
+    hide: none
+  states:
+    coordinate: [16, 80]
+    rotation: 0
+    state: enabled
+- name: frequency
+  id: parameter
+  parameters:
+    label: Requested RF center frequency in Hz
+    type: eng_float
+    value: 100e6
+    short_id: ''
+    hide: none
+  states:
+    coordinate: [200, 80]
+    rotation: 0
+    state: enabled
+- name: sample_rate
+  id: parameter
+  parameters:
+    label: Requested complex sample rate in S/s
+    type: eng_float
+    value: 2e6
+    short_id: ''
+    hide: none
+  states:
+    coordinate: [440, 80]
+    rotation: 0
+    state: enabled
+- name: gain
+  id: parameter
+  parameters:
+    label: Requested manual RX gain in dB
+    type: eng_float
+    value: '20'
+    short_id: ''
+    hide: none
+  states:
+    coordinate: [680, 80]
+    rotation: 0
+    state: enabled
+- name: device
+  id: parameter
+  parameters:
+    label: Device instance or serial
+    type: str
+    value: '0'
+    short_id: ''
+    hide: none
+  states:
+    coordinate: [16, 176]
+    rotation: 0
+    state: enabled
+- name: output_path
+  id: parameter
+  parameters:
+    label: Native complex float32 IQ output
+    type: str
+    value: artifacts/gnuradio-rx.cf32
+    short_id: ''
+    hide: none
+  states:
+    coordinate: [248, 176]
+    rotation: 0
+    state: enabled
+- name: bladeRF_source_0
+  id: bladeRF_source
+  parameters:
+    bias_tee0: 'False'
+    bias_tee1: 'False'
+    buflen: '8192'
+    buffers: '32'
+    bw: sample_rate
+    dac: '6000'
+    dc_calibration: RX_LPF
+    dc_offset_mode0: '0'
+    dc_offset_mode1: '0'
+    device_id: device
+    feature: default
+    fpga_image: ''
+    fpga_reload: 'False'
+    freq: frequency
+    gain0: gain
+    gain1: '20'
+    gain_mode0: 'False'
+    gain_mode1: 'False'
+    if_gain0: gain
+    if_gain1: '20'
+    in_clk: ONBOARD
+    iq_balance_mode0: '0'
+    iq_balance_mode1: '0'
+    lpf_mode: bypassed
+    metadata: 'False'
+    nchan: '1'
+    out_clk: 'False'
+    ref_clk: 10e6
+    sample_format: 16bit
+    sample_rate: sample_rate
+    sampling: internal
+    show_pmic: 'False'
+    smb: 10e6
+    tamer: internal
+    trigger0: 'False'
+    trigger1: 'False'
+    trigger_role0: master
+    trigger_role1: master
+    trigger_signal0: J71_4
+    trigger_signal1: J51_1
+    use_dac: 'False'
+    use_ref_clk: 'False'
+    verbosity: warning
+    xb200: none
+  states:
+    coordinate: [16, 320]
+    rotation: 0
+    state: enabled
+- name: blocks_head_0
+  id: blocks_head
+  parameters:
+    num_items: samples
+    type: complex
+    vlen: '1'
+  states:
+    coordinate: [400, 352]
+    rotation: 0
+    state: enabled
+- name: blocks_file_sink_0
+  id: blocks_file_sink
+  parameters:
+    append: 'False'
+    file: output_path
+    type: complex
+    unbuffered: 'False'
+    vlen: '1'
+  states:
+    coordinate: [640, 352]
+    rotation: 0
+    state: enabled
+connections:
+- [bladeRF_source_0, '0', blocks_head_0, '0']
+- [blocks_head_0, '0', blocks_file_sink_0, '0']
+metadata:
+  file_format: 1
