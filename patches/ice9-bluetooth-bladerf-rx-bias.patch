@@ -1,0 +1,14 @@
+diff --git a/src/sdr/bladerf.c b/src/sdr/bladerf.c
+index c802e96..26498fd 100644
+--- a/src/sdr/bladerf.c
++++ b/src/sdr/bladerf.c
+@@ -142,6 +142,9 @@ void *bladerf_stream_thread(void *arg) {
+     if (bladerf_set_stream_timeout(bladerf, BLADERF_MODULE_RX, timeout * (num_transfers + 2)) != 0)
+         errx(1, "Unable to set bladeRF timeout");
+ 
++    if ((status = bladerf_set_bias_tee(bladerf, BLADERF_CHANNEL_RX(0), false)) != 0)
++        errx(1, "Unable to disable bladeRF RX bias tee: %s", bladerf_strerror(status));
++
+     if (bladerf_enable_module(bladerf, BLADERF_MODULE_RX, true) != 0)
+         errx(1, "Unable to enable bladeRF RX module");
+ 

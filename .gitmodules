@@ -10,3 +10,9 @@
 [submodule "repos/gr-bladeRF"]
 	path = repos/gr-bladeRF
 	url = https://github.com/Nuand/gr-bladeRF.git
+[submodule "repos/ice9-bluetooth-sniffer"]
+	path = repos/ice9-bluetooth-sniffer
+	url = https://github.com/mikeryan/ice9-bluetooth-sniffer.git
+[submodule "repos/blue-dragon"]
+	path = repos/blue-dragon
+	url = https://github.com/alphafox02/blue-dragon.git

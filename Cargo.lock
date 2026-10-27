@@ -185,6 +185,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluetooth-monitor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ctrlc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "borrow-or-share"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

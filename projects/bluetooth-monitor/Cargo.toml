@@ -1,0 +1,18 @@
+[package]
+name = "bluetooth-monitor"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Passive bladeRF Bluetooth capture and independent BLE packet validation"
+
+[dependencies]
+anyhow = "1"
+chrono = { default-features = false, features = ["clock", "std"], version = "0.4" }
+clap = { features = ["derive"], version = "4.5" }
+ctrlc = { features = ["termination"], version = "3.4" }
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

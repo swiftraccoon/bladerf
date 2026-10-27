@@ -1,0 +1,282 @@
+diff --git a/crates/sdr/src/bladerf.rs b/crates/sdr/src/bladerf.rs
+index 97496ee..2140057 100644
+--- a/crates/sdr/src/bladerf.rs
++++ b/crates/sdr/src/bladerf.rs
+@@ -4,8 +4,8 @@ use crossbeam::channel::Sender;
+ use std::ffi::CString;
+ use std::os::raw::{c_char, c_int, c_uint, c_void};
+ use std::ptr;
+-use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use crate::{SampleBuf, SdrSource};
+ 
+@@ -15,6 +15,7 @@ type BladerfDevice = c_void;
+ const BLADERF_MODULE_RX: c_int = 0;
+ const BLADERF_MODULE_TX: c_int = 1;
+ const BLADERF_CHANNEL_RX_0: c_int = 0;
++const BLADERF_CHANNEL_RX_1: c_int = 2;
+ const BLADERF_CHANNEL_TX_0: c_int = 1;
+ const BLADERF_GAIN_MGC: c_int = 1;
+ // On the bladeRF 2.0 Micro this maps to the AD9361 slow-attack hardware AGC,
+@@ -23,7 +24,7 @@ const BLADERF_GAIN_MGC: c_int = 1;
+ // transmitter or go deaf on a weak one, without hand-tuning a fixed gain.
+ const BLADERF_GAIN_DEFAULT: c_int = 0;
+ const BLADERF_FORMAT_SC8_Q7: c_int = 4;
+-const BLADERF_FORMAT_SC16_Q11: c_int = 1;
++const BLADERF_FORMAT_SC16_Q11: c_int = 0;
+ 
+ // bladerf_devinfo
+ #[repr(C)]
+@@ -52,6 +53,7 @@ extern "C" {
+         actual: *mut c_uint,
+     ) -> c_int;
+     fn bladerf_set_gain(dev: *mut BladerfDevice, ch: c_int, gain: c_int) -> c_int;
++    fn bladerf_set_bias_tee(dev: *mut BladerfDevice, ch: c_int, enable: bool) -> c_int;
+     fn bladerf_set_gain_mode(dev: *mut BladerfDevice, ch: c_int, mode: c_int) -> c_int;
+     fn bladerf_set_gain_stage(
+         dev: *mut BladerfDevice,
+@@ -91,16 +93,102 @@ extern "C" {
+     fn bladerf_enable_module(dev: *mut BladerfDevice, ch: c_int, enable: bool) -> c_int;
+     fn bladerf_get_device_list(devices: *mut *mut BladerfDevinfo) -> c_int;
+     fn bladerf_free_device_list(devices: *mut BladerfDevinfo);
+-    fn bladerf_enable_feature(
+-        dev: *mut BladerfDevice,
+-        feature: c_uint,
+-        enable: bool,
+-    ) -> c_int;
++    fn bladerf_enable_feature(dev: *mut BladerfDevice, feature: c_uint, enable: bool) -> c_int;
+ }
+ 
+ // BLADERF_FEATURE_OVERSAMPLE = 1
+ const BLADERF_FEATURE_OVERSAMPLE: c_uint = 1;
+ 
++/// Check setup on an exclusively owned open handle, closing it on failure.
++///
++/// Safety: `dev` must be the live handle used by the operation producing `status`.
++/// An error consumes that handle; the caller must immediately propagate it.
++unsafe fn check_rx_setup(
++    dev: *mut BladerfDevice,
++    status: c_int,
++    operation: &str,
++) -> Result<(), String> {
++    if status != 0 {
++        bladerf_close(dev);
++        return Err(format!("{} failed: {}", operation, status));
++    }
++    Ok(())
++}
++
++/// Configure an RX channel before streaming; every failed call closes the handle.
++///
++/// Safety: the caller owns the live `dev` handle exclusively and propagates errors
++/// immediately, without subsequently accessing or closing a consumed handle.
++unsafe fn configure_rx(
++    dev: *mut BladerfDevice,
++    channel: c_int,
++    sample_rate: u32,
++    center_freq: u64,
++    gain: i32,
++) -> Result<bool, String> {
++    if channel != BLADERF_CHANNEL_RX_0 && channel != BLADERF_CHANNEL_RX_1 {
++        bladerf_close(dev);
++        return Err("only bladeRF RX channels are supported".to_string());
++    }
++    let use_sc8 = sample_rate > 61_440_000;
++    check_rx_setup(
++        dev,
++        bladerf_enable_feature(dev, BLADERF_FEATURE_OVERSAMPLE, use_sc8),
++        "bladerf_enable_feature",
++    )?;
++    check_rx_setup(
++        dev,
++        bladerf_set_bandwidth(dev, channel, sample_rate.min(56_000_000), ptr::null_mut()),
++        "bladerf_set_bandwidth",
++    )?;
++    check_rx_setup(
++        dev,
++        bladerf_set_frequency(dev, channel, center_freq),
++        "bladerf_set_frequency",
++    )?;
++    let mode = if gain < 0 {
++        BLADERF_GAIN_DEFAULT
++    } else {
++        BLADERF_GAIN_MGC
++    };
++    check_rx_setup(
++        dev,
++        bladerf_set_gain_mode(dev, channel, mode),
++        "bladerf_set_gain_mode",
++    )?;
++    if gain >= 0 {
++        check_rx_setup(
++            dev,
++            bladerf_set_gain(dev, channel, gain),
++            "bladerf_set_gain",
++        )?;
++    }
++    Ok(use_sc8)
++}
++
++/// Require the configured rate to match the decoder's sample-time assumptions.
++/// Safety: the caller exclusively owns `dev` and propagates errors immediately.
++unsafe fn configure_rx_rate(
++    dev: *mut BladerfDevice,
++    channel: c_int,
++    requested: u32,
++) -> Result<(), String> {
++    let mut actual = 0;
++    check_rx_setup(
++        dev,
++        bladerf_set_sample_rate(dev, channel, requested, &mut actual),
++        "bladerf_set_sample_rate",
++    )?;
++    if actual != requested {
++        bladerf_close(dev);
++        return Err(format!(
++            "bladeRF sample rate mismatch: requested {}, actual {}",
++            requested, actual
++        ));
++    }
++    Ok(())
++}
++
+ #[derive(Debug, Clone)]
+ pub struct BladerfInfo {
+     pub instance: u32,
+@@ -151,12 +239,7 @@ pub struct BladerfSource {
+ }
+ 
+ impl BladerfSource {
+-    pub fn new(
+-        iface: &str,
+-        sample_rate: u32,
+-        center_freq: u64,
+-        gain: i32,
+-    ) -> Result<Self, String> {
++    pub fn new(iface: &str, sample_rate: u32, center_freq: u64, gain: i32) -> Result<Self, String> {
+         let instance = parse_instance(iface)
+             .ok_or_else(|| format!("invalid bladeRF interface: '{}' (expected bladerf0)", iface))?;
+ 
+@@ -188,26 +271,18 @@ impl SdrSource for BladerfSource {
+                 return Err(format!("bladerf_open failed: {}", r));
+             }
+ 
+-            // Only use oversample (SC8_Q7) when sample rate exceeds normal mode max (61.44 MHz)
+-            let use_sc8 = if self.sample_rate > 61_440_000 {
+-                bladerf_enable_feature(dev, BLADERF_FEATURE_OVERSAMPLE, true) == 0
+-            } else {
+-                false
+-            };
++            let use_sc8 = configure_rx(
++                dev,
++                BLADERF_CHANNEL_RX_0,
++                self.sample_rate,
++                self.center_freq,
++                self.gain,
++            )?;
+             let format = if use_sc8 {
+                 BLADERF_FORMAT_SC8_Q7
+             } else {
+-                let bw = self.sample_rate.min(56_000_000);
+-                bladerf_set_bandwidth(dev, BLADERF_CHANNEL_RX_0, bw, ptr::null_mut());
+                 BLADERF_FORMAT_SC16_Q11
+             };
+-            bladerf_set_frequency(dev, BLADERF_CHANNEL_RX_0, self.center_freq);
+-            if self.gain < 0 {
+-                bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_DEFAULT);
+-            } else {
+-                bladerf_set_gain_mode(dev, BLADERF_CHANNEL_RX_0, BLADERF_GAIN_MGC);
+-                bladerf_set_gain(dev, BLADERF_CHANNEL_RX_0, self.gain);
+-            }
+ 
+             let buf_size = (self.sample_rate / 1_000_000 / 2 * 4096).max(8192);
+             let r = bladerf_sync_config(dev, BLADERF_MODULE_RX, format, 16, buf_size, 8, 3500);
+@@ -217,14 +292,14 @@ impl SdrSource for BladerfSource {
+             }
+ 
+             // Set sample rate AFTER sync_config (must occur after format change)
+-            bladerf_set_sample_rate(
++            configure_rx_rate(dev, BLADERF_CHANNEL_RX_0, self.sample_rate)?;
++            check_rx_setup(
+                 dev,
+-                BLADERF_CHANNEL_RX_0,
+-                self.sample_rate,
+-                ptr::null_mut(),
+-            );
++                bladerf_set_bias_tee(dev, BLADERF_CHANNEL_RX_0, false),
++                "bladerf_set_bias_tee",
++            )?;
+ 
+-            let r = bladerf_enable_module(dev, BLADERF_MODULE_RX, true);
++            let r = bladerf_enable_module(dev, BLADERF_CHANNEL_RX_0, true);
+             if r != 0 {
+                 bladerf_close(dev);
+                 return Err(format!("bladerf_enable_module failed: {}", r));
+@@ -340,8 +415,9 @@ impl BladerfHandle {
+             .ok_or_else(|| format!("invalid bladeRF interface: '{}'", iface))?;
+ 
+         let rx_channel = match antenna {
+-            Some("RX2") | Some("rx2") => 1, // BLADERF_CHANNEL_RX(1)
+-            _ => BLADERF_CHANNEL_RX_0,
++            Some("RX2") | Some("rx2") => BLADERF_CHANNEL_RX_1,
++            None | Some("RX1") | Some("rx1") => BLADERF_CHANNEL_RX_0,
++            _ => return Err("bladeRF antenna must be RX1 or RX2".to_string()),
+         };
+ 
+         let identifier = CString::new(format!("*:instance={}", instance))
+@@ -354,26 +430,12 @@ impl BladerfHandle {
+                 return Err(format!("bladerf_open failed: {}", r));
+             }
+ 
+-            // Only use oversample (SC8_Q7) when sample rate exceeds normal mode max (61.44 MHz)
+-            let use_sc8 = if sample_rate > 61_440_000 {
+-                bladerf_enable_feature(dev, BLADERF_FEATURE_OVERSAMPLE, true) == 0
+-            } else {
+-                false
+-            };
++            let use_sc8 = configure_rx(dev, rx_channel, sample_rate, center_freq, gain)?;
+             let format = if use_sc8 {
+                 BLADERF_FORMAT_SC8_Q7
+             } else {
+-                let bw = sample_rate.min(56_000_000);
+-                bladerf_set_bandwidth(dev, rx_channel, bw, ptr::null_mut());
+                 BLADERF_FORMAT_SC16_Q11
+             };
+-            bladerf_set_frequency(dev, rx_channel, center_freq);
+-            if gain < 0 {
+-                bladerf_set_gain_mode(dev, rx_channel, BLADERF_GAIN_DEFAULT);
+-            } else {
+-                bladerf_set_gain_mode(dev, rx_channel, BLADERF_GAIN_MGC);
+-                bladerf_set_gain(dev, rx_channel, gain);
+-            }
+ 
+             // Buffer size: match C tool (channels/2 * 4096, minimum 8192)
+             let buf_size = (sample_rate / 1_000_000 / 2 * 4096).max(8192);
+@@ -384,9 +446,14 @@ impl BladerfHandle {
+             }
+ 
+             // Set sample rate AFTER sync_config (must occur after format change)
+-            bladerf_set_sample_rate(dev, rx_channel, sample_rate, ptr::null_mut());
++            configure_rx_rate(dev, rx_channel, sample_rate)?;
++            check_rx_setup(
++                dev,
++                bladerf_set_bias_tee(dev, rx_channel, false),
++                "bladerf_set_bias_tee",
++            )?;
+ 
+-            let r = bladerf_enable_module(dev, BLADERF_MODULE_RX, true);
++            let r = bladerf_enable_module(dev, rx_channel, true);
+             if r != 0 {
+                 bladerf_close(dev);
+                 return Err(format!("bladerf_enable_module failed: {}", r));
+@@ -527,7 +594,7 @@ impl BladerfHandle {
+ impl Drop for BladerfHandle {
+     fn drop(&mut self) {
+         unsafe {
+-            bladerf_enable_module(self.dev, BLADERF_MODULE_RX, false);
++            bladerf_enable_module(self.dev, self.rx_channel, false);
+             bladerf_close(self.dev);
+         }
+     }

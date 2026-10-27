@@ -21,6 +21,13 @@ component documentation.
 Cargo commands below name `-p bladerf-lab` explicitly; omitting the selector
 uses that default member.
 
+## Monitoring projects
+
+The [Bluetooth monitor](projects/bluetooth-monitor) provides passive BLE and
+Classic Bluetooth capture, Wireshark-compatible files, decoded JSON records,
+and independent BLE CRC validation. Its guide describes decoder setup, receive
+connector selection, coverage limits and offline inspection.
+
 ## Use it
 
 From this directory, after installing the native host stack:
@@ -73,11 +80,13 @@ example has bias tees off, preserves the factory oscillator trim, and starts at
 | [repos/bladeRF-wiki](repos/bladeRF-wiki) | Offline upstream guides and architecture documentation | Pinned Git commit |
 | [repos/SoapyBladeRF](repos/SoapyBladeRF) | bladeRF driver for SoapySDR | `soapy-bladerf-0.4.3` |
 | [repos/gr-bladeRF](repos/gr-bladeRF) | GNU Radio source/sink blocks and examples | Pinned Git commit plus [compatibility patch](patches/gr-bladeRF-fedora.patch) |
+| [repos/blue-dragon](repos/blue-dragon) | Rust BLE and Classic Bluetooth decoder | Pinned Git commit plus [RX setup patch](patches/blue-dragon-bladerf-rx-setup.patch) |
+| [repos/ice9-bluetooth-sniffer](repos/ice9-bluetooth-sniffer) | Optional BLE 1M reference decoder | Pinned Git commit plus [RX bias patch](patches/ice9-bluetooth-bladerf-rx-bias.patch) |
 
 These are Git submodules. Clone with `--recurse-submodules`, or run
 `git submodule update --init --recursive` in an existing checkout. Rust host setup
 applies the saved gr-bladeRF patch; that submodule reports intentional local
-modifications.
+modifications. The Bluetooth project guide covers its decoder patches and builds.
 
 ## Host setup and validation
 

@@ -8,7 +8,8 @@ the dependency resolution in [Cargo.lock](../Cargo.lock).
 The root [Cargo.toml](../Cargo.toml) is a virtual workspace with resolver 3,
 shared build profiles and a shared `target/` directory. Its default member is
 [`bladerf-lab`](../tools/bladerf-lab/README.md). Select an explicit package with
-`-p bladerf-lab` or `-p bladerf-docs`; use `--workspace` for both.
+`-p bladerf-lab`, `-p bladerf-docs` or `-p bluetooth-monitor`; use `--workspace`
+for all members.
 
 ## Lab tool features and native libraries
 
@@ -62,3 +63,11 @@ cargo run --locked -p bladerf-docs -- render --check
 Rendering handbook HTML or text uses Sphinx separately; see
 [BUILDING.md](BUILDING.md). Contribution checks and coding conventions are in
 [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+## Bluetooth monitor
+
+[`bluetooth-monitor`](../projects/bluetooth-monitor/README.md) builds with the
+same toolchain and lockfile. PCAP inspection has no native SDR prerequisite;
+live reception launches a separately built decoder. The project guide specifies
+the pinned decoder sources, compatibility patches and upstream lockfile needed
+for that build.
