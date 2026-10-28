@@ -1,0 +1,20 @@
+[package]
+name = "rf-observatory"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Wideband receiver references and verified FPGA channel-bank experiments"
+
+[dependencies]
+anyhow = "1"
+chrono = { default-features = false, features = ["clock", "std"], version = "0.4" }
+clap = { features = ["derive"], version = "4.5" }
+ctrlc = { features = ["termination"], version = "3.4" }
+rustfft = "6"
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

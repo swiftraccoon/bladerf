@@ -1,0 +1,139 @@
+diff --git a/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip b/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip
+index 2a97c1c9..498582fd 100644
+--- a/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip
++++ b/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip
+@@ -33,6 +33,12 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip trigg
+ set_global_assignment -name QIP_FILE  [file normalize [file join $nuand_ip pll_reset/pll_reset.qip]]
+ set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip ps_sync/vhdl/ps_sync.vhd]]
+ 
++# rf-observatory source files are copied into this directory by the isolated
++# build preparation command. The platform build selects VHDL-2008.
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_observatory_p.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_channel_bank.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_channel_framer.vhd]]
++
+ # Implementation Details
+ set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif_p.vhd]]
+ set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif.vhd]]
+diff --git a/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd b/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd
+index 4818f26e..7319e414 100644
+--- a/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd
++++ b/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd
+@@ -159,6 +159,20 @@ architecture hosted_bladerf of bladerf is
+     signal adc_streams            : sample_streams_t(adc_controls'range)  := (others => ZERO_SAMPLE);
+     signal adc_streams_last_v     : std_logic_vector(adc_controls'range)  := (others => '0');
+ 
++    -- rf-observatory fixed profile 1: this revision exports framed channel-bank
++    -- records, NOT ordinary RF IQ. See rf_channel_framer.vhd for the wire schema.
++    signal rf_controls            : sample_controls_t(adc_controls'range) := (others => SAMPLE_CONTROL_DISABLE);
++    signal rf_streams             : sample_streams_t(adc_streams'range) := (others => ZERO_SAMPLE);
++    signal rf_reset               : std_logic;
++    signal rf_source_rx2          : std_logic;
++    signal rf_source_i, rf_source_q : signed(15 downto 0);
++    signal rf_source_valid        : std_logic;
++    signal rf_config_error        : std_logic;
++    signal rf_trigger_arm_rx      : std_logic := '0';
++    signal rf_output_valid        : std_logic;
++    signal rf_output_i, rf_output_q : signed(15 downto 0);
++
++
+     signal   ps_sync              : std_logic_vector(0 downto 0)          := (others => '0');
+ 
+ 
+@@ -621,6 +635,51 @@ begin
+         end loop;
+     end process;
+ 
++    -- Receive sample clock and FPGA reset stay in the existing RX domain.
++    rf_reset <= rx_reset or not rx_enable;
++    -- Trigger control originates in the Nios domain. Synchronize this
++    -- diagnostic before the RX-domain framer latches configuration errors.
++    U_rf_sync_trigger_arm : entity work.synchronizer
++        generic map (RESET_LEVEL => '0')
++        port map (
++            reset => rf_reset, clock => rx_clock,
++            async => rx_trigger_ctl.arm, sync => rf_trigger_arm_rx
++        );
++    rf_source_rx2 <= '1' when adc_controls(1).enable = '1' and adc_controls(0).enable = '0' else '0';
++    rf_source_i <= adc_streams(1).data_i when rf_source_rx2 = '1' else adc_streams(0).data_i;
++    rf_source_q <= adc_streams(1).data_q when rf_source_rx2 = '1' else adc_streams(0).data_q;
++    rf_source_valid <= adc_streams(1).data_v when rf_source_rx2 = '1' else adc_streams(0).data_v;
++    rf_config_error <= '1' when
++        not ((adc_controls(0).enable = '1' and adc_controls(1).enable = '0') or
++             (adc_controls(0).enable = '0' and adc_controls(1).enable = '1')) or
++        meta_en_rx = '1' or eightbit_en_rx = '1' or highly_packed_en_txrx = '1' or
++        packet_en_rx = '1' or rx_mux_sel /= 0 or rf_trigger_arm_rx = '1'
++        else '0';
++
++    U_rf_channel_framer : entity work.rf_channel_framer
++        port map (
++            clock => rx_clock, reset => rf_reset,
++            s_valid => rf_source_valid, s_i => rf_source_i, s_q => rf_source_q,
++            source_rx2 => rf_source_rx2, configuration_error => rf_config_error,
++            fifo_overflow => rx_overflow_led,
++            m_valid => rf_output_valid, m_ready => '1',
++            m_i => rf_output_i, m_q => rf_output_q
++        );
++
++    process(all)
++    begin
++        rf_controls <= (others => SAMPLE_CONTROL_DISABLE);
++        rf_streams <= (others => ZERO_SAMPLE);
++        rf_controls(0).enable <= adc_controls(0).enable or adc_controls(1).enable;
++        rf_controls(0).data_req <= '1';
++        rf_streams(0).data_i <= rf_output_i;
++        rf_streams(0).data_q <= rf_output_q;
++        rf_streams(0).data_v <= rf_output_valid;
++    end process;
++
++    -- Existing FIFO/FX3 path carries one logical stream of framed int16 words.
++    -- RX sample metadata, packing, trigger and alternate mux modes are disabled.
++    -- TX and the existing RFIC/USB control paths retain their upstream behavior.
+     -- RX Submodule
+     U_rx : entity work.rx
+         generic map (
+@@ -631,25 +690,25 @@ begin
+             rx_clock               => rx_clock,
+             rx_enable              => rx_enable,
+ 
+-            meta_en                => meta_en_rx,
++            meta_en                => '0',
+             timestamp_reset        => rx_ts_reset,
+             usb_speed              => usb_speed_rx,
+-            rx_mux_sel             => rx_mux_sel,
++            rx_mux_sel             => to_unsigned(0, rx_mux_sel'length),
+             rx_overflow_led        => rx_overflow_led,
+             rx_timestamp           => rx_timestamp,
+ 
+             -- Triggering
+-            trigger_arm            => rx_trigger_ctl.arm,
+-            trigger_fire           => rx_trigger_ctl.fire,
+-            trigger_master         => rx_trigger_ctl.master,
++            trigger_arm            => '0',
++            trigger_fire           => '0',
++            trigger_master         => '0',
+             trigger_line           => rx_trigger_line,
+ 
+             -- Packed modes
+-            eight_bit_mode_en      => eightbit_en_rx,
+-            highly_packed_mode_en  => highly_packed_en_txrx,
++            eight_bit_mode_en      => '0',
++            highly_packed_mode_en  => '0',
+ 
+             -- Packet FIFO
+-            packet_en              => packet_en_rx,
++            packet_en              => '0',
+             packet_control         => rx_packet_control,
+             packet_ready           => rx_packet_ready,
+ 
+@@ -684,8 +743,8 @@ begin
+             loopback_fifo_wused    => tx_loopback_fifo.wused,
+ 
+             -- RFFE Interface
+-            adc_controls           => adc_controls,
+-            adc_streams            => adc_streams
++            adc_controls           => rf_controls,
++            adc_streams            => rf_streams
+         );
+ 
+     adc_assignment_proc : process( all )

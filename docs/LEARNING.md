@@ -219,6 +219,12 @@ includes Cyclone V support. The current upstream
 and master README recommend **23.1.1** instead. Device support and project/IP
 compatibility are separate questions: newer versions can change Nios II tools
 or IP generation, so follow the instructions for the checked-out revision.
+The RF observatory's build workflow selects **23.1.1** and begins with the
+unmodified pinned design as its baseline.
+The Nios II compiler's presence does not establish availability of the required
+`altera_nios2_gen2` processor generator. The
+[channel-bank build guide](../projects/rf-observatory/hdl/README.md#quartus-baseline-and-custom-image-build)
+explains the 25.1 catalog incompatibility and baseline procedure.
 
 Start with the [micro hosted top level](../repos/bladeRF/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd),
 [receive path](../repos/bladeRF/hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd),

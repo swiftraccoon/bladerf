@@ -8,7 +8,8 @@ the dependency resolution in [Cargo.lock](../Cargo.lock).
 The root [Cargo.toml](../Cargo.toml) is a virtual workspace with resolver 3,
 shared build profiles and a shared `target/` directory. Its default member is
 [`bladerf-lab`](../tools/bladerf-lab/README.md). Select an explicit package with
-`-p bladerf-lab`, `-p bladerf-docs`, `-p bluetooth-monitor` or `-p wifi-monitor`;
+`-p bladerf-lab`, `-p bladerf-docs`, `-p bluetooth-monitor`, `-p wifi-monitor`
+or `-p rf-observatory`;
 use `--workspace` for all members.
 
 ## Lab tool features and native libraries
@@ -107,3 +108,19 @@ Its reproducibility inputs are
 Build it with explicit `--bin rx` and the `soapy` feature, using the
 [project instructions](../projects/wifi-monitor/README.md#build-the-optional-live-engine).
 Runtime reception requires SoapySDR, SoapyBladeRF and libbladeRF.
+
+## RF observatory
+
+[`rf-observatory`](../projects/rf-observatory/README.md) uses the stable workspace
+toolchain and lockfile. Its Rust references, saved-IQ processing and controlled
+waveform generation need no native SDR library. Live ordinary-IQ recording
+launches the separately built `bladerf-lab` radio adapter.
+
+The FPGA arithmetic and stream wrapper are VHDL-2008, integrated into Nuand's
+existing VHDL design. This target-specific hardware description is separate
+from the Rust host code. HDL verification uses **GHDL 3.0.0** for simulation and
+generic synthesis. That does not produce a device bitstream or establish timing.
+Cyclone V builds use **Quartus Prime Lite 23.1.1**, Cyclone V device support and
+matching Nios II tools. The pinned upstream source originally specified 20.1.1;
+the selected version follows Nuand's current build guidance. See the
+[HDL build guide](../projects/rf-observatory/hdl/README.md) for exact stages.

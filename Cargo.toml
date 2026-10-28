@@ -1,6 +1,6 @@
 [workspace]
 default-members = ["tools/bladerf-lab"]
-members = ["projects/bluetooth-monitor", "projects/wifi-monitor", "tools/bladerf-docs", "tools/bladerf-lab"]
+members = ["projects/bluetooth-monitor", "projects/wifi-monitor", "projects/rf-observatory", "tools/bladerf-docs", "tools/bladerf-lab"]
 resolver = "3"
 
 [workspace.package]

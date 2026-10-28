@@ -36,6 +36,11 @@ the two workflows, decoder limits and replaying saved IQ.
 Channel surveys, saved-PCAP inventories and repeated captures aggregate
 observations while recording gaps and managing local retention.
 
+The [RF observatory](projects/rf-observatory) adds wideband recording,
+four-channel FM reference reception and an FPGA NCO/CIC channel bank. Its guide
+separates software replay, bit-exact HDL simulation, generic synthesis and the
+Quartus/board qualification steps.
+
 ## Use it
 
 From this directory, after installing the native host stack:
