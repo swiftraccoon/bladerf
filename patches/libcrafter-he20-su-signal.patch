@@ -1,0 +1,392 @@
+--- a/crafter/src/radio/codec.rs
++++ b/crafter/src/radio/codec.rs
+@@ -38,6 +38,15 @@
+         fields: HtSignalFields,
+         preamble_sample_index: u64,
+     },
++    /// An integrity-checked HE20 SU SIG-A header in source sample coordinates.
++    HeSuSignal {
++        preamble_sample_index: u64,
++        mcs: u8,
++        space_time_streams: u8,
++        ldpc: bool,
++        guard_interval_ns: u16,
++        bss_color: u8,
++    },
+     Reset(ResetReason),
+     TruncatedFrame,
+     InvalidHeader,
+@@ -179,6 +188,24 @@
+                     data_symbols: f,
+                 },
+             ) => a.map(f32::to_bits) == d.map(f32::to_bits) && b.to_bits() == e.to_bits() && c == f,
++            (
++                Self::HeSuSignal {
++                    preamble_sample_index: a,
++                    mcs: b,
++                    space_time_streams: c,
++                    ldpc: d,
++                    guard_interval_ns: e,
++                    bss_color: f,
++                },
++                Self::HeSuSignal {
++                    preamble_sample_index: g,
++                    mcs: h,
++                    space_time_streams: i,
++                    ldpc: j,
++                    guard_interval_ns: k,
++                    bss_color: l,
++                },
++            ) => (a, b, c, d, e, f) == (g, h, i, j, k, l),
+             (Self::Reset(a), Self::Reset(b)) => a == b,
+             (Self::OfdmRecovery { attempts: a }, Self::OfdmRecovery { attempts: b }) => a == b,
+             (
+--- a/crafter/src/radio/wifi/decoder.rs
++++ b/crafter/src/radio/wifi/decoder.rs
+@@ -17,7 +17,7 @@
+ /// extension training are supported. `max_frame_bytes` bounds each MPDU;
+ /// `max_pending_frames` must accommodate the returned MPDUs plus two reserved
+ /// child slots. Overflow is an explicit error, never a truncated aggregate.
+-/// Additional data streams, HT40, VHT, HE and EHT are not decoded. This
++/// Additional data streams, HT40, VHT, HE and EHT DATA are not decoded. This
+ /// implements the same `PhyDecoder` packet-source interface and shares the
+ /// bounds and output ordering of `LegacyWifiDecoder`.
+ pub struct WifiDecoder {
+@@ -37,6 +37,13 @@
+     pub fn new() -> Self {
+         Self::default()
+     }
++    /// Observe integrity-checked HE20 SU signaling on strongly acquired preambles.
++    ///
++    /// Disabled by default. Events use the source sample coordinates and the
++    /// decoder's existing diagnostic output limit. Frame decoding is unchanged.
++    pub fn set_he_su_signal_events(&mut self, enabled: bool) {
++        self.inner.ofdm.set_he_su_signal_events(enabled);
++    }
+     pub fn ofdm_stats(&self) -> DecoderStats {
+         self.inner.ofdm_stats()
+     }
+@@ -146,6 +153,7 @@
+         let mut dsss_config = ofdm_config.clone();
+         dsss_config.max_buffer_samples = 128;
+         dsss_config.max_pending_frames = 1;
++        let mut he_su_signals = Vec::new();
+         for (index, samples) in chunk.cs8().chunks(256).enumerate() {
+             if self.ofdm.uses_ht() {
+                 self.ofdm.set_output_allowance(
+@@ -197,11 +205,20 @@
+                 out.frames.push(frame);
+             }
+             for diagnostic in first.diagnostics.into_iter().chain(second.diagnostics) {
+-                if out.diagnostics.len() < config.max_pending_frames {
++                if matches!(diagnostic, PhyDiagnostic::HeSuSignal { .. }) {
++                    if he_su_signals.len() < config.max_pending_frames {
++                        he_su_signals.push(diagnostic);
++                    }
++                } else if out.diagnostics.len() < config.max_pending_frames {
+                     out.diagnostics.push(diagnostic);
+                 }
+             }
+         }
++        let available = config
++            .max_pending_frames
++            .saturating_sub(out.diagnostics.len());
++        out.diagnostics
++            .extend(he_su_signals.into_iter().take(available));
+         Ok(out)
+     }
+ }
+--- a/crafter/src/radio/wifi/ht/mod.rs
++++ b/crafter/src/radio/wifi/ht/mod.rs
+@@ -13,5 +13,5 @@
+     HtCoding, HtFormat, HtGuardInterval, HtMcs, HtSignalBits, HtTransmission, HtTxConfig,
+ };
+ 
+-pub(super) use signal::{decode_iq, decode_iq_at};
++pub(super) use signal::{crc as signal_crc, decode_iq, decode_iq_at};
+ pub(super) use training::{train_single_stream, train_stbc_second};
+--- a/crafter/src/radio/wifi/ht/signal.rs
++++ b/crafter/src/radio/wifi/ht/signal.rs
+@@ -137,7 +137,7 @@
+     }
+ }
+ 
+-pub(super) fn crc(bits: &[u8]) -> u8 {
++pub(in crate::radio::wifi) fn crc(bits: &[u8]) -> u8 {
+     let mut state = 255u8;
+     for &bit in bits {
+         let feedback = (state >> 7) ^ bit;
+--- a/crafter/src/radio/wifi/ofdm/he_su.rs
++++ b/crafter/src/radio/wifi/ofdm/he_su.rs
+@@ -0,0 +1,193 @@
++//! HE20 SU SIG-A observation after legacy OFDM acquisition.
++
++use super::{
++    signal::{decode_bcc, decode_signal, SignalInfo},
++    sync::{fft64, Acquisition},
++};
++use crate::radio::{codec::PhyDiagnostic, wifi::ht::signal_crc, ComplexSample};
++
++const SYMBOL_SAMPLES: usize = 80;
++const REPEATED_HEADER_SAMPLES: usize = 2 * SYMBOL_SAMPLES;
++const PREFIX_SAMPLES: usize = 4 * SYMBOL_SAMPLES;
++
++/// The observer owns one bounded prefix buffer outside the DATA reservations.
++#[derive(Default)]
++pub(super) struct Observer {
++    pending: Option<Prefix>,
++}
++
++struct Prefix {
++    acquisition: Acquisition,
++    samples: [ComplexSample; PREFIX_SAMPLES],
++    count: usize,
++    legacy: Option<SignalInfo>,
++}
++
++impl Observer {
++    pub(super) fn start(&mut self, acquisition: &Acquisition) {
++        if self.pending.is_none() {
++            self.pending = Some(Prefix {
++                acquisition: acquisition.clone(),
++                samples: [ComplexSample::ZERO; PREFIX_SAMPLES],
++                count: 0,
++                legacy: None,
++            });
++        }
++    }
++
++    pub(super) fn reset(&mut self) {
++        self.pending = None;
++    }
++
++    pub(super) fn push(&mut self, sample: ComplexSample) -> Option<PhyDiagnostic> {
++        let prefix = self.pending.as_mut()?;
++        prefix.samples[prefix.count] = sample;
++        prefix.count += 1;
++        match prefix.count {
++            SYMBOL_SAMPLES => {
++                prefix.legacy =
++                    decode_signal(&prefix.samples[..SYMBOL_SAMPLES], &prefix.acquisition, 4095)
++                        .ok()
++                        .filter(|signal| {
++                            signal.rate_bps == 6_000_000 && signal.psdu_bytes % 3 == 1
++                        });
++                if prefix.legacy.is_none() {
++                    self.reset();
++                }
++                None
++            }
++            REPEATED_HEADER_SAMPLES => {
++                let mut repeated = prefix.acquisition.clone();
++                // This position was already checked by the L-SIG decoder.
++                let legacy = prefix.legacy?;
++                repeated.signal_start = legacy.data_start;
++                let signal = decode_signal(
++                    &prefix.samples[SYMBOL_SAMPLES..REPEATED_HEADER_SAMPLES],
++                    &repeated,
++                    4095,
++                );
++                if !signal.is_ok_and(|signal| {
++                    signal.rate_bps == 6_000_000
++                        && prefix
++                            .legacy
++                            .is_some_and(|legacy| signal.psdu_bytes == legacy.psdu_bytes)
++                }) {
++                    self.reset();
++                }
++                None
++            }
++            PREFIX_SAMPLES => {
++                let prefix = self.pending.take()?;
++                decode_prefix(&prefix.samples, &prefix.acquisition)
++            }
++            _ => None,
++        }
++    }
++}
++
++/// Phase-correct one signaling symbol using the legacy long-training estimate.
++fn corrected_bins(
++    samples: &[ComplexSample; PREFIX_SAMPLES],
++    symbol: usize,
++    acquisition: &Acquisition,
++) -> Option<[ComplexSample; 64]> {
++    let offset = symbol * SYMBOL_SAMPLES + 16;
++    let elapsed = acquisition
++        .signal_start
++        .checked_add(offset as u64)?
++        .checked_sub(acquisition.phase_origin)?;
++    let bins = fft64(std::array::from_fn(|index| {
++        samples[offset + index].mul(ComplexSample::rotation(
++            -acquisition.frequency_rad * (elapsed + index as u64) as f32,
++        ))
++    }));
++    let mut pilot = ComplexSample::ZERO;
++    for (tone, sign) in [(43, 1.), (57, 1.), (7, 1.), (21, -1.)] {
++        pilot = pilot.add(bins[tone].mul(acquisition.channel[tone].conj()).scale(sign));
++    }
++    if !pilot.power().is_finite() || pilot.power() < 1e-12 {
++        return None;
++    }
++    let correction = ComplexSample::rotation(-pilot.phase());
++    Some(bins.map(|bin| bin.mul(correction)))
++}
++
++fn decode_prefix(
++    samples: &[ComplexSample; PREFIX_SAMPLES],
++    acquisition: &Acquisition,
++) -> Option<PhyDiagnostic> {
++    // Follow libcrafter 00f1fed7 HE SU SIG-A demodulation. L-SIG and RL-SIG
++    // supply channel estimates for the four tones absent from legacy L-LTF.
++    let legacy = corrected_bins(samples, 0, acquisition)?;
++    let repeated = corrected_bins(samples, 1, acquisition)?;
++    let mut channel = acquisition.channel;
++    for (tone, sign) in [(36, -1.), (37, -1.), (27, -1.), (28, 1.)] {
++        channel[tone] = legacy[tone].add(repeated[tone]).scale(0.5 * sign);
++    }
++    let mut metrics = [0.; 104];
++    for symbol in 0..2 {
++        let observed = corrected_bins(samples, symbol + 2, acquisition)?;
++        let (mut real, mut quadrature) = (0., 0.);
++        for (index, tone) in (-28i32..=28)
++            .filter(|tone| ![-21, -7, 0, 7, 21].contains(tone))
++            .enumerate()
++        {
++            let bin = tone.rem_euclid(64) as usize;
++            let weighted = observed[bin].mul(channel[bin].conj());
++            metrics[symbol * 52 + index] = weighted.i;
++            real += weighted.i * weighted.i;
++            quadrature += weighted.q * weighted.q;
++        }
++        if !real.is_finite() || !quadrature.is_finite() || real < 1e-12 || real <= 4. * quadrature {
++            return None;
++        }
++    }
++    let scale = metrics.iter().map(|metric| metric.abs()).fold(0., f32::max);
++    let coded: [f32; 104] = std::array::from_fn(|index| {
++        let bit = index % 52;
++        metrics[52 * (index / 52) + 4 * (bit % 13) + bit / 13] / scale
++    });
++    let pairs: [[f32; 2]; 52] =
++        std::array::from_fn(|index| [coded[2 * index], coded[2 * index + 1]]);
++    signal_fields(&decode_bcc(&pairs), acquisition.preamble_start)
++}
++
++/// HE SU fields and integrity checks follow IEEE 802.11ax-2021 Tables 27-18/19/35.
++fn signal_fields(bits: &[u8; 52], preamble_sample_index: u64) -> Option<PhyDiagnostic> {
++    let expected_crc = signal_crc(&bits[..42]) >> 4;
++    let received_crc = bits[42..46].iter().fold(0, |crc, bit| (crc << 1) | bit);
++    if expected_crc != received_crc || bits[46..].iter().any(|bit| *bit != 0) {
++        return None;
++    }
++    let field = |start: usize, length: usize| {
++        bits[start..start + length]
++            .iter()
++            .enumerate()
++            .fold(0, |value, (index, bit)| value | (bit << index))
++    };
++    let mcs = field(3, 4);
++    let ldpc = bits[33] != 0;
++    if bits[0] != 1
++        || bits[14] != 1
++        || bits[40] != 1
++        || (!ldpc && bits[34] != 1)
++        || mcs > 11
++        || field(19, 2) != 0
++    {
++        return None;
++    }
++    let gi = usize::from(field(21, 2));
++    let guard_interval_ns = if bits[7] != 0 && bits[35] != 0 {
++        (gi == 3).then_some(800)?
++    } else {
++        [800, 800, 1600, 3200][gi]
++    };
++    Some(PhyDiagnostic::HeSuSignal {
++        preamble_sample_index,
++        mcs,
++        space_time_streams: field(23, if bits[41] != 0 { 2 } else { 3 }) + 1,
++        ldpc,
++        guard_interval_ns,
++        bss_color: field(8, 6),
++    })
++}
+--- a/crafter/src/radio/wifi/ofdm/mod.rs
++++ b/crafter/src/radio/wifi/ofdm/mod.rs
+@@ -1,6 +1,7 @@
+ //! Legacy OFDM receive, transmit, and shared waveform internals.
+ 
+ pub(in crate::radio) mod demod;
++mod he_su;
+ pub(in crate::radio) mod rx;
+ pub(in crate::radio) mod signal;
+ pub(in crate::radio) mod sync;
+--- a/crafter/src/radio/wifi/ofdm/rx.rs
++++ b/crafter/src/radio/wifi/ofdm/rx.rs
+@@ -1,6 +1,7 @@
+ //! Legacy OFDM streaming coordination with optional HT receive delegation.
+ use super::{
+     demod::{decode_data, valid_fcs},
++    he_su,
+     signal::{decode_signal, SignalInfo},
+     sync::{Acquisition, AcquisitionFailure, StrongLongTrainingFailure, SyncEvent, Synchronizer},
+ };
+@@ -399,6 +400,7 @@
+     data_failures: OfdmDataFailureStats,
+     strong_long_training: OfdmStrongLongTrainingStats,
+     ht: ht::rx::Receiver,
++    he_su: Option<Box<he_su::Observer>>,
+     // Dispatcher output budget is not a capture reconfiguration. Changing
+     // RxConfig between internal slices would discard an in-flight PPDU.
+     output_allowance: Option<usize>,
+@@ -473,6 +475,13 @@
+             ..Self::default()
+         }
+     }
++    pub(in crate::radio) fn set_he_su_signal_events(&mut self, enabled: bool) {
++        if enabled {
++            self.he_su.get_or_insert_with(Box::default);
++        } else {
++            self.he_su = None;
++        }
++    }
+     pub(in crate::radio) fn uses_ht(&self) -> bool {
+         self.ht.accepts_ht()
+     }
+@@ -530,6 +539,9 @@
+             out.diagnostics.push(PhyDiagnostic::TruncatedFrame);
+         }
+         self.sync.reset();
++        if let Some(observer) = &mut self.he_su {
++            observer.reset();
++        }
+         self.continuity.reset();
+         self.terminal = matches!(reason, ResetReason::End(_));
+         out.diagnostics.push(PhyDiagnostic::Reset(reason));
+@@ -558,6 +570,13 @@
+         }
+         for (offset, sample) in chunk.normalized().enumerate() {
+             let index = chunk.position().sample_index + offset as u64;
++            if let Some(diagnostic) = self
++                .he_su
++                .as_mut()
++                .and_then(|observer| observer.push(sample))
++            {
++                out.diagnostics.push(diagnostic);
++            }
+             for slot in 0..self.pending.len() {
+                 // Header reservations on the original acquisition path take
+                 // priority over the optional weak-training hypothesis.
+@@ -782,6 +801,11 @@
+                 let weak = matches!(event, SyncEvent::WeakAcquired(_));
+                 match event {
+                     SyncEvent::Acquired(a) | SyncEvent::WeakAcquired(a) => {
++                        if !weak {
++                            if let Some(observer) = &mut self.he_su {
++                                observer.start(&a);
++                            }
++                        }
+                         // The two searches can locate the same training pair.
+                         // Prefer the original path before either DATA decode.
+                         if weak

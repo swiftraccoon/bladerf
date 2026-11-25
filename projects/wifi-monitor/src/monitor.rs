@@ -47,6 +47,9 @@ pub(crate) struct Watch {
     /// Finite capture count; use a fresh output directory for another run.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=1000))]
     cycles: u16,
+    /// Stop after this many consecutive incomplete attempts.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=100))]
+    max_consecutive_failures: u16,
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u16).range(1..=100))]
     keep_sessions: u16,
     #[arg(long)]
@@ -99,6 +102,7 @@ struct Plan {
     radio: Receive,
     channels: Vec<u16>,
     cycles: u16,
+    max_consecutive_failures: Option<u16>,
     keep_sessions: Option<usize>,
     retained_limit: u64,
     output: Option<PathBuf>,
@@ -128,6 +132,17 @@ impl Plan {
             super::frequency(self.radio.band, Some(*channel))?;
         }
         ensure!((1..=1000).contains(&self.cycles), "cycles must be 1..=1000");
+        ensure!(
+            (self.mode == "survey"
+                && self.keep_sessions.is_none()
+                && self.max_consecutive_failures.is_none())
+                || (self.mode == "watch"
+                    && self.keep_sessions.is_some()
+                    && self
+                        .max_consecutive_failures
+                        .is_some_and(|limit| (1..=100).contains(&limit))),
+            "invalid survey/watch retention or failure policy"
+        );
         ensure!(
             self.retained_limit > 0 && self.keep_sessions.is_none_or(|keep| keep > 0),
             "retention bounds must be positive"
@@ -175,6 +190,7 @@ pub(crate) fn survey(
             radio: args.radio,
             channels,
             cycles: 1,
+            max_consecutive_failures: None,
             keep_sessions: None,
             retained_limit: byte_limit(args.retained_limit_mib)?,
             output: args.output,
@@ -198,6 +214,7 @@ pub(crate) fn watch(
             radio: args.radio,
             channels: vec![channel],
             cycles: args.cycles,
+            max_consecutive_failures: Some(args.max_consecutive_failures),
             keep_sessions: Some(usize::from(args.keep_sessions)),
             retained_limit: byte_limit(args.retained_limit_mib)?,
             output: args.output,
@@ -341,6 +358,26 @@ struct RunState {
     inventory: Inventory,
 }
 
+fn attempt_succeeded(attempt: &Attempt) -> bool {
+    attempt.capture_succeeded && attempt.inventory_ingested && !attempt.interrupted
+}
+
+fn failure_streaks(attempts: &[Attempt]) -> (usize, usize) {
+    let mut current = 0;
+    let mut maximum = 0;
+    for attempt in attempts {
+        if attempt.interrupted {
+            continue;
+        } else if attempt_succeeded(attempt) {
+            current = 0;
+        } else {
+            current += 1;
+            maximum = maximum.max(current);
+        }
+    }
+    (current, maximum)
+}
+
 fn save_run(
     directory: &Path,
     plan: &Plan,
@@ -351,6 +388,7 @@ fn save_run(
     stop_reason: Option<&str>,
 ) -> Result<()> {
     let channels = channel_accounting(&state.attempts, elapsed);
+    let (consecutive_failures, maximum_consecutive_failures) = failure_streaks(&state.attempts);
     let sample_seconds: f64 = state
         .attempts
         .iter()
@@ -369,10 +407,13 @@ fn save_run(
         &serde_json::to_vec_pretty(&json!({
             "mode":plan.mode,"engine":plan.radio.engine,"channels_requested":plan.channels,
             "cycles_requested":plan.cycles,"attempts_requested":plan.channels.len()*usize::from(plan.cycles),
+            "max_consecutive_failures":plan.max_consecutive_failures,
+            "consecutive_failures_at_end":consecutive_failures,
+            "maximum_consecutive_failures_observed":maximum_consecutive_failures,
             "finished":finished,"plan_completed":finished && !interrupted && stop_reason.is_none()
                 && state.attempts.len()==plan.channels.len()*usize::from(plan.cycles),
             "successful":finished && !interrupted && stop_reason.is_none()
-                && state.attempts.iter().all(|a|a.capture_succeeded && a.inventory_ingested),
+                && state.attempts.iter().all(attempt_succeeded),
             "interrupted":interrupted,"stop_reason":stop_reason,
             "elapsed_wall_seconds":elapsed,"recorded_sample_seconds":complete_sample_seconds,
             "known_recorded_sample_seconds":sample_seconds,"attempts_without_sample_time":unknown_sample_times,
@@ -403,8 +444,9 @@ fn prune(directory: &Path, state: &mut RunState, log: &mut File) -> Result<bool>
 }
 
 /// Execute a finite plan. Capture errors preserve evidence and allow a survey to
-/// visit remaining channels. Watch stops on its first failed or interrupted
-/// attempt. Successful aggregate publication precedes any retention deletion.
+/// visit remaining channels. Watch continues after isolated failures, but stops
+/// at its bounded consecutive-failure limit. Successful aggregate publication
+/// precedes any retention deletion.
 fn run_plan(
     directory: &Path,
     plan: &Plan,
@@ -422,6 +464,8 @@ fn run_plan(
     save_inventory(directory, &state.inventory)?;
     save_run(directory, plan, &state, 0.0, false, false, None)?;
     let mut stop_reason = None;
+    let mut progress_error = None;
+    let mut consecutive_failures = 0u16;
     'cycles: for _ in 0..plan.cycles {
         for channel in &plan.channels {
             if stop.load(Ordering::Relaxed) {
@@ -504,7 +548,7 @@ fn run_plan(
             } else {
                 attempt.inventory_error = Some("no completed candidate PCAP".into());
             }
-            let succeeded = attempt.capture_succeeded && attempt.inventory_ingested && !interrupted;
+            let succeeded = attempt_succeeded(&attempt);
             save_inventory(directory, &state.inventory)?;
             journal(
                 &mut log,
@@ -512,7 +556,10 @@ fn run_plan(
             )?;
             state.attempts.push(attempt);
             if succeeded {
+                consecutive_failures = 0;
                 state.retained.push_back((index, session));
+            } else if !interrupted {
+                consecutive_failures += 1;
             }
             if plan.keep_sessions.is_some() {
                 while tree_bytes(directory)? > plan.retained_limit && state.retained.len() > 1 {
@@ -528,14 +575,19 @@ fn run_plan(
                 interrupted,
                 None,
             )?;
-            println!(
+            if let Err(error) = writeln!(
+                std::io::stdout().lock(),
                 "Channel {channel}: {} (attempt {index})",
                 if succeeded {
                     "captured and inventoried"
                 } else {
                     "incomplete; evidence retained"
                 }
-            );
+            ) {
+                progress_error = Some(error);
+                stop_reason = Some("progress_output_failed");
+                break 'cycles;
+            }
             if tree_bytes(directory)? > plan.retained_limit {
                 stop_reason = Some("retained_byte_threshold_after_capture");
                 break 'cycles;
@@ -544,8 +596,11 @@ fn run_plan(
                 stop_reason = Some("interrupted");
                 break 'cycles;
             }
-            if !succeeded && plan.keep_sessions.is_some() {
-                stop_reason = Some("failed_watch_attempt");
+            if plan
+                .max_consecutive_failures
+                .is_some_and(|limit| consecutive_failures >= limit)
+            {
+                stop_reason = Some("consecutive_failure_limit_reached");
                 break 'cycles;
             }
         }
@@ -560,23 +615,29 @@ fn run_plan(
         interrupted,
         stop_reason,
     )?;
-    println!(
-        "Inventory: {} networks, {} observed addresses",
-        state.inventory.report().networks.len(),
-        state.inventory.report().observed_addresses.len()
-    );
-    println!("Output directory: {}", directory.display());
+    if let Some(error) = progress_error {
+        return Err(error).context("write monitoring progress");
+    }
+    print_inventory(&state.inventory, directory)?;
     ensure!(
-        stop_reason.is_none()
-            && !interrupted
-            && state
-                .attempts
-                .iter()
-                .all(|a| a.capture_succeeded && a.inventory_ingested),
+        stop_reason.is_none() && !interrupted && state.attempts.iter().all(attempt_succeeded),
         "monitoring plan incomplete or had failed attempts; see {}",
         directory.join("run.json").display()
     );
     Ok(())
+}
+
+fn print_inventory(inventory: &Inventory, directory: &Path) -> Result<()> {
+    let report = inventory.report();
+    let mut stdout = std::io::stdout().lock();
+    writeln!(
+        stdout,
+        "Inventory: {} networks, {} observed addresses",
+        report.networks.len(),
+        report.observed_addresses.len()
+    )?;
+    writeln!(stdout, "Output directory: {}", directory.display())?;
+    stdout.flush().context("flush inventory output")
 }
 
 pub(crate) fn inventory(root: &Path, args: InventoryArgs, stop: &AtomicBool) -> Result<()> {
@@ -642,13 +703,7 @@ pub(crate) fn inventory(root: &Path, args: InventoryArgs, stop: &AtomicBool) -> 
         "inventory interrupted; completed inputs preserved in {}",
         directory.display()
     );
-    println!(
-        "Inventory: {} networks, {} observed addresses",
-        inventory.report().networks.len(),
-        inventory.report().observed_addresses.len()
-    );
-    println!("Output directory: {}", directory.display());
-    Ok(())
+    print_inventory(&inventory, &directory)
 }
 
 #[cfg(test)]
@@ -676,6 +731,7 @@ mod tests {
             radio: args.radio,
             channels,
             cycles,
+            max_consecutive_failures: (mode == "watch").then_some(3),
             keep_sessions: keep,
             retained_limit: 1024 * 1024,
             output: None,
@@ -757,6 +813,155 @@ mod tests {
     }
 
     #[test]
+    fn watch_continues_after_isolated_failures_and_resets_streak() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = plan("watch", vec![6], 4, Some(1));
+        plan.max_consecutive_failures = Some(2);
+        let mut attempt = 0;
+        let result = run_plan(
+            directory.path(),
+            &plan,
+            &AtomicBool::new(false),
+            |args, path, stop| {
+                attempt += 1;
+                if attempt % 2 == 1 {
+                    anyhow::bail!("synthetic transient failure");
+                }
+                empty_capture(args, path, stop)
+            },
+        );
+        assert!(result.is_err());
+        let run = read_run(directory.path());
+        assert_eq!(run["attempts"].as_array().unwrap().len(), 4);
+        assert_eq!(run["plan_completed"], true);
+        assert_eq!(run["successful"], false);
+        assert_eq!(run["stop_reason"], serde_json::Value::Null);
+        assert_eq!(run["consecutive_failures_at_end"], 0);
+        assert_eq!(run["maximum_consecutive_failures_observed"], 1);
+        assert!(directory.path().join("sessions/000001-ch006").is_dir());
+        assert!(directory.path().join("sessions/000003-ch006").is_dir());
+        assert_eq!(run["attempts"][1]["capture_succeeded"], true);
+        assert_eq!(run["attempts"][3]["capture_succeeded"], true);
+    }
+
+    #[test]
+    fn watch_stops_at_consecutive_failure_limit_and_retains_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = plan("watch", vec![6], 4, Some(1));
+        plan.max_consecutive_failures = Some(2);
+        let result = run_plan(
+            directory.path(),
+            &plan,
+            &AtomicBool::new(false),
+            |_args, _path, _stop| anyhow::bail!("synthetic persistent failure"),
+        );
+        assert!(result.is_err());
+        let run = read_run(directory.path());
+        assert_eq!(run["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(run["plan_completed"], false);
+        assert_eq!(run["successful"], false);
+        assert_eq!(run["stop_reason"], "consecutive_failure_limit_reached");
+        assert_eq!(run["consecutive_failures_at_end"], 2);
+        assert_eq!(run["maximum_consecutive_failures_observed"], 2);
+        assert!(directory.path().join("sessions/000001-ch006").is_dir());
+        assert!(directory.path().join("sessions/000002-ch006").is_dir());
+    }
+
+    #[test]
+    fn one_failure_limit_restores_stop_on_first_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = plan("watch", vec![6], 3, Some(1));
+        plan.max_consecutive_failures = Some(1);
+        assert!(
+            run_plan(
+                directory.path(),
+                &plan,
+                &AtomicBool::new(false),
+                |_args, _path, _stop| anyhow::bail!("synthetic failure"),
+            )
+            .is_err()
+        );
+        let run = read_run(directory.path());
+        assert_eq!(run["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(run["stop_reason"], "consecutive_failure_limit_reached");
+    }
+
+    #[test]
+    fn final_attempt_failure_threshold_is_a_stop_condition() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = plan("watch", vec![6], 3, Some(1));
+        plan.max_consecutive_failures = Some(1);
+        let mut attempt = 0;
+        assert!(
+            run_plan(
+                directory.path(),
+                &plan,
+                &AtomicBool::new(false),
+                |args, path, stop| {
+                    attempt += 1;
+                    if attempt == 3 {
+                        anyhow::bail!("synthetic final failure");
+                    }
+                    empty_capture(args, path, stop)
+                },
+            )
+            .is_err()
+        );
+        let run = read_run(directory.path());
+        assert_eq!(run["attempts"].as_array().unwrap().len(), 3);
+        assert_eq!(run["attempts_requested"], 3);
+        assert_eq!(run["plan_completed"], false);
+        assert_eq!(run["stop_reason"], "consecutive_failure_limit_reached");
+    }
+
+    #[test]
+    fn failed_evidence_byte_limit_stops_before_failure_streak_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = plan("watch", vec![6], 3, Some(1));
+        plan.max_consecutive_failures = Some(3);
+        assert!(
+            run_plan(
+                directory.path(),
+                &plan,
+                &AtomicBool::new(false),
+                |_args, path, _stop| {
+                    File::create(path.join("failed-evidence"))?.set_len(2 * 1024 * 1024)?;
+                    anyhow::bail!("synthetic receive failure")
+                },
+            )
+            .is_err()
+        );
+        let run = read_run(directory.path());
+        assert_eq!(run["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(run["stop_reason"], "retained_byte_threshold_after_capture");
+        assert!(
+            directory
+                .path()
+                .join("sessions/000001-ch006/failed-evidence")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn watch_failure_limit_cli_has_bounded_default() {
+        let Action::Watch(args) = Cli::try_parse_from(["wifi-monitor", "watch"])
+            .unwrap()
+            .command
+        else {
+            panic!("watch")
+        };
+        assert_eq!(args.max_consecutive_failures, 3);
+        for value in ["0", "101"] {
+            assert!(
+                Cli::try_parse_from(
+                    ["wifi-monitor", "watch", "--max-consecutive-failures", value,]
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn cancellation_keeps_partial_report_and_stops_next_capture() {
         let directory = tempfile::tempdir().unwrap();
         let stop = AtomicBool::new(false);
@@ -776,6 +981,8 @@ mod tests {
         let run = read_run(directory.path());
         assert_eq!(run["interrupted"], true);
         assert_eq!(run["plan_completed"], false);
+        assert_eq!(run["consecutive_failures_at_end"], 0);
+        assert_eq!(run["maximum_consecutive_failures_observed"], 0);
         assert_eq!(run["attempts"].as_array().unwrap().len(), 1);
         assert!(
             directory
@@ -837,6 +1044,9 @@ mod tests {
     fn duplicate_or_invalid_channels_fail_preflight() {
         assert!(plan("survey", vec![1, 1], 1, None).validate().is_err());
         assert!(plan("survey", vec![1, 36], 1, None).validate().is_err());
+        let mut invalid = plan("watch", vec![6], 1, Some(1));
+        invalid.max_consecutive_failures = Some(0);
+        assert!(invalid.validate().is_err());
     }
     #[test]
     fn duplicate_inventory_inputs_fail_before_creating_outputs() {

@@ -1,0 +1,78 @@
+diff --git a/crates/app/src/main.rs b/crates/app/src/main.rs
+index 62ad623823e8bfcbb71431615175e0e7e43383f8..401e552a6a7fc3436495a09fdefa69e9bd2a58b7 100644
+--- a/crates/app/src/main.rs
++++ b/crates/app/src/main.rs
+@@ -172,6 +172,10 @@ struct Cli {
+     #[arg(long, requires_all = ["file", "coded_scan_frequency_mhz", "write_bursts"])]
+     omit_scan_iq: bool,
+ 
++    /// Omit ordinary squelch burst IQ from the archive while still decoding it.
++    #[arg(long, requires = "omit_scan_iq")]
++    omit_squelch_iq: bool,
++
+     /// Disable GPU acceleration (use CPU-only PFB+FFT)
+     #[arg(long)]
+     no_gpu: bool,
+@@ -622,6 +626,7 @@ fn main() {
+             cli.check_crc,
+             coded_scan,
+             cli.omit_scan_iq,
++            cli.omit_squelch_iq,
+             cli.squelch,
+             cli.stats,
+             &classic_uaps,
+@@ -769,4 +774,21 @@ mod tests {
+             assert!(Cli::try_parse_from([&base[..], &remaining].concat()).is_err());
+         }
+     }
++
++    #[test]
++    fn omit_squelch_iq_requires_omit_scan_iq() {
++        let args = [
++            "blue-dragon",
++            "--file",
++            "capture.sc16q11",
++            "--coded-scan-frequency-mhz",
++            "2444",
++            "--write-bursts",
++            "capture.bdb",
++            "--omit-squelch-iq",
++        ];
++        assert!(Cli::try_parse_from(args).is_err());
++        let cli = Cli::try_parse_from(args.into_iter().chain(["--omit-scan-iq"])).unwrap();
++        assert!(cli.omit_scan_iq && cli.omit_squelch_iq);
++    }
+ }
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+index c59f8044e6fd8745e5772111006944e2167e2b6c..448512101e91454f710aacb24e77eb5ebcdcfe3b 100644
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -231,6 +231,7 @@ pub fn run_file(
+     check_crc: bool,
+     coded_scan: FileCodedScan,
+     omit_scan_iq: bool,
++    omit_squelch_iq: bool,
+     squelch_db: f32,
+     print_stats: bool,
+     classic_uaps: &[(u32, u8)],
+@@ -248,6 +249,9 @@ pub fn run_file(
+     if omit_scan_iq && (!matches!(coded_scan, FileCodedScan::Secondary(_)) || burst_path.is_none()) {
+         return Err("--omit-scan-iq requires a selected file scan and burst archive".to_string());
+     }
++    if omit_squelch_iq && !omit_scan_iq {
++        return Err("--omit-squelch-iq requires --omit-scan-iq".to_string());
++    }
+     let mut coverage = match coded_scan {
+         FileCodedScan::Secondary(selected_frequency_mhz) => Some(CodedScanCoverage {
+             selected_frequency_mhz,
+@@ -456,7 +460,9 @@ pub fn run_file(
+ 
+                 if let Some(burst) = ordinary_burst {
+                     total_bursts += 1;
+-                    record_burst(&mut burst_writer, &burst);
++                    if !omit_squelch_iq {
++                        record_burst(&mut burst_writer, &burst);
++                    }
+ 
+                     // Skip very short bursts (< 132 samples, matching C)
+                     if burst.samples.len() < 132 {

@@ -1,0 +1,304 @@
+diff --git a/host/libraries/libbladeRF/CMakeLists.txt b/host/libraries/libbladeRF/CMakeLists.txt
+index 009ab65f..ca3f1679 100644
+--- a/host/libraries/libbladeRF/CMakeLists.txt
++++ b/host/libraries/libbladeRF/CMakeLists.txt
+@@ -87,6 +87,23 @@ option(ENABLE_USB_DEV_RESET_ON_OPEN
+        ${BLADERF_OS_LINUX}
+ )
+ 
++option(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN
++       "Open only a bladeRF 2 at firmware state without inspecting, loading, or initializing its current FPGA."
++       OFF
++)
++
++if(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN AND ENABLE_USB_DEV_RESET_ON_OPEN)
++    message(FATAL_ERROR
++        "ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN requires ENABLE_USB_DEV_RESET_ON_OPEN=OFF"
++    )
++endif()
++
++if(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN AND ENABLE_LIBBLADERF_BLADERF2_CONFIG_NEUTRAL_OPEN)
++    message(FATAL_ERROR
++        "bladeRF 2 loader-neutral and configuration-neutral open modes are mutually exclusive"
++    )
++endif()
++
+ option(ENABLE_RFIC_TIMING_CALIBRATION
+        "Perform timing calibration on the RFIC digital interface during initialization. This is only implemented on AD936x-based hardware."
+        OFF
+@@ -286,6 +303,10 @@ if(ENABLE_USB_DEV_RESET_ON_OPEN)
+     add_definitions(-DENABLE_USB_DEV_RESET_ON_OPEN=1)
+ endif()
+ 
++if(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
++    add_definitions(-DENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN=1)
++endif()
++
+ if(BUILD_AD936X)
+     set(LIBBLADERF_LIBS ${LIBBLADERF_LIBS} ad936x)
+ endif(BUILD_AD936X)
+diff --git a/host/libraries/libbladeRF/include/libbladeRF.h b/host/libraries/libbladeRF/include/libbladeRF.h
+index 63cb2385..d7dab27b 100644
+--- a/host/libraries/libbladeRF/include/libbladeRF.h
++++ b/host/libraries/libbladeRF/include/libbladeRF.h
+@@ -53,6 +53,11 @@
+  */
+ #define LIBBLADERF_API_VERSION (0x02060000)
+ 
++/** Versioned marker returned by
++ * bladerf_get_bladerf2_loader_neutral_open_marker() when the specialized open
++ * contract is enabled. The value encodes "B2L" followed by revision 1. */
++#define BLADERF2_LOADER_NEUTRAL_OPEN_MARKER_V1 UINT32_C(0x42324c01)
++
+ #ifdef __cplusplus
+ extern "C" {
+ #else
+@@ -4467,6 +4472,25 @@ void CALL_CONV bladerf_log_set_verbosity(bladerf_log_level level);
+ API_EXPORT
+ void CALL_CONV bladerf_version(struct bladerf_version *version);
+ 
++/**
++ * Query this patched library's specialized bladeRF 2 loader open contract.
++ *
++ * A return value of ::BLADERF2_LOADER_NEUTRAL_OPEN_MARKER_V1 means
++ * bladerf_open() accepts a bladeRF 2 whether its FPGA is configured or not,
++ * leaves board state at firmware-loaded, and skips automatic FPGA loading,
++ * current-FPGA protocol/version access, board/RFIC initialization,
++ * configuration-file processing and scheduled-retune cancellation. It was
++ * built without USB reset-on-open. The USB backend still claims the interface
++ * and selects transport alternate settings. Explicit bladerf_load_fpga() calls
++ * load the supplied RAM image and then perform normal board/RFIC initialization.
++ * Other explicit APIs can also change the device.
++ *
++ * @return ::BLADERF2_LOADER_NEUTRAL_OPEN_MARKER_V1 when enabled, or
++ *         zero in the default build.
++ */
++API_EXPORT
++uint32_t CALL_CONV bladerf_get_bladerf2_loader_neutral_open_marker(void);
++
+ /** @} (End of FN_LIBRARY_VERSION) */
+ 
+ /**
+diff --git a/host/libraries/libbladeRF/src/backend/usb/usb.c b/host/libraries/libbladeRF/src/backend/usb/usb.c
+index fba2c335..566bf7cc 100644
+--- a/host/libraries/libbladeRF/src/backend/usb/usb.c
++++ b/host/libraries/libbladeRF/src/backend/usb/usb.c
+@@ -126,11 +126,13 @@ static int usb_is_fpga_configured(struct bladerf *dev)
+      * libbladeRF. Specifically, this has proven to be a problem with pre-v0.0.1
+      * FPGA images, as they do not provide version readback functionality.
+      */
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+     if (getenv("BLADERF_FORCE_NO_FPGA_PRESENT")) {
+         log_debug("Reporting no FPGA present - "
+                   "BLADERF_FORCE_NO_FPGA_PRESENT is set.\n");
+         return 0;
+     }
++#endif
+ 
+     status = vendor_cmd_int(dev, BLADE_USB_CMD_QUERY_FPGA_STATUS,
+                             USB_DIR_DEVICE_TO_HOST, &result);
+@@ -463,7 +465,11 @@ static int usb_load_fpga(struct bladerf *dev, const uint8_t *image, size_t image
+         log_debug("Failed to determine if FPGA is loaded: %s\n",
+                   bladerf_strerror(status));
+         return status;
++#if defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
++    } else if (status != 1) {
++#else
+     } else if (wait_count == 0 && status != 0) {
++#endif
+         log_debug("Timeout while waiting for FPGA configuration status\n");
+         return BLADERF_ERR_TIMEOUT;
+     }
+diff --git a/host/libraries/libbladeRF/src/bladerf.c b/host/libraries/libbladeRF/src/bladerf.c
+index d68595f4..3a846420 100644
+--- a/host/libraries/libbladeRF/src/bladerf.c
++++ b/host/libraries/libbladeRF/src/bladerf.c
+@@ -164,13 +164,15 @@ int bladerf_open_with_devinfo(struct bladerf **opened_device,
+         return status;
+     }
+ 
+-    /* Load configuration file */
++    /* The specialized bladeRF 2 loader contract never processes bladeRF.conf. */
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+     status = config_load_options_file(dev);
+ 
+     if (status < 0) {
+         bladerf_close(dev);
+         return status;
+     }
++#endif
+ 
+     *opened_device = dev;
+ 
+@@ -530,6 +532,15 @@ void bladerf_version(struct bladerf_version *version)
+     version->describe = LIBBLADERF_VERSION;
+ }
+ 
++uint32_t bladerf_get_bladerf2_loader_neutral_open_marker(void)
++{
++#if defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
++    return BLADERF2_LOADER_NEUTRAL_OPEN_MARKER_V1;
++#else
++    return 0;
++#endif
++}
++
+ /******************************************************************************/
+ /* Enable/disable */
+ /******************************************************************************/
+diff --git a/host/libraries/libbladeRF/src/board/bladerf1/bladerf1.c b/host/libraries/libbladeRF/src/board/bladerf1/bladerf1.c
+index 8d885676..475e87a5 100644
+--- a/host/libraries/libbladeRF/src/board/bladerf1/bladerf1.c
++++ b/host/libraries/libbladeRF/src/board/bladerf1/bladerf1.c
+@@ -821,6 +821,13 @@ static bool bladerf1_matches(struct bladerf *dev)
+ 
+ static int bladerf1_open(struct bladerf *dev, struct bladerf_devinfo *devinfo)
+ {
++#if defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
++    (void)dev;
++    (void)devinfo;
++    log_error("This libbladeRF build accepts only bladeRF 2 devices.\n");
++    return BLADERF_ERR_UNSUPPORTED;
++#endif
++
+     struct bladerf1_board_data *board_data;
+     struct bladerf_version required_fw_version;
+     bladerf_dev_speed usb_speed;
+diff --git a/host/libraries/libbladeRF/src/board/bladerf2/bladerf2.c b/host/libraries/libbladeRF/src/board/bladerf2/bladerf2.c
+index 5a77ff83..23bffadb 100644
+--- a/host/libraries/libbladeRF/src/board/bladerf2/bladerf2.c
++++ b/host/libraries/libbladeRF/src/board/bladerf2/bladerf2.c
+@@ -262,7 +262,9 @@ static int bladerf2_open(struct bladerf *dev, struct bladerf_devinfo *devinfo)
+ 
+     struct bladerf2_board_data *board_data;
+     struct bladerf_version required_fw_version;
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+     char *full_path;
++#endif
+     bladerf_dev_speed usb_speed;
+     bool use_legacy_msg_size = false;
+     size_t i;
+@@ -411,10 +413,12 @@ static int bladerf2_open(struct bladerf *dev, struct bladerf_devinfo *devinfo)
+         log_warning("Failed to get FPGA size %s\n", bladerf_strerror(status));
+     }
+ 
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+     if (getenv("BLADERF_FORCE_FPGA_A9")) {
+         log_info("BLADERF_FORCE_FPGA_A9 is set, assuming A9 FPGA\n");
+         board_data->fpga_size = BLADERF_FPGA_A9;
+     }
++#endif
+ 
+     /* If the flash architecture could not be decoded earlier, try again now
+      * that the FPGA size is known. */
+@@ -427,6 +431,18 @@ static int bladerf2_open(struct bladerf *dev, struct bladerf_devinfo *devinfo)
+         }
+     }
+ 
++    /* Loader-neutral open queries only firmware-reported FPGA status. It does
++     * not trust or inspect the currently loaded FPGA and deliberately retains
++     * STATE_FIRMWARE_LOADED for an explicit replacement load. */
++#if defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
++    status = dev->backend->is_fpga_configured(dev);
++    if (status < 0) {
++        RETURN_ERROR_STATUS("is_fpga_configured", status);
++    }
++    log_verbose("Firmware reports FPGA configured status %d; current FPGA remains uninspected.\n",
++                status);
++    return 0;
++#else
+     /* Skip further work if BLADERF_FORCE_NO_FPGA_PRESENT is set */
+     if (getenv("BLADERF_FORCE_NO_FPGA_PRESENT")) {
+         log_debug("Skipping FPGA configuration and initialization - "
+@@ -512,13 +528,15 @@ static int bladerf2_open(struct bladerf *dev, struct bladerf_devinfo *devinfo)
+     }
+ 
+     return 0;
++#endif
+ }
+ 
+ static void bladerf2_close(struct bladerf *dev)
+ {
+     if (dev != NULL) {
+         struct bladerf2_board_data *board_data = dev->board_data;
+-        struct controller_fns const *rfic      = board_data->rfic;
++        struct controller_fns const *rfic =
++            board_data == NULL ? NULL : board_data->rfic;
+         struct bladerf_flash_arch *flash_arch  = dev->flash_arch;
+ 
+         if (board_data != NULL) {
+@@ -544,11 +562,13 @@ static void bladerf2_close(struct bladerf *dev)
+                      * the device could start up and/or "unexpectedly" switch to
+                      * a different frequency.
+                      */
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+                     if (dev->backend->is_fpga_configured(dev) &&
+                         have_cap(board_data->capabilities,
+                                  BLADERF_CAP_SCHEDULED_RETUNE)) {
+                         dev->board->cancel_scheduled_retunes(dev, ch);
+                     }
++#endif
+                 }
+             }
+ 
+diff --git a/host/libraries/libbladeRF/src/board/bladerf2/common.c b/host/libraries/libbladeRF/src/board/bladerf2/common.c
+index 37bd86ba..9991b9b9 100644
+--- a/host/libraries/libbladeRF/src/board/bladerf2/common.c
++++ b/host/libraries/libbladeRF/src/board/bladerf2/common.c
+@@ -167,7 +167,9 @@ bool is_valid_fpga_size(struct bladerf *dev, bladerf_fpga_size fpga, size_t len)
+     /* We do not build FPGAs with compression enabled. Therfore, they
+      * will always have a fixed file size.
+      */
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+     char const env_override[] = "BLADERF_SKIP_FPGA_SIZE_CHECK";
++#endif
+ 
+     bool valid;
+     size_t expected;
+@@ -185,10 +187,13 @@ bool is_valid_fpga_size(struct bladerf *dev, bladerf_fpga_size fpga, size_t len)
+      * folks who know what they're doing to work around this quickly without
+      * needing to make a code change. (e.g., someone building a custom FPGA
+      * image that enables compressoin) */
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+     if (getenv(env_override)) {
+         log_info("Overriding FPGA size check per %s\n", env_override);
+         valid = true;
+-    } else if (expected > 0) {
++    } else
++#endif
++    if (expected > 0) {
+         valid = (len == expected);
+     } else {
+         log_debug("Unknown FPGA type (%d). Using relaxed size criteria.\n",
+@@ -209,9 +214,11 @@ bool is_valid_fpga_size(struct bladerf *dev, bladerf_fpga_size fpga, size_t len)
+                     "expected %d).\n",
+                     len, expected);
+ 
++#if !defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
+         log_debug("If you are certain this file is valid, you may define\n"
+                   "BLADERF_SKIP_FPGA_SIZE_CHECK in your environment to skip "
+                   "this check.\n\n");
++#endif
+     }
+ 
+     return valid;
+@@ -232,6 +239,11 @@ bool is_valid_fw_size(size_t len)
+ 
+ bladerf_tuning_mode default_tuning_mode(struct bladerf *dev)
+ {
++#if defined(ENABLE_LIBBLADERF_BLADERF2_LOADER_NEUTRAL_OPEN)
++    (void)dev;
++    log_debug("Default tuning mode: Host (loader-neutral contract)\n");
++    return BLADERF_TUNING_MODE_HOST;
++#else
+     struct bladerf2_board_data *board_data = dev->board_data;
+     bladerf_tuning_mode mode;
+     char const *env_var;
+@@ -296,6 +308,7 @@ bladerf_tuning_mode default_tuning_mode(struct bladerf *dev)
+     }
+ 
+     return mode;
++#endif
+ }
+ 
+ 

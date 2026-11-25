@@ -1,0 +1,114 @@
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+index 4485121..bc36c87 100644
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -1692,12 +1692,25 @@ fn decode_coded_scan_burst<'a>(
+ ) -> impl Iterator<Item = CodedScanResult> + 'a {
+     let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+     let packets = match replay_connections {
+-        Some(connections) => ble::ble_coded_replay_packets(
+-            &raw_demod,
+-            burst.freq,
+-            burst.timestamp.clone(),
+-            connections,
+-        ),
++        Some(connections) => {
++            let mut decode = |demod: &[f32]| {
++                ble::ble_coded_replay_packets(
++                    demod,
++                    burst.freq,
++                    burst.timestamp.clone(),
++                    connections,
++                )
++            };
++            let packets = decode(&raw_demod);
++            if packets.is_empty() {
++                // The full-band result takes precedence. A centered retry
++                // preserves the timestamp and uses the same CRC context.
++                let narrow = bd_dsp::fsk::narrow_coded_iq(&burst.samples);
++                decode(&fsk.fm_discriminate_raw(&narrow))
++            } else {
++                packets
++            }
++        }
+         None => ble::ble_coded_scan_packets(
+             &raw_demod,
+             burst.freq,
+diff --git a/crates/dsp/src/fsk.rs b/crates/dsp/src/fsk.rs
+index 7e8c65d..ab53def 100644
+--- a/crates/dsp/src/fsk.rs
++++ b/crates/dsp/src/fsk.rs
+@@ -2,6 +2,48 @@
+ 
+ use num_complex::Complex32;
+ 
++const CODED_FILTER_HALF_TAPS: usize = 16;
++const CODED_FILTER_TAPS: usize = 2 * CODED_FILTER_HALF_TAPS + 1;
++
++fn coded_filter_taps() -> [f32; CODED_FILTER_TAPS] {
++    const CUTOFF: f32 = 0.45 / 2.0; // 450 kHz at 2 MSps.
++    let mut taps = std::array::from_fn(|i| {
++        let x = i as f32 - CODED_FILTER_HALF_TAPS as f32;
++        let phase = std::f32::consts::TAU * CUTOFF * x;
++        let sinc = if i == CODED_FILTER_HALF_TAPS {
++            1.0
++        } else {
++            phase.sin() / phase
++        };
++        let window = 0.54 + 0.46 * (std::f32::consts::PI * x / CODED_FILTER_HALF_TAPS as f32).cos();
++        2.0 * CUTOFF * sinc * window
++    });
++    let gain = taps.iter().sum::<f32>();
++    for tap in &mut taps {
++        *tap /= gain;
++    }
++    taps
++}
++
++/// Narrow a 2 MSps LE Coded window with a centered 450 kHz low-pass filter.
++/// Zero padding keeps one output per input sample on the original time grid.
++pub fn narrow_coded_iq(samples: &[Complex32]) -> Vec<Complex32> {
++    static TAPS: std::sync::OnceLock<[f32; CODED_FILTER_TAPS]> = std::sync::OnceLock::new();
++    let taps = TAPS.get_or_init(coded_filter_taps);
++    let mut padded = vec![Complex32::default(); samples.len() + 2 * CODED_FILTER_HALF_TAPS];
++    padded[CODED_FILTER_HALF_TAPS..CODED_FILTER_HALF_TAPS + samples.len()].copy_from_slice(samples);
++    padded
++        .windows(taps.len())
++        .map(|window| {
++            window
++                .iter()
++                .zip(taps)
++                .map(|(sample, tap)| *sample * tap)
++                .sum()
++        })
++        .collect()
++}
++
+ const MEDIAN_SYMBOLS: usize = 64;
+ /// Maximum FM discriminator value before rejecting burst.
+ /// Must accommodate BLE 2M (±0.5 normalized) plus PFB bin frequency offset
+@@ -244,6 +286,24 @@ pub fn reslice(demod: &[f32], silence_offset: usize, sps: usize) -> Vec<u8> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn coded_filter_preserves_center_and_rejects_an_outer_tone() {
++        let mut impulse = [Complex32::default(); 67];
++        impulse[33] = Complex32::new(1.0, 0.0);
++        let filtered = narrow_coded_iq(&impulse);
++        assert_eq!(filtered.len(), impulse.len());
++        assert!(filtered[33].re > filtered[32].re);
++        assert!((filtered[32].re - filtered[34].re).abs() < 1e-6);
++        assert!((filtered.iter().map(|sample| sample.re).sum::<f32>() - 1.0).abs() < 1e-6);
++        assert!(narrow_coded_iq(&[]).is_empty());
++
++        let tone: Vec<_> = (0..128)
++            .map(|i| Complex32::from_polar(1.0, std::f32::consts::TAU * 0.4 * i as f32))
++            .collect();
++        let filtered = narrow_coded_iq(&tone);
++        assert!(filtered[16..112].iter().all(|sample| sample.norm() < 0.01));
++    }
++
+     #[test]
+     fn test_freq_discriminator_dc() {
+         let mut demod = FskDemod::new(2);

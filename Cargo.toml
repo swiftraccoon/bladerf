@@ -1,7 +1,24 @@
 [workspace]
 default-members = ["tools/bladerf-lab"]
-members = ["projects/bluetooth-monitor", "projects/wifi-monitor", "projects/rf-observatory", "tools/bladerf-docs", "tools/bladerf-lab"]
+exclude = ["repos/libcrafter", "vendor/soapysdr-0.5.1"]
+members = [
+    "crates/bladerf-profile2-loader-ipc",
+    "crates/bladerf-profile2-ipc",
+    "crates/bladerf-profile2-recovery-ipc",
+    "crates/bladerf-profile2-session-ipc",
+    "projects/bluetooth-monitor",
+    "projects/digital-monitor",
+    "projects/ieee802154-monitor",
+    "projects/rf-observatory",
+    "projects/wifi-monitor",
+    "tools/bladerf-docs",
+    "tools/bladerf-lab",
+    "tools/bladerf-profile2-adapter",
+]
 resolver = "3"
+
+[patch.crates-io]
+soapysdr = { path = "vendor/soapysdr-0.5.1" }
 
 [workspace.package]
 edition = "2024"

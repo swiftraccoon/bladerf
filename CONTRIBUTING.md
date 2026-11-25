@@ -37,8 +37,10 @@ from reusable parsing, calculations and DSP. Express units, sample formats and
 ownership clearly; propagate input/device errors with context. Document blocking,
 shutdown and partial-output behavior where callers need to understand it.
 
-Run checks relevant to the change. With native dependencies installed, the
-workspace checks are:
+Run checks relevant to the change. Prepare the native dependencies and apply
+the [Wi-Fi dependency patches](projects/wifi-monitor/docs/guide.md#build-and-check)
+before the workspace checks. The libcrafter formatting patch keeps the workspace
+formatter within the intended source boundary.
 
 ```sh
 cargo fmt --all -- --check
@@ -59,6 +61,10 @@ particular lab. Keep setup instructions portable and explain each tool's inputs,
 outputs, failure behavior and limits. Repository standards and reusable review
 checklists are shared contributor documentation. Personal work plans, unprocessed
 research logs, completed internal reviews and installation records stay local.
+
+Keep READMEs focused on purpose and a quick start. Link to the component's
+`docs/` guides for longer procedures and to Rustdoc for API contracts and
+examples.
 
 Support hardware claims with public primary sources and precise revisions or
 locations. Distinguish chip specifications, assembled-board properties, software

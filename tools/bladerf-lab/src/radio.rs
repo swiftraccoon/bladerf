@@ -7,6 +7,7 @@
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -18,9 +19,82 @@ use num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use soapysdr::{Device, Direction::Rx, Format, RxStream, StreamSample};
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod segment_output;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod segment_stream;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod segmented;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) use segmented::{SegmentCaptureArgs, capture_segments};
+
 const MAX_CAPTURE_SAMPLES: usize = 250_000_000;
+const MAX_DISCARD_INITIAL_SAMPLES: u32 = 20_000_000;
+const MAX_FPGA_VERSION_BYTES: usize = 32;
 const CHUNK_SAMPLES: usize = 65_536;
 const READ_TIMEOUT_US: i64 = 2_000_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FpgaVersion(String);
+
+impl FpgaVersion {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for FpgaVersion {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() || value.len() > MAX_FPGA_VERSION_BYTES {
+            return Err(format!(
+                "FPGA version must contain 1 through {MAX_FPGA_VERSION_BYTES} bytes"
+            ));
+        }
+        let mut components = value.split('.');
+        for _ in 0..3 {
+            let component = components
+                .next()
+                .ok_or_else(|| "FPGA version must use MAJOR.MINOR.PATCH digits".to_owned())?;
+            if component.is_empty()
+                || component.len() > 10
+                || !component.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(
+                    "FPGA version must use three 1-to-10-digit MAJOR.MINOR.PATCH components"
+                        .to_owned(),
+                );
+            }
+        }
+        if components.next().is_some() {
+            return Err("FPGA version must use exactly three components".to_owned());
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+fn require_fpga_version(required: Option<&FpgaVersion>, observed: Option<&str>) -> Result<()> {
+    let Some(required) = required else {
+        return Ok(());
+    };
+    let observed = observed.context("device did not report an FPGA version")?;
+    ensure!(
+        observed == required.as_str(),
+        "observed FPGA version {observed} does not match required version {}",
+        required.as_str()
+    );
+    Ok(())
+}
+
+fn after_fpga_preflight<T>(
+    required: Option<&FpgaVersion>,
+    observed: Option<&str>,
+    configure: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    require_fpga_version(required, observed)?;
+    configure()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 struct FrequencyHz(f64);
@@ -128,7 +202,10 @@ impl RadioArgs {
         usize::from(self.channel - 1)
     }
 
-    fn open(&self) -> Result<Device> {
+    /// Open through SoapyBladeRF, then enforce the optional version before this
+    /// application configures RX or creates a stream. SoapyBladeRF itself writes
+    /// default RX and TX sample rates while constructing the device.
+    fn open(&self, required_fpga_version: Option<&FpgaVersion>) -> Result<Device> {
         self.validate()?;
         let mut selector = soapysdr::Args::new();
         selector.set("driver", "bladerf");
@@ -147,6 +224,21 @@ impl RadioArgs {
             device.hardware_key()? == "bladerf2",
             "this tool requires a bladeRF 2.0 micro"
         );
+        let observed_fpga_version = if required_fpga_version.is_some() {
+            let information = device.hardware_info()?;
+            information.get("fpga_version").map(str::to_owned)
+        } else {
+            None
+        };
+        after_fpga_preflight(
+            required_fpga_version,
+            observed_fpga_version.as_deref(),
+            || self.configure(&device),
+        )?;
+        Ok(device)
+    }
+
+    fn configure(&self, device: &Device) -> Result<()> {
         ensure!(
             device.num_channels(Rx)? > self.index(),
             "requested RX port is unavailable"
@@ -176,7 +268,7 @@ impl RadioArgs {
             range.maximum
         );
         device.set_gain(Rx, self.index(), self.gain)?;
-        Ok(device)
+        Ok(())
     }
 }
 
@@ -187,9 +279,15 @@ pub(crate) struct CaptureArgs {
     /// Duration in seconds, greater than zero and at most 60; capture capped at 1 GB.
     #[arg(long, default_value_t = 1.0)]
     duration: f64,
+    /// Complex samples to discard at stream start before the requested capture duration.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_DISCARD_INITIAL_SAMPLES)))]
+    discard_initial_samples: u32,
     /// IQ output; OUTPUT.json is the metadata sidecar. Existing paths are refused.
     #[arg(long, default_value = "captures/rx1.sc16q11")]
     output: PathBuf,
+    /// Require this exact version before application RX configuration/stream setup.
+    #[arg(long)]
+    require_fpga_version: Option<FpgaVersion>,
 }
 
 #[derive(Args, Debug)]
@@ -329,7 +427,7 @@ impl CaptureFiles {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CaptureMetadata {
     format: String,
     dtype: String,
@@ -345,8 +443,12 @@ struct CaptureMetadata {
     device_serial: Option<String>,
     firmware_version: Option<String>,
     fpga_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_fpga_version: Option<String>,
     num_samples: usize,
     duration_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discarded_initial_samples: Option<u32>,
     started_utc: String,
     timestamp_note: String,
     continuity_note: String,
@@ -366,41 +468,89 @@ fn encode_iq(samples: &[Complex<i16>], bytes: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn capture(args: CaptureArgs) -> Result<()> {
-    args.radio.validate()?;
-    let duration = DurationSeconds::try_from(args.duration)?;
-    sample_count(SampleRateHz::try_from(args.radio.sample_rate)?, duration)?;
-    let interrupted = interrupt_flag()?;
-    let mut files = CaptureFiles::create(&args.output)?;
-    let device = args.radio.open()?;
-    let rate = SampleRateHz::try_from(device.sample_rate(Rx, args.radio.index())?)?;
-    let count = sample_count(rate, duration)?.get();
+fn read_capture(
+    count: usize,
+    discard_count: usize,
+    buffer: &mut [Complex<i16>],
+    within_deadline: impl Fn() -> bool,
+    interrupted: &AtomicBool,
+    mut read: impl FnMut(&mut [Complex<i16>]) -> Result<usize>,
+    mut store: impl FnMut(&[Complex<i16>]) -> Result<()>,
+) -> Result<()> {
+    for (mut remaining, retain) in [(discard_count, false), (count, true)] {
+        while remaining > 0 {
+            ensure!(
+                !interrupted.load(Ordering::Relaxed),
+                "capture interrupted; incomplete output removed"
+            );
+            ensure!(
+                within_deadline(),
+                "capture exceeded its wall-clock deadline"
+            );
+            let wanted = remaining.min(buffer.len());
+            let received = read(&mut buffer[..wanted])?;
+            ensure!(
+                within_deadline(),
+                "capture exceeded its wall-clock deadline"
+            );
+            ensure!(
+                received > 0 && received <= wanted,
+                "receive returned invalid count {received}"
+            );
+            if retain {
+                store(&buffer[..received])?;
+            }
+            remaining -= received;
+        }
+    }
+    ensure!(
+        !interrupted.load(Ordering::Relaxed),
+        "capture interrupted; incomplete output removed"
+    );
+    ensure!(
+        within_deadline(),
+        "capture exceeded its wall-clock deadline"
+    );
+    Ok(())
+}
+
+fn capture_metadata(
+    device: &Device,
+    radio: &RadioArgs,
+    rate: SampleRateHz,
+    count: usize,
+    discard_initial_samples: u32,
+    required_fpga_version: Option<&FpgaVersion>,
+) -> Result<CaptureMetadata> {
     let info = device.hardware_info()?;
-    let mut settings = CaptureMetadata {
+    Ok(CaptureMetadata {
         format: "SC16_Q11".into(),
         dtype: "<i2".into(),
         interleave: "I,Q".into(),
         complex_scale: 2048,
-        frequency_hz: device.frequency(Rx, args.radio.index())?,
+        frequency_hz: device.frequency(Rx, radio.index())?,
         sample_rate_hz: rate.0,
-        bandwidth_hz: device.bandwidth(Rx, args.radio.index())?,
+        bandwidth_hz: device.bandwidth(Rx, radio.index())?,
         gain_db: 0.0,
         gain_mode: "manual".into(),
         bias_tee_enabled: false,
-        channel: format!("RX{}", args.radio.channel),
+        channel: format!("RX{}", radio.channel),
         device_serial: info.get("serial").map(str::to_owned),
         firmware_version: info.get("fw_version").map(str::to_owned),
         fpga_version: info.get("fpga_version").map(str::to_owned),
+        required_fpga_version: required_fpga_version.map(|version| version.as_str().to_owned()),
         num_samples: count,
         duration_seconds: count as f64 / rate.0,
+        discarded_initial_samples: (discard_initial_samples > 0).then_some(discard_initial_samples),
         started_utc: Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         timestamp_note: "Host wall-clock before RX enable, not a hardware timestamp".into(),
         continuity_note:
             "Untimestamped SC16_Q11 output does not certify absence of dropped samples".into(),
         receive_api: "Rust soapysdr -> SoapyBladeRF -> libbladeRF".into(),
-    };
-    let mut buffer = vec![Complex::new(0i16, 0); CHUNK_SAMPLES];
-    let mut encoded = Vec::with_capacity(CHUNK_SAMPLES * 4);
+    })
+}
+
+fn receive_stream_args() -> soapysdr::Args {
     // SoapyBladeRF enables RX during setupStream, before activate. Its default
     // 32 x 4096 samples allow only 6.6 ms at 20 MSps for startup and scheduling.
     // Reserve 8 MiB of native buffering; this absorbs brief stalls without
@@ -409,48 +559,62 @@ pub(crate) fn capture(args: CaptureArgs) -> Result<()> {
     stream_args.set("buffers", "128");
     stream_args.set("buflen", "16384");
     stream_args.set("transfers", "32");
+    stream_args
+}
+
+pub(crate) fn capture(args: CaptureArgs) -> Result<()> {
+    args.radio.validate()?;
+    let duration = DurationSeconds::try_from(args.duration)?;
+    sample_count(SampleRateHz::try_from(args.radio.sample_rate)?, duration)?;
+    let discard_count = usize::try_from(args.discard_initial_samples)?;
+    let interrupted = interrupt_flag()?;
+    let mut files = CaptureFiles::create(&args.output)?;
+    let device = args.radio.open(args.require_fpga_version.as_ref())?;
+    let rate = SampleRateHz::try_from(device.sample_rate(Rx, args.radio.index())?)?;
+    let count = sample_count(rate, duration)?.get();
+    let mut settings = capture_metadata(
+        &device,
+        &args.radio,
+        rate,
+        count,
+        args.discard_initial_samples,
+        args.require_fpga_version.as_ref(),
+    )?;
+    let mut buffer = vec![Complex::new(0i16, 0); CHUNK_SAMPLES];
+    let mut encoded = Vec::with_capacity(CHUNK_SAMPLES * 4);
     let mut stream =
-        device.rx_stream_args::<Complex<i16>, _>(&[args.radio.index()], stream_args)?;
-    let deadline = Instant::now() + Duration::from_secs_f64(duration.0 + 15.0);
+        device.rx_stream_args::<Complex<i16>, _>(&[args.radio.index()], receive_stream_args())?;
+    let discard_seconds = f64::from(args.discard_initial_samples) / rate.0;
+    let deadline = Instant::now() + Duration::from_secs_f64(duration.0 + discard_seconds + 15.0);
     with_active_stream(&mut stream, |stream| {
         settings.gain_db = device.gain(Rx, args.radio.index())?;
-        let mut remaining = count;
-        while remaining > 0 {
-            ensure!(
-                !interrupted.load(Ordering::Relaxed),
-                "capture interrupted; incomplete output removed"
-            );
-            ensure!(
-                Instant::now() < deadline,
-                "capture exceeded its wall-clock deadline"
-            );
-            let wanted = remaining.min(buffer.len());
-            let received = stream
-                .read(&mut [&mut buffer[..wanted]], READ_TIMEOUT_US)
-                .context("receive IQ")?;
-            ensure!(
-                received > 0 && received <= wanted,
-                "receive returned invalid count {received}"
-            );
-            encode_iq(&buffer[..received], &mut encoded)?;
-            files.raw.write_all(&encoded).context("write IQ samples")?;
-            remaining -= received;
-        }
-        ensure!(
-            !interrupted.load(Ordering::Relaxed),
-            "capture interrupted; incomplete output removed"
-        );
-        Ok(())
+        read_capture(
+            count,
+            discard_count,
+            &mut buffer,
+            || Instant::now() < deadline,
+            &interrupted,
+            |buffer| {
+                stream
+                    .read(&mut [buffer], READ_TIMEOUT_US)
+                    .context("receive IQ")
+            },
+            |samples| {
+                encode_iq(samples, &mut encoded)?;
+                files.raw.write_all(&encoded).context("write IQ samples")
+            },
+        )
     })?;
     files.complete(&settings)?;
-    println!(
+    writeln!(
+        std::io::stdout().lock(),
         "Captured {count} complex samples from RX{} at {} S/s\nIQ: {}\nMetadata: {}.json",
         args.radio.channel,
         rate.0,
         args.output.display(),
         args.output.display()
-    );
-    Ok(())
+    )
+    .context("write capture summary")
 }
 
 pub(crate) fn soapy_rx(args: SoapyRxArgs) -> Result<()> {
@@ -464,7 +628,7 @@ pub(crate) fn soapy_rx(args: SoapyRxArgs) -> Result<()> {
         "receive duration exceeds 60 seconds"
     );
     let interrupted = interrupt_flag()?;
-    let device = args.radio.open()?;
+    let device = args.radio.open(None)?;
     let rate = SampleRateHz::try_from(device.sample_rate(Rx, args.radio.index())?)?;
     let duration = DurationSeconds::try_from(args.samples as f64 / rate.0)?;
     let mut stream = device.rx_stream::<Complex<f32>>(&[args.radio.index()])?;
@@ -499,7 +663,8 @@ pub(crate) fn soapy_rx(args: SoapyRxArgs) -> Result<()> {
         Ok(())
     })?;
     ensure!(energy > 0.0, "received only zero samples");
-    println!(
+    writeln!(
+        std::io::stdout().lock(),
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "status": "PASS", "api": "Rust SoapySDR", "channel": format!("RX{}", args.radio.channel),
@@ -507,13 +672,86 @@ pub(crate) fn soapy_rx(args: SoapyRxArgs) -> Result<()> {
             "frequency_hz": device.frequency(Rx, args.radio.index())?, "bias_tee_enabled": false,
             "rms_dbfs": 10.0 * (energy / args.samples as f64).log10(),
         }))?
-    );
-    Ok(())
+    )
+    .context("write receive check summary")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use clap::Parser;
+
     use super::*;
+    use crate::{Cli, Command};
+
+    #[test]
+    fn fpga_version_requirement_is_exact_and_optional() {
+        let required = FpgaVersion::from_str("0.16.0").unwrap();
+        require_fpga_version(Some(&required), Some("0.16.0")).unwrap();
+        assert!(require_fpga_version(Some(&required), Some("0.15.3")).is_err());
+        assert!(require_fpga_version(Some(&required), None).is_err());
+        require_fpga_version(None, Some("unconstrained")).unwrap();
+        require_fpga_version(None, None).unwrap();
+    }
+
+    #[test]
+    fn fpga_mismatch_stops_before_application_configuration_boundary() {
+        let required = FpgaVersion::from_str("0.16.0").unwrap();
+        let configured = Cell::new(false);
+        let result = after_fpga_preflight(Some(&required), Some("0.15.3"), || {
+            configured.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!configured.get());
+
+        after_fpga_preflight(Some(&required), Some("0.16.0"), || {
+            configured.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(configured.get());
+    }
+
+    #[test]
+    fn capture_cli_validates_bounded_fpga_version_syntax() {
+        let cli =
+            Cli::try_parse_from(["bladerf-lab", "capture", "--require-fpga-version", "0.16.0"])
+                .unwrap();
+        let Command::Capture(capture) = cli.command else {
+            panic!("capture command")
+        };
+        assert_eq!(
+            capture
+                .require_fpga_version
+                .as_ref()
+                .map(FpgaVersion::as_str),
+            Some("0.16.0")
+        );
+
+        let cli = Cli::try_parse_from(["bladerf-lab", "capture"]).unwrap();
+        let Command::Capture(capture) = cli.command else {
+            panic!("capture command")
+        };
+        assert!(capture.require_fpga_version.is_none());
+
+        for invalid in [
+            "",
+            "0.16",
+            "0.16.0.1",
+            "0..0",
+            "v0.16.0",
+            "0.16.-1",
+            "12345678901.0.0",
+        ] {
+            assert!(
+                Cli::try_parse_from(["bladerf-lab", "capture", "--require-fpga-version", invalid,])
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     #[test]
     fn rejects_unbounded_or_empty_capture_before_hardware() {
@@ -535,6 +773,73 @@ mod tests {
                 .get(),
             2_000_000
         );
+    }
+
+    #[test]
+    fn capture_cli_bounds_initial_discard_and_defaults_to_zero() {
+        let cli = Cli::try_parse_from(["bladerf-lab", "capture"]).unwrap();
+        let Command::Capture(args) = cli.command else {
+            panic!("capture command")
+        };
+        assert_eq!(args.discard_initial_samples, 0);
+        let parse = |count| {
+            Cli::try_parse_from(["bladerf-lab", "capture", "--discard-initial-samples", count])
+        };
+        assert!(parse("20000000").is_ok());
+        assert!(parse("20000001").is_err());
+    }
+
+    #[test]
+    fn capture_drains_exact_initial_extent_and_keeps_requested_samples() {
+        let mut buffer = [Complex::new(0, 0); 4];
+        let mut next = 0;
+        let mut saved = Vec::new();
+        read_capture(
+            5,
+            7,
+            &mut buffer,
+            || true,
+            &AtomicBool::new(false),
+            |buffer| {
+                let received = buffer.len().min(3);
+                for sample in &mut buffer[..received] {
+                    *sample = Complex::new(next, -next);
+                    next += 1;
+                }
+                Ok(received)
+            },
+            |samples| {
+                saved.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(next, 12);
+        assert_eq!(
+            saved,
+            (7..12)
+                .map(|value| Complex::new(value, -value))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn capture_rejects_a_final_read_that_returns_after_the_deadline() {
+        let within_deadline = std::cell::Cell::new(true);
+        let error = read_capture(
+            1,
+            0,
+            &mut [Complex::new(0, 0)],
+            || within_deadline.get(),
+            &AtomicBool::new(false),
+            |_| {
+                within_deadline.set(false);
+                Ok(1)
+            },
+            |_| panic!("late capture data reached the writer"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("wall-clock deadline"));
     }
 
     #[test]

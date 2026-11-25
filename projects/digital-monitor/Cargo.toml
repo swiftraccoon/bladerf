@@ -1,0 +1,20 @@
+[package]
+name = "digital-monitor"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Bounded offline orchestration for multiple passive RF decoders"
+
+[dependencies]
+anyhow = "1"
+clap = { features = ["derive"], version = "4.5" }
+ctrlc = { features = ["termination"], version = "3.4" }
+data-encoding = "2"
+nix = { default-features = false, features = ["fs", "process", "signal"], version = "0.31" }
+ring = { version = "0.17", default-features = false }
+rustix = { version = "1.1", features = ["process"] }
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"

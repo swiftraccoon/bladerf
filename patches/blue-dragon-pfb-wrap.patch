@@ -1,0 +1,12 @@
+--- a/crates/dsp/src/pfb.rs
++++ b/crates/dsp/src/pfb.rs
+@@ -410,3 +410,8 @@
+         for i in 0..self.m {
+-            let cur_offset = (coeff_offset + i) % self.m;
++            let cur_offset = coeff_offset + i;
++            let cur_offset = if cur_offset >= self.m {
++                cur_offset - self.m
++            } else {
++                cur_offset
++            };
+             let coeff_start = cur_offset * h_sub_len;

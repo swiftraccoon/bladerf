@@ -1,0 +1,223 @@
+diff --git a/crafter/src/radio/wifi/dsss/rx.rs b/crafter/src/radio/wifi/dsss/rx.rs
+index fff4880c8b7f..85d75b8ee228 100644
+--- a/crafter/src/radio/wifi/dsss/rx.rs
++++ b/crafter/src/radio/wifi/dsss/rx.rs
+@@ -38,7 +38,7 @@
+     pub previous_symbol: ComplexSample,
+     pub descrambler: Descrambler,
+     pub correlation: f32,
+-    pub trained_channel: Option<ChannelModel>,
++    trained_channel: Option<PayloadChannel>,
+ }
+ 
+ fn length(header: [u8; 6], short: bool, bound: usize) -> Option<(u32, usize)> {
+@@ -475,7 +475,9 @@
+         self.previous = symbol;
+         self.symbols = self.symbols.saturating_add(1);
+         if let Some(short) = self.short {
+-            if matches!(self.header[0], 55 | 110) && self.bits >= if short { 16 } else { 32 } {
++            if matches!(self.header[0], 10 | 20 | 55 | 110)
++                && self.bits >= if short { 16 } else { 32 }
++            {
+                 self.channel_training
+                     .observe(samples, start, self.frequency / 20.);
+             }
+@@ -508,7 +510,22 @@
+                         previous_symbol: symbol,
+                         descrambler: self.descrambler,
+                         correlation: self.quality / if short { 24. } else { 48. },
+-                        trained_channel: self.channel_training.finish(),
++                        trained_channel: self.channel_training.finish().and_then(|model| {
++                            match rate_bps {
++                                1_000_000 | 2_000_000 => {
++                                    let projection =
++                                        BarkerProjection::new(model, self.frequency / 20.)?;
++                                    // The acquisition lookahead can age this symbol out of
++                                    // the sample ring before the payload decoder starts.
++                                    let previous_symbol = projection.symbol(samples, start)?;
++                                    Some(PayloadChannel::Barker {
++                                        projection,
++                                        previous_symbol,
++                                    })
++                                }
++                                _ => Some(PayloadChannel::Cck(model)),
++                            }
++                        }),
+                     });
+                 *self = Self::default();
+                 return Some(decoded.ok_or(()));
+@@ -1181,8 +1198,64 @@
+         self.base
+     }
+ }
++#[derive(Clone, Debug)]
++enum PayloadChannel {
++    Barker {
++        projection: BarkerProjection,
++        previous_symbol: ComplexSample,
++    },
++    Cck(ChannelModel),
++}
++
++#[derive(Clone, Debug)]
++struct BarkerProjection {
++    weights: [ComplexSample; 18],
++}
++
++impl BarkerProjection {
++    fn new((taps, noise): ChannelModel, frequency_rad: f32) -> Option<Self> {
++        let mut weights = [ComplexSample::ZERO; 18];
++        let mut energy = 0.;
++        for (index, weight) in weights.iter_mut().enumerate() {
++            // Adjacent header or payload symbols can mix into the outer chips.
++            // Restrict the projection to the trained interior of this symbol.
++            let chip = 1 + index / 2;
++            let phase = index % 2;
++            let mut expected = ComplexSample::ZERO;
++            for tap in 0..3 {
++                expected = expected.add(taps[3 * phase + tap].scale(BARKER[chip + tap - 1]));
++            }
++            let inverse_noise = 1. / noise[phase];
++            energy += expected.power() * inverse_noise;
++            let rotation =
++                ComplexSample::rotation(-frequency_rad * (Self::offset(index) as f32 - 10.));
++            *weight = expected.conj().mul(rotation).scale(inverse_noise);
++        }
++        if !energy.is_finite() || energy <= 1e-12 {
++            return None;
++        }
++        for weight in &mut weights {
++            *weight = weight.scale(energy.recip());
++        }
++        Some(Self { weights })
++    }
++
++    fn offset(index: usize) -> f64 {
++        (1.25 + index as f64 * 0.5) * 20. / 11.
++    }
++
++    fn symbol(&self, samples: &Samples, start: f64) -> Option<ComplexSample> {
++        let mut sum = ComplexSample::ZERO;
++        for (index, weight) in self.weights.iter().enumerate() {
++            let sample = samples.at(start + Self::offset(index))?;
++            sum = sum.add(sample.mul(*weight));
++        }
++        Some(sum)
++    }
++}
++
+ struct Payload {
+-    channel: Option<([ComplexSample; 6], [f32; 2])>,
++    channel: Option<PayloadChannel>,
+     header: Header,
+     start: IqPosition,
+     bytes: Vec<u8>,
+@@ -1294,8 +1367,8 @@
+         Some(best)
+     }
+     fn cck(&self, samples: &Samples, start: f64) -> Option<(ComplexSample, u8, f32)> {
+-        if let Some((h, noise)) = self.channel {
+-            return self.equalized_cck_symbol(samples, start, h, noise);
++        if let Some(PayloadChannel::Cck((h, noise))) = &self.channel {
++            return self.equalized_cck_symbol(samples, start, *h, *noise);
+         }
+         let mut chips = [ComplexSample::ZERO; 8];
+         let mut power = 0.;
+@@ -1404,7 +1477,21 @@
+             return self.advance_cck(samples);
+         }
+         while samples.end as f64 >= self.next + 29. {
+-            let Some((symbol, _)) = samples.barker(self.next) else {
++            let projected_symbol = match &self.channel {
++                Some(PayloadChannel::Barker {
++                    projection,
++                    previous_symbol,
++                }) => {
++                    if self.bits == 0 {
++                        // Differential decisions need the same projection on both sides
++                        // of the boundary between the PLCP header and payload.
++                        self.header.previous_symbol = *previous_symbol;
++                    }
++                    projection.symbol(samples, self.next)
++                }
++                _ => samples.barker(self.next).map(|(symbol, _)| symbol),
++            };
++            let Some(symbol) = projected_symbol else {
+                 return false;
+             };
+             let corrected = symbol
+@@ -1525,12 +1612,12 @@
+         let pending = &mut self.pending;
+         let stats = &mut self.stats;
+         self.acquisition.push_samples(&chunk, |header, samples| {
+-            if let Some(header) = header {
++            if let Some(mut header) = header {
+                 if pending.is_none() {
+                     let mut start = chunk.position().clone();
+                     start.sample_index = header.preamble_start.floor() as u64;
+                     let recovered = Payload {
+-                        channel: header.trained_channel,
++                        channel: header.trained_channel.take(),
+                         next: header.payload_start,
+                         bytes: vec![0; header.psdu_bytes],
+                         bits: 0,
+diff --git a/crafter/tests/radio_dsss_vectors.rs b/crafter/tests/radio_dsss_vectors.rs
+index 59c8a49ab425..1a3e85ae5e12 100644
+--- a/crafter/tests/radio_dsss_vectors.rs
++++ b/crafter/tests/radio_dsss_vectors.rs
+@@ -226,6 +226,55 @@
+         }
+     }
+ }
++#[test]
++fn radio_dsss_barker_recovers_payload_interference() {
++    let index = include_str!("fixtures/iq/dsss-index.tsv");
++    let truth = index
++        .lines()
++        .find(|line| line.starts_with("dsss-10-long-impaired-64\t"))
++        .unwrap();
++    let expected = bytes(truth.split('\t').nth(4).unwrap());
++    let input = include_bytes!("fixtures/iq/dsss-10-long-impaired-64.cs8");
++    let mut noise_state = 12_345u32;
++    let stressed: Vec<u8> = input
++        .iter()
++        .enumerate()
++        .map(|(component, &value)| {
++            noise_state = noise_state
++                .wrapping_mul(1_664_525)
++                .wrapping_add(1_013_904_223);
++            // Start interference 100 samples into the payload to preserve PLCP training.
++            let noise = if component / 2 >= 3_978 {
++                ((i64::from(noise_state) - (1 << 31)) * 104) / (1 << 31)
++            } else {
++                0
++            };
++            i8::try_from((i64::from(value as i8) + noise) * 5 / 8)
++                .expect("interference fixture must stay within CS8 range") as u8
++        })
++        .collect();
++    for width in [137, 100_000] {
++        let mut decoder = DsssCckDecoder::new();
++        let mut frames = Vec::new();
++        for (part, samples) in stressed.chunks(width * 2).enumerate() {
++            frames.extend(
++                decoder
++                    .consume(IqEvent::Chunk(chunk(
++                        samples,
++                        part as u64,
++                        (part * width) as u64,
++                    )))
++                    .unwrap()
++                    .frames,
++            );
++        }
++        assert_eq!(frames.len(), 1, "{:?}", decoder.stats());
++        assert_eq!(frames[0].bytes, expected);
++        assert_eq!(frames[0].integrity, FrameIntegrity::ValidFcs);
++        assert_eq!(decoder.stats().invalid_fcs, 0);
++    }
++}
++
+ #[test]
+ fn radio_dsss_minimal_terminal_prefix_is_chunk_invariant() {
+     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/iq");

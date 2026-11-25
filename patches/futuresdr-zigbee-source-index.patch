@@ -1,0 +1,241 @@
+diff --git a/examples/zigbee/src/clock_recovery_mm.rs b/examples/zigbee/src/clock_recovery_mm.rs
+index 2bb427f..5479b56 100644
+--- a/examples/zigbee/src/clock_recovery_mm.rs
++++ b/examples/zigbee/src/clock_recovery_mm.rs
+@@ -1,5 +1,27 @@
++use anyhow::Context;
+ use futuresdr::runtime::dev::prelude::*;
+ 
++#[derive(Default)]
++struct SourceIndex {
++    consumed: u64,
++    previous_horizon: Option<u64>,
++}
++
++impl SourceIndex {
++    fn anchor(&mut self, required_through: usize) -> Result<Option<u64>> {
++        let horizon = self
++            .consumed
++            .checked_add(u64::try_from(required_through)?)
++            .context("clock input horizon overflow")?;
++        let follows_nominal_step = self
++            .previous_horizon
++            .and_then(|previous| previous.checked_add(2))
++            == Some(horizon);
++        self.previous_horizon = Some(horizon);
++        Ok((!follows_nominal_step).then_some(horizon))
++    }
++}
++
+ #[derive(Block)]
+ pub struct ClockRecoveryMm<I = DefaultCpuReader<f32>, O = DefaultCpuWriter<f32>>
+ where
+@@ -18,6 +40,7 @@ where
+     gain_mu: f32,
+     last_sample: f32,
+     look_ahead: usize,
++    source_index: Option<SourceIndex>,
+ }
+ 
+ impl<I, O> ClockRecoveryMm<I, O>
+@@ -46,8 +69,16 @@ where
+             gain_mu,
+             last_sample: 0.0,
+             look_ahead,
++            source_index: None,
+         }
+     }
++
++    /// Tag recovered chips with the zero-based input horizon required to emit them.
++    /// The first chip and departures from a two-sample step carry numeric anchors.
++    pub fn with_source_index(mut self) -> Self {
++        self.source_index = Some(SourceIndex::default());
++        self
++    }
+ }
+ 
+ fn slice(i: f32) -> f32 {
+@@ -66,12 +97,22 @@ where
+         _meta: &BlockMeta,
+     ) -> Result<()> {
+         let i = self.input.slice();
+-        let o = self.output.slice();
++        let (o, mut indexing) = if let Some(source_index) = &mut self.source_index {
++            let (output, tags) = self.output.slice_with_tags();
++            (output, Some((source_index, tags)))
++        } else {
++            (self.output.slice(), None)
++        };
+ 
+         let mut ii = 0;
+         let mut oo = 0;
+ 
+         while ii + self.look_ahead < i.len() && oo < o.len() {
++            if let Some((source_index, tags)) = &mut indexing
++                && let Some(horizon) = source_index.anchor(ii + self.look_ahead)?
++            {
++                tags.add_tag(oo, Tag::Id(horizon));
++            }
+             o[oo] = i[ii] + self.mu * (i[ii + 1] - i[ii]);
+             let mm_val = slice(self.last_sample) * o[oo] - slice(o[oo]) * self.last_sample;
+             self.last_sample = o[oo];
+@@ -86,6 +127,12 @@ where
+             oo += 1;
+         }
+ 
++        if let Some((source_index, _)) = indexing {
++            source_index.consumed = source_index
++                .consumed
++                .checked_add(u64::try_from(ii)?)
++                .context("clock consumed input count overflow")?;
++        }
+         self.input.consume(ii);
+         self.output.produce(oo);
+ 
+diff --git a/examples/zigbee/src/decoder.rs b/examples/zigbee/src/decoder.rs
+index 4ec06f9..bc1a57b 100644
+--- a/examples/zigbee/src/decoder.rs
++++ b/examples/zigbee/src/decoder.rs
+@@ -1,4 +1,6 @@
++use anyhow::Context;
+ use anyhow::anyhow;
++use anyhow::ensure;
+ use futuresdr::runtime::dev::prelude::*;
+ 
+ const CHIP_MAPPING: [u32; 16] = [
+@@ -46,8 +48,35 @@ impl Correlator {
+     }
+ }
+ 
++#[derive(Default)]
++struct SourceIndex {
++    previous_horizon: Option<u64>,
++}
++
++impl SourceIndex {
++    fn observe(&mut self, anchor: Option<u64>) -> Result<u64> {
++        let horizon = match anchor {
++            Some(horizon) => {
++                ensure!(
++                    self.previous_horizon
++                        .is_none_or(|previous| horizon >= previous),
++                    "clock input horizon moved backwards"
++                );
++                horizon
++            }
++            None => self
++                .previous_horizon
++                .context("missing initial clock input horizon anchor")?
++                .checked_add(2)
++                .context("clock input horizon overflow")?,
++        };
++        self.previous_horizon = Some(horizon);
++        Ok(horizon)
++    }
++}
++
+ #[derive(Block)]
+-#[message_outputs(out, indexed)]
++#[message_outputs(out, indexed, indexed_source)]
+ pub struct Decoder<I = DefaultCpuReader<f32>>
+ where
+     I: CpuBufferReader<Item = f32>,
+@@ -58,6 +87,7 @@ where
+     chip_count: u32,
+     total_chips: u64,
+     state: State,
++    source_index: Option<SourceIndex>,
+ }
+ 
+ impl<I> Decoder<I>
+@@ -74,8 +104,19 @@ where
+             state: State::Search,
+             chip_count: 0,
+             total_chips: 0,
++            source_index: None,
+         }
+     }
++
++    /// Read sparse clock input anchors and publish source-indexed candidates.
++    ///
++    /// Connect an indexed clock recovery directly to this decoder. Each
++    /// `indexed_source` message contains the recovered chip count, the zero-based
++    /// clock input horizon, and the candidate PSDU in that order.
++    pub fn with_source_index(mut self) -> Self {
++        self.source_index = Some(SourceIndex::default());
++        self
++    }
+ }
+ 
+ impl<I> Kernel for Decoder<I>
+@@ -88,16 +129,44 @@ where
+         mo: &mut MessageOutputs,
+         _meta: &BlockMeta,
+     ) -> Result<()> {
+-        let inbuf = self.input.slice().to_vec();
++        let (inbuf, anchors) = if self.source_index.is_some() {
++            let (samples, tags) = self.input.slice_with_tags();
++            let anchors: Vec<_> = tags
++                .iter()
++                .filter_map(|tag| match tag.tag {
++                    Tag::Id(horizon) => Some((tag.index, horizon)),
++                    _ => None,
++                })
++                .collect();
++            ensure!(
++                anchors
++                    .last()
++                    .is_none_or(|&(index, _)| index < samples.len())
++                    && anchors.windows(2).all(|pair| pair[0].0 < pair[1].0),
++                "clock input horizon anchors are out of order or outside the chip buffer"
++            );
++            (samples.to_vec(), anchors)
++        } else {
++            (self.input.slice().to_vec(), Vec::new())
++        };
++        let mut anchors = anchors.into_iter().peekable();
+         let inbuf_len = inbuf.len();
+ 
+-        for v in inbuf.into_iter() {
++        for (index, v) in inbuf.into_iter().enumerate() {
+             // Saturation would make indexed positions repeat, so fail before
+             // the archive's strict monotonic-position contract is violated.
+             self.total_chips = self
+                 .total_chips
+                 .checked_add(1)
+                 .ok_or_else(|| anyhow!("recovered chip counter overflow"))?;
++            let source_horizon = if let Some(source_index) = &mut self.source_index {
++                let anchor = anchors
++                    .next_if(|&(offset, _)| offset == index)
++                    .map(|(_, horizon)| horizon);
++                Some(source_index.observe(anchor)?)
++            } else {
++                None
++            };
+             if v > 0.0 {
+                 self.correlator.shift_reg = (self.correlator.shift_reg << 1) | 1;
+             } else {
+@@ -168,6 +237,13 @@ where
+                                 if data.len() == *len {
+                                     // info!("decoded frame");
+                                     let frame = std::mem::take(data);
++                                    let indexed_source = source_horizon.map(|horizon| {
++                                        Pmt::VecPmt(vec![
++                                            Pmt::U64(self.total_chips),
++                                            Pmt::U64(horizon),
++                                            Pmt::Blob(frame.clone()),
++                                        ])
++                                    });
+                                     mo.post("out", Pmt::Blob(frame.clone())).await?;
+                                     mo.post(
+                                         "indexed",
+@@ -177,6 +253,9 @@ where
+                                         ]),
+                                     )
+                                     .await?;
++                                    if let Some(message) = indexed_source {
++                                        mo.post("indexed_source", message).await?;
++                                    }
+                                     self.state = State::Search;
+                                 }
+                             } else {

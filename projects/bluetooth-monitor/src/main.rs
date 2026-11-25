@@ -1,11 +1,16 @@
-//! Passive Bluetooth capture with bounded decoder lifetime and independent BLE CRC checks.
+//! Passive Bluetooth capture with bounded decoder lifetime, independent BLE CRC checks and
+//! structural validation of retained Blue Dragon burst archives.
 //!
 //! Run `cargo run --locked -p bluetooth-monitor -- --help` from the workspace.
 //! Captures and per-packet reports contain radio observations; keep them local.
 
 #![forbid(unsafe_code)]
 
+mod alias_control;
+mod burst_families;
+mod bursts;
 mod packets;
+mod replay;
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{Read, Write};
@@ -52,6 +57,37 @@ enum Action {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// Validate and summarize a Blue Dragon burst archive without a radio or decoder.
+    InspectBursts(BurstInspect),
+    /// Classify bounded candidate waveform families in an existing burst archive.
+    ClassifyBursts(burst_families::ClassifyBursts),
+    /// Compare selected 2 MSps bursts with a retained 4 MSps frequency stream.
+    AliasControl(alias_control::AliasControl),
+    /// Analyze fixed windows selected without burst triggers or signal metrics.
+    BackgroundControls(alias_control::BackgroundControls),
+    /// Replay bounded retained SC16_Q11 IQ through Blue Dragon without opening a radio.
+    ReplayIq(replay::ReplayIq),
+}
+
+#[derive(Debug, Args)]
+struct BurstInspect {
+    input: PathBuf,
+    /// New output directory; defaults under artifacts/bluetooth-burst-inspect/.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Maximum accepted archive size in MiB.
+    #[arg(long, default_value_t = 8192)]
+    max_input_mib: u32,
+}
+
+impl BurstInspect {
+    fn max_input_bytes(&self) -> Result<u64> {
+        ensure!(
+            (1..=8192).contains(&self.max_input_mib),
+            "burst input limit must be 1..=8192 MiB"
+        );
+        Ok(u64::from(self.max_input_mib) * 1024 * 1024)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
@@ -217,6 +253,7 @@ fn decoder(root: &Path, selected: Option<&Path>, engine: Engine) -> Result<PathB
         )
     })?;
     let status = Command::new("git")
+        .env("GIT_CEILING_DIRECTORIES", root.join("repos"))
         .arg("-C")
         .arg(root.join(engine.source()))
         .args(["apply", "--reverse", "--check"])
@@ -229,6 +266,9 @@ fn decoder(root: &Path, selected: Option<&Path>, engine: Engine) -> Result<PathB
         status.success(),
         "required decoder receive-setup patch is missing; follow the project build instructions"
     );
+    if matches!(engine, Engine::BlueDragon) {
+        replay::check_patch(root)?;
+    }
     Ok(binary)
 }
 
@@ -263,12 +303,80 @@ fn output_path(explicit: Option<&Path>, base: &str) -> PathBuf {
     })
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct CodedScanCoverage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_geometry_version: Option<u8>,
+    frequency_mhz: u64,
+    completed_windows: u64,
+    first_start_channel_sample: u64,
+    first_window_channel_samples: u64,
+    last_start_channel_sample: u64,
+    last_window_channel_samples: u64,
+}
+
+impl CodedScanCoverage {
+    fn parse(log: &str) -> Result<Option<Self>> {
+        let mut reports = log
+            .split_inclusive('\n')
+            .filter_map(|line| line.strip_prefix("coded scan coverage"));
+        let Some(report) = reports.next() else {
+            return Ok(None);
+        };
+        ensure!(
+            reports.next().is_none(),
+            "duplicate coded scan coverage report"
+        );
+        let (window_geometry_version, report) = if let Some(report) = report.strip_prefix(" v1: ") {
+            (None, report)
+        } else {
+            (
+                Some(2),
+                report
+                    .strip_prefix(" v2: ")
+                    .context("unsupported coded scan coverage format")?,
+            )
+        };
+        let report = report
+            .strip_suffix('\n')
+            .context("incomplete coded scan coverage line")?;
+        let mut fields = report.split_ascii_whitespace();
+        let mut number = || -> Result<u64> {
+            let field = fields.next().context("missing coded scan coverage field")?;
+            ensure!(
+                field.bytes().all(|byte| byte.is_ascii_digit()),
+                "invalid coded scan coverage field"
+            );
+            field.parse().context("invalid coded scan coverage number")
+        };
+        let coverage = Self {
+            window_geometry_version,
+            frequency_mhz: number()?,
+            completed_windows: number()?,
+            first_start_channel_sample: number()?,
+            first_window_channel_samples: number()?,
+            last_start_channel_sample: number()?,
+            last_window_channel_samples: number()?,
+        };
+        ensure!(fields.next().is_none(), "extra coded scan coverage field");
+        Ok(Some(coverage))
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct Diagnostics {
     scanned_bytes: usize,
     prefix_only: bool,
     stream_error_mentions: usize,
     processing_warning_mentions: usize,
+    file_reader_error_mentions: usize,
+    pcap_write_error_mentions: usize,
+    burst_limit_mentions: usize,
+    burst_write_error_mentions: usize,
+    file_sample_reports: usize,
+    file_samples_processed: Option<u64>,
+    #[serde(skip_serializing)]
+    coded_scan_coverage: Option<CodedScanCoverage>,
 }
 
 fn diagnostics(path: &Path) -> Result<Diagnostics> {
@@ -277,6 +385,12 @@ fn diagnostics(path: &Path) -> Result<Diagnostics> {
     let mut bytes = Vec::new();
     input.take(16 * 1024 * 1024).read_to_end(&mut bytes)?;
     let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+    let file_samples: Vec<u64> = text
+        .lines()
+        .filter(|line| line.starts_with("done ("))
+        .filter_map(|line| line.rsplit_once(" samples: ").map(|(_, value)| value))
+        .filter_map(|value| value.parse().ok())
+        .collect();
     Ok(Diagnostics {
         scanned_bytes: bytes.len(),
         prefix_only: length > bytes.len() as u64,
@@ -310,7 +424,38 @@ fn diagnostics(path: &Path) -> Result<Diagnostics> {
                         .count()
                 })
                 .sum::<usize>(),
+        file_reader_error_mentions: ["file reader error", "read error:"]
+            .iter()
+            .map(|message| text.matches(message).count())
+            .sum(),
+        pcap_write_error_mentions: text.matches("pcap write error:").count(),
+        burst_limit_mentions: text
+            .matches("burst capture size limit reached; recording stopped")
+            .count(),
+        burst_write_error_mentions: text.matches("burst capture write error:").count(),
+        file_sample_reports: file_samples.len(),
+        file_samples_processed: (file_samples.len() == 1).then(|| file_samples[0]),
+        coded_scan_coverage: CodedScanCoverage::parse(&text)?,
     })
+}
+
+fn require_capture_diagnostics(diagnostics: &Diagnostics, output: &Path) -> Result<()> {
+    ensure!(
+        diagnostics.pcap_write_error_mentions == 0 && diagnostics.burst_write_error_mentions == 0,
+        "decoder reported candidate PCAP or burst archive write errors; captured evidence is preserved in {}",
+        output.display()
+    );
+    ensure!(
+        !diagnostics.prefix_only,
+        "decoder log exceeds the complete diagnostic scan limit; captured evidence is preserved in {}",
+        output.display()
+    );
+    ensure!(
+        diagnostics.stream_error_mentions == 0,
+        "decoder reported receive/USB errors; captured evidence is preserved in {}",
+        output.display()
+    );
+    Ok(())
 }
 
 /// The owned child is always reaped; fallback cleanup cannot report errors.
@@ -481,7 +626,7 @@ fn capture(root: &Path, executable: &Path, args: &Capture, interrupted: &AtomicB
         &output.join("capture.json"),
         &json!({"engine":args.engine,"stop_reason":reason,"exit_code":status.code(),"exit_success":status.success(),"forced_kill":forced,"elapsed_wall_seconds":start.elapsed().as_secs_f64(),"iq_bytes":fs::metadata(&iq).ok().map(|m|m.len()),"native_diagnostics":diagnostics,"continuity_guaranteed":false}),
     )?;
-    if candidates.is_file() {
+    let summary = if candidates.is_file() {
         let summary = packets::inspect(
             &candidates,
             Some(&output.join("validated.pcap")),
@@ -494,28 +639,62 @@ fn capture(root: &Path, executable: &Path, args: &Capture, interrupted: &AtomicB
             )
         })?;
         json_file(&output.join("summary.json"), &summary)?;
-        println!("{}", serde_json::to_string_pretty(&summary)?);
-    }
-    println!("Capture directory: {}", output.display());
-    if diagnostics.processing_warning_mentions > 0 {
-        eprintln!(
-            "Decoder reported processing warnings; inspect decoder.log for possible capture gaps."
-        );
-    }
+        Some(summary)
+    } else {
+        None
+    };
+    let burst_summary = if matches!(args.engine, Engine::BlueDragon) && args.save_iq {
+        let summary = bursts::inspect(&iq, u64::from(args.iq_limit_mib) * 1024 * 1024)
+            .with_context(|| {
+                format!(
+                    "inspect Blue Dragon burst archive; capture evidence is preserved in {}",
+                    output.display()
+                )
+            })?;
+        json_file(&output.join("bursts.json"), &summary)?;
+        Some(summary)
+    } else {
+        None
+    };
     ensure!(
         status.success() && !forced && reason != "decoder_exit",
         "decoder did not shut down successfully; candidates and logs are preserved in {}",
         output.display()
     );
-    ensure!(
-        candidates.is_file(),
-        "decoder produced no PCAP; inspect decoder.log"
-    );
-    ensure!(
-        diagnostics.stream_error_mentions == 0,
-        "decoder reported receive/USB errors; validated packets are preserved, but the capture may have gaps (see decoder.log)"
-    );
-    Ok(())
+    require_capture_diagnostics(&diagnostics, &output)?;
+    let summary = summary.with_context(|| {
+        format!(
+            "decoder produced no PCAP; inspect {}",
+            output.join("decoder.log").display()
+        )
+    })?;
+    if diagnostics.processing_warning_mentions > 0 {
+        writeln!(
+            std::io::stderr().lock(),
+            "Decoder reported processing warnings; inspect decoder.log for possible capture gaps."
+        )
+        .context("write capture warning")?;
+    }
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", serde_json::to_string_pretty(&summary)?)?;
+    if let Some(burst_summary) = burst_summary {
+        writeln!(
+            stdout,
+            "Burst archive: {} channelized records ({} squelch-triggered, {} scan windows; not decoded packets or occupancy)",
+            burst_summary.archive_record_count,
+            burst_summary.squelch_record_count,
+            burst_summary.scan_window_record_count
+        )?;
+    }
+    writeln!(stdout, "Capture directory: {}", output.display())?;
+    stdout.flush().context("flush capture output")
+}
+
+fn print_summary(summary: &impl Serialize, label: &str, output: &Path) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", serde_json::to_string_pretty(summary)?)?;
+    writeln!(stdout, "{label}: {}", output.display())?;
+    stdout.flush().context("flush summary output")
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -535,8 +714,57 @@ fn run(cli: Cli) -> Result<()> {
             Some(&output.join("packets.jsonl")),
         )?;
         json_file(&output.join("summary.json"), &summary)?;
-        println!("{}", serde_json::to_string_pretty(&summary)?);
-        println!("Inspection directory: {}", output.display());
+        return print_summary(&summary, "Inspection directory", &output);
+    }
+    if let Action::InspectBursts(args) = &cli.command {
+        let max_input_bytes = args.max_input_bytes()?;
+        let base = match &cli.workspace {
+            Some(path) => workspace(Some(path.clone()))?,
+            None => workspace(None).unwrap_or(std::env::current_dir()?),
+        };
+        let output = base.join(output_path(
+            args.output.as_deref(),
+            "artifacts/bluetooth-burst-inspect",
+        ));
+        new_directory(&output)?;
+        let summary = bursts::inspect(&args.input, max_input_bytes)?;
+        json_file(&output.join("bursts.json"), &summary)?;
+        return print_summary(&summary, "Burst inspection directory", &output);
+    }
+    if let Action::ClassifyBursts(args) = &cli.command {
+        let base = match &cli.workspace {
+            Some(path) => workspace(Some(path.clone()))?,
+            None => workspace(None).unwrap_or(std::env::current_dir()?),
+        };
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&interrupted);
+        ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+            .context("install shutdown handler")?;
+        burst_families::run(&base, args, &interrupted)?;
+        return Ok(());
+    }
+    if let Action::AliasControl(args) = &cli.command {
+        let base = match &cli.workspace {
+            Some(path) => workspace(Some(path.clone()))?,
+            None => workspace(None).unwrap_or(std::env::current_dir()?),
+        };
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&interrupted);
+        ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+            .context("install shutdown handler")?;
+        alias_control::run(&base, args, &interrupted)?;
+        return Ok(());
+    }
+    if let Action::BackgroundControls(args) = &cli.command {
+        let base = match &cli.workspace {
+            Some(path) => workspace(Some(path.clone()))?,
+            None => workspace(None).unwrap_or(std::env::current_dir()?),
+        };
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&interrupted);
+        ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+            .context("install shutdown handler")?;
+        alias_control::run_background_controls(&base, args, &interrupted)?;
         return Ok(());
     }
     if let Action::Capture(args) = &cli.command {
@@ -546,7 +774,14 @@ fn run(cli: Cli) -> Result<()> {
     let engine = match &cli.command {
         Action::Doctor { engine } => *engine,
         Action::Capture(args) => args.engine,
-        Action::Inspect { .. } => unreachable!(),
+        Action::ReplayIq(_) => Engine::BlueDragon,
+        Action::Inspect { .. }
+        | Action::InspectBursts(_)
+        | Action::ClassifyBursts(_)
+        | Action::AliasControl(_)
+        | Action::BackgroundControls(_) => {
+            unreachable!()
+        }
     };
     let executable = decoder(&root, cli.decoder.as_deref(), engine)?;
     match cli.command {
@@ -562,7 +797,20 @@ fn run(cli: Cli) -> Result<()> {
                 .context("install shutdown handler")?;
             capture(&root, &executable, &args, &interrupted)?;
         }
-        Action::Inspect { .. } => unreachable!(),
+        Action::ReplayIq(args) => {
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let signal = Arc::clone(&interrupted);
+            ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
+                .context("install shutdown handler")?;
+            replay::run(&root, &executable, &args, &interrupted)?;
+        }
+        Action::Inspect { .. }
+        | Action::InspectBursts(_)
+        | Action::ClassifyBursts(_)
+        | Action::AliasControl(_)
+        | Action::BackgroundControls(_) => {
+            unreachable!()
+        }
     }
     Ok(())
 }
@@ -571,7 +819,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error:#}");
+            let _ = writeln!(std::io::stderr().lock(), "{error:#}");
             ExitCode::FAILURE
         }
     }
@@ -579,7 +827,110 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    #[test]
+    fn burst_feature_breakdown_requires_a_valid_family_frequency_pair() {
+        assert!(
+            Cli::try_parse_from([
+                "bluetooth-monitor",
+                "classify-bursts",
+                "input.bdb",
+                "--feature-breakdown-family",
+                "narrowband_constant_envelope_unresolved_candidate",
+                "--feature-breakdown-frequency-mhz",
+                "2438",
+            ])
+            .is_ok()
+        );
+        for args in [
+            vec![
+                "--feature-breakdown-family",
+                "narrowband_constant_envelope_unresolved_candidate",
+            ],
+            vec!["--feature-breakdown-frequency-mhz", "2438"],
+            vec![
+                "--feature-breakdown-family",
+                "unknown",
+                "--feature-breakdown-frequency-mhz",
+                "2438",
+            ],
+            vec![
+                "--feature-breakdown-family",
+                "unclassified_burst_group",
+                "--feature-breakdown-frequency-mhz",
+                "2401",
+            ],
+        ] {
+            let mut command = vec!["bluetooth-monitor", "classify-bursts", "input.bdb"];
+            command.extend(args);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+    }
+
+    #[test]
+    fn alias_control_requires_closed_selection_and_both_provenance_manifests() {
+        assert!(
+            Cli::try_parse_from([
+                "bluetooth-monitor",
+                "alias-control",
+                "bursts.bdb",
+                "frequency.cf32",
+                "--manifest",
+                "channelize-frequency.json",
+                "--replay-manifest",
+                "replay.json",
+                "--family",
+                "narrowband_constant_envelope_unresolved_candidate",
+                "--frequency-mhz",
+                "2438",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bluetooth-monitor",
+                "alias-control",
+                "bursts.bdb",
+                "frequency.cf32",
+                "--manifest",
+                "channelize-frequency.json",
+                "--family",
+                "unknown",
+                "--frequency-mhz",
+                "2401",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn background_controls_requires_manifest_and_expected_frequency() {
+        assert!(
+            Cli::try_parse_from([
+                "bluetooth-monitor",
+                "background-controls",
+                "frequency.cf32",
+                "--manifest",
+                "channelize-frequency.json",
+                "--frequency-mhz",
+                "2438",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bluetooth-monitor",
+                "background-controls",
+                "frequency.cf32",
+                "--manifest",
+                "channelize-frequency.json",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn rejects_invalid_capture_before_radio_access() {
@@ -597,6 +948,24 @@ mod tests {
             };
             assert!(capture.validate().is_err());
         }
+    }
+
+    #[test]
+    fn bounds_burst_inspection_before_output_or_input_access() {
+        for max_input_mib in [0, 8193] {
+            let args = BurstInspect {
+                input: PathBuf::from("missing"),
+                output: None,
+                max_input_mib,
+            };
+            assert!(args.max_input_bytes().is_err());
+        }
+        let args = BurstInspect {
+            input: PathBuf::from("missing"),
+            output: None,
+            max_input_mib: 8192,
+        };
+        assert_eq!(args.max_input_bytes().unwrap(), 8 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -640,6 +1009,88 @@ mod tests {
     }
 
     #[test]
+    fn decoder_write_errors_fail_capture_and_keep_parseable_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let decoder = root.join("decoder");
+        fs::write(
+            &decoder,
+            r#"#!/bin/sh
+set -eu
+trap 'exit 0' INT
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -w) cp fixture.pcap "$2"; shift ;;
+        --write-bursts) cp fixture.bdb "$2"; shift ;;
+    esac
+    shift
+done
+printf '%s\n' 'PCAP write error: full' 'burst capture write error: full' >&2
+touch ready
+while :; do sleep 0.02; done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&decoder, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            root.join("fixture.pcap"),
+            b"\xd4\xc3\xb2\xa1\x02\0\x04\0\0\0\0\0\0\0\0\0\0\x10\0\0\0\x01\0\0",
+        )
+        .unwrap();
+        fs::write(
+            root.join("fixture.bdb"),
+            b"BDBURST\0\x01\0\x10\0\x80\x84\x1e\0",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from([
+            "bluetooth-monitor",
+            "capture",
+            "--output",
+            "capture",
+            "--save-iq",
+        ])
+        .unwrap();
+        let Action::Capture(args) = cli.command else {
+            panic!("capture command");
+        };
+        let stop = AtomicBool::new(false);
+        let result = thread::scope(|scope| {
+            scope.spawn(|| {
+                let start = Instant::now();
+                while !root.join("ready").is_file() && start.elapsed() < Duration::from_secs(3) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            capture(root, &decoder, &args, &stop)
+        });
+        assert!(result.unwrap_err().to_string().contains("write errors"));
+        let output = root.join("capture");
+        for name in [
+            "candidates.pcap",
+            "summary.json",
+            "bursts.bdb",
+            "bursts.json",
+        ] {
+            assert!(
+                output.join(name).is_file(),
+                "missing capture artifact {name}"
+            );
+        }
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("capture.json")).unwrap()).unwrap();
+        assert_eq!(manifest["exit_success"], true);
+        assert_eq!(
+            manifest["native_diagnostics"]["pcap_write_error_mentions"],
+            1
+        );
+        assert_eq!(
+            manifest["native_diagnostics"]["burst_write_error_mentions"],
+            1
+        );
+    }
+
+    #[test]
     fn interrupts_and_reaps_owned_child() {
         let process = Command::new("sleep").arg("60").spawn().unwrap();
         let mut child = DecoderChild {
@@ -655,12 +1106,61 @@ mod tests {
     fn distinguishes_zero_counters_from_reported_stream_and_processing_errors() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("decoder.log");
-        fs::write(&path, "overflow: 0 shed:0\n").unwrap();
+        fs::write(
+            &path,
+            "overflow: 0 shed:0\ndone (1.0s): BLE: 0 BT: 0 bursts: 0 CRC: 0.0% (0/0) samples: 20000000\n",
+        )
+        .unwrap();
         let clean = diagnostics(&path).unwrap();
         assert_eq!(clean.processing_warning_mentions, 0);
+        assert_eq!(clean.file_sample_reports, 1);
+        assert_eq!(clean.file_samples_processed, Some(20_000_000));
+        require_capture_diagnostics(&clean, directory.path()).unwrap();
+        fs::write(
+            &path,
+            "done (1.0s): samples: 10\ndone (1.1s): samples: 20\n",
+        )
+        .unwrap();
+        let duplicate = diagnostics(&path).unwrap();
+        assert_eq!(duplicate.file_sample_reports, 2);
+        assert_eq!(duplicate.file_samples_processed, None);
         fs::write(&path, "overflow: 3 shed:2\nGot transfer error for buffer\n").unwrap();
         let degraded = diagnostics(&path).unwrap();
         assert_eq!(degraded.processing_warning_mentions, 2);
         assert_eq!(degraded.stream_error_mentions, 1);
+        fs::write(
+            &path,
+            "PCAP write error: full\nburst capture write error: denied\nfile reader error: invalid Q11\n",
+        )
+        .unwrap();
+        let failed = diagnostics(&path).unwrap();
+        assert_eq!(failed.pcap_write_error_mentions, 1);
+        assert_eq!(failed.burst_write_error_mentions, 1);
+        assert_eq!(failed.file_reader_error_mentions, 1);
+        for message in [
+            "PCAP write error: full",
+            "burst capture write error: denied",
+        ] {
+            fs::write(&path, message).unwrap();
+            assert!(
+                require_capture_diagnostics(&diagnostics(&path).unwrap(), directory.path())
+                    .is_err()
+            );
+        }
+        fs::write(
+            &path,
+            "Burst capture size limit reached; recording stopped\noverflow: 3",
+        )
+        .unwrap();
+        let mut limited = diagnostics(&path).unwrap();
+        assert_eq!(limited.burst_limit_mentions, 1);
+        require_capture_diagnostics(&limited, directory.path()).unwrap();
+        limited.prefix_only = true;
+        assert!(
+            require_capture_diagnostics(&limited, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("complete diagnostic scan limit")
+        );
     }
 }

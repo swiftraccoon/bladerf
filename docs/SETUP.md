@@ -130,6 +130,8 @@ For a short receive experiment, select a suitable input and use fresh filenames:
 
 ```bash
 target/release/bladerf-lab capture --output captures/setup-check.sc16q11
+target/release/bladerf-lab capture --require-fpga-version 0.16.0 \
+  --output captures/version-checked.sc16q11
 target/release/bladerf-lab analyze captures/setup-check.sc16q11 --output artifacts/setup-check-psd.png
 target/release/bladerf-lab soapy-rx
 target/release/bladerf-lab gnuradio-rx
@@ -139,6 +141,16 @@ Inspect `capture --help`, choose appropriate settings and
 record readbacks alongside the results. It saves SC16Q11 IQ and a JSON sidecar
 and refuses existing outputs. A completed single-channel capture contains four
 bytes per complex sample; compare the file size with the completed sample count.
+The optional `--require-fpga-version MAJOR.MINOR.PATCH` guard compares the
+device's exact reported version on the opened handle before this application
+changes bias, loopback, tuning, bandwidth or gain and before it creates a
+stream. SoapyBladeRF writes its default 4 MHz RX and TX sample rates while
+constructing the device, before the application can inspect hardware
+information. A missing or unequal version still opens no stream, publishes no
+capture, enables neither RX nor TX, and exposes no image-load or flash action.
+The guard itself requests no image-load or flash operation; ordinary
+libbladeRF/Soapy device-open behavior necessarily precedes this post-open check.
+The sidecar records the observed version and, when supplied, the requirement.
 Analysis reports relative dBFS/Hz, not calibrated dBm. Untimestamped SC16Q11 does
 not by itself certify continuity.
 

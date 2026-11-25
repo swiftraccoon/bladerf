@@ -23,9 +23,345 @@ const BAD_FCS: u8 = 0x40;
 const MINIMAL_RADIOTAP: [u8; 9] = [0, 0, 9, 0, 2, 0, 0, 0, FCS_PRESENT];
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Aggregate counters; frame-type and IE maps describe independently valid frames.
 #[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct EapolPacketTypes {
+    pub(crate) eap_packet: u64,
+    pub(crate) start: u64,
+    pub(crate) logoff: u64,
+    pub(crate) key: u64,
+    pub(crate) asf_alert: u64,
+    pub(crate) other: u64,
+}
+
+impl EapolPacketTypes {
+    fn observe(&mut self, packet_type: u8) {
+        let count = match packet_type {
+            0 => &mut self.eap_packet,
+            1 => &mut self.start,
+            2 => &mut self.logoff,
+            3 => &mut self.key,
+            4 => &mut self.asf_alert,
+            _ => &mut self.other,
+        };
+        *count += 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.eap_packet += other.eap_packet;
+        self.start += other.start;
+        self.logoff += other.logoff;
+        self.key += other.key;
+        self.asf_alert += other.asf_alert;
+        self.other += other.other;
+    }
+}
+
+/// Aggregate EAPOL structure only; no address, payload or key material.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct EapolSummary {
+    pub(crate) frame_count: u64,
+    pub(crate) complete_header_count: u64,
+    pub(crate) truncated_header_count: u64,
+    pub(crate) complete_body_count: u64,
+    pub(crate) truncated_body_count: u64,
+    pub(crate) packet_types: EapolPacketTypes,
+    pub(crate) parsed_key_header_count: u64,
+    pub(crate) pairwise_key_count: u64,
+    pub(crate) install_key_count: u64,
+    pub(crate) ack_key_count: u64,
+    pub(crate) mic_key_count: u64,
+    pub(crate) secure_key_count: u64,
+}
+
+impl EapolSummary {
+    fn merge(&mut self, other: Self) {
+        self.frame_count += other.frame_count;
+        self.complete_header_count += other.complete_header_count;
+        self.truncated_header_count += other.truncated_header_count;
+        self.complete_body_count += other.complete_body_count;
+        self.truncated_body_count += other.truncated_body_count;
+        self.packet_types.merge(other.packet_types);
+        self.parsed_key_header_count += other.parsed_key_header_count;
+        self.pairwise_key_count += other.pairwise_key_count;
+        self.install_key_count += other.install_key_count;
+        self.ack_key_count += other.ack_key_count;
+        self.mic_key_count += other.mic_key_count;
+        self.secure_key_count += other.secure_key_count;
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct AdvertisementPhySummary {
+    pub(crate) ht_capabilities_element_frames: u64,
+    pub(crate) ht_operation_element_frames: u64,
+    pub(crate) vht_capabilities_element_frames: u64,
+    pub(crate) vht_operation_element_frames: u64,
+    pub(crate) he_capabilities_element_frames: u64,
+    pub(crate) he_operation_element_frames: u64,
+    pub(crate) eht_capabilities_element_frames: u64,
+    pub(crate) eht_operation_element_frames: u64,
+    pub(crate) unrecognized_extension_element_frames: u64,
+}
+
+impl AdvertisementPhySummary {
+    fn merge(&mut self, other: Self) {
+        self.ht_capabilities_element_frames += other.ht_capabilities_element_frames;
+        self.ht_operation_element_frames += other.ht_operation_element_frames;
+        self.vht_capabilities_element_frames += other.vht_capabilities_element_frames;
+        self.vht_operation_element_frames += other.vht_operation_element_frames;
+        self.he_capabilities_element_frames += other.he_capabilities_element_frames;
+        self.he_operation_element_frames += other.he_operation_element_frames;
+        self.eht_capabilities_element_frames += other.eht_capabilities_element_frames;
+        self.eht_operation_element_frames += other.eht_operation_element_frames;
+        self.unrecognized_extension_element_frames += other.unrecognized_extension_element_frames;
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct AdvertisementSecuritySummary {
+    pub(crate) privacy_capability_frames: u64,
+    pub(crate) rsn_present_frames: u64,
+    pub(crate) rsn_parsed_frames: u64,
+    pub(crate) rsn_malformed_frames: u64,
+    pub(crate) pmf_capable_frames: u64,
+    pub(crate) pmf_required_frames: u64,
+    pub(crate) wpa_present_frames: u64,
+    pub(crate) wpa_parsed_frames: u64,
+    pub(crate) wpa_malformed_frames: u64,
+}
+
+impl AdvertisementSecuritySummary {
+    fn merge(&mut self, other: Self) {
+        self.privacy_capability_frames += other.privacy_capability_frames;
+        self.rsn_present_frames += other.rsn_present_frames;
+        self.rsn_parsed_frames += other.rsn_parsed_frames;
+        self.rsn_malformed_frames += other.rsn_malformed_frames;
+        self.pmf_capable_frames += other.pmf_capable_frames;
+        self.pmf_required_frames += other.pmf_required_frames;
+        self.wpa_present_frames += other.wpa_present_frames;
+        self.wpa_parsed_frames += other.wpa_parsed_frames;
+        self.wpa_malformed_frames += other.wpa_malformed_frames;
+    }
+}
+
+/// Aggregate element presence in eligible beacon and probe-response frames.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct AdvertisementSummary {
+    pub(crate) eligible_frame_count: u64,
+    pub(crate) beacon_frames: u64,
+    pub(crate) probe_response_frames: u64,
+    pub(crate) complete_ie_layout_frames: u64,
+    pub(crate) truncated_ie_layout_frames: u64,
+    pub(crate) phy: AdvertisementPhySummary,
+    pub(crate) security: AdvertisementSecuritySummary,
+}
+
+impl AdvertisementSummary {
+    fn observe(&mut self, subtype: u8, capabilities: u16, ie: &InformationElements) {
+        self.eligible_frame_count += 1;
+        if subtype == 8 {
+            self.beacon_frames += 1;
+        } else {
+            debug_assert_eq!(subtype, 5);
+            self.probe_response_frames += 1;
+        }
+        if ie.layout_complete {
+            self.complete_ie_layout_frames += 1;
+        } else {
+            self.truncated_ie_layout_frames += 1;
+        }
+        let phy = &ie.evidence.phy;
+        self.phy.ht_capabilities_element_frames += u64::from(phy.ht_capabilities);
+        self.phy.ht_operation_element_frames += u64::from(phy.ht_operation);
+        self.phy.vht_capabilities_element_frames += u64::from(phy.vht_capabilities);
+        self.phy.vht_operation_element_frames += u64::from(phy.vht_operation);
+        self.phy.he_capabilities_element_frames += u64::from(phy.he_capabilities);
+        self.phy.he_operation_element_frames += u64::from(phy.he_operation);
+        self.phy.eht_capabilities_element_frames += u64::from(phy.eht_capabilities);
+        self.phy.eht_operation_element_frames += u64::from(phy.eht_operation);
+        self.phy.unrecognized_extension_element_frames += u64::from(phy.unrecognized_extension);
+        let security = &ie.evidence.security;
+        self.security.privacy_capability_frames += u64::from(capabilities & 0x10 != 0);
+        self.security.rsn_present_frames += u64::from(security.rsn_present);
+        self.security.rsn_parsed_frames += u64::from(security.rsn_parsed);
+        self.security.rsn_malformed_frames += u64::from(security.rsn_malformed);
+        self.security.pmf_capable_frames += u64::from(security.pmf_capable);
+        self.security.pmf_required_frames += u64::from(security.pmf_required);
+        self.security.wpa_present_frames += u64::from(security.wpa_present);
+        self.security.wpa_parsed_frames += u64::from(security.wpa_parsed);
+        self.security.wpa_malformed_frames += u64::from(security.wpa_malformed);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.eligible_frame_count += other.eligible_frame_count;
+        self.beacon_frames += other.beacon_frames;
+        self.probe_response_frames += other.probe_response_frames;
+        self.complete_ie_layout_frames += other.complete_ie_layout_frames;
+        self.truncated_ie_layout_frames += other.truncated_ie_layout_frames;
+        self.phy.merge(other.phy);
+        self.security.merge(other.security);
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct BlockAckTidCounts {
+    pub(crate) tid_0: u64,
+    pub(crate) tid_1: u64,
+    pub(crate) tid_2: u64,
+    pub(crate) tid_3: u64,
+    pub(crate) tid_4: u64,
+    pub(crate) tid_5: u64,
+    pub(crate) tid_6: u64,
+    pub(crate) tid_7: u64,
+    pub(crate) tid_8: u64,
+    pub(crate) tid_9: u64,
+    pub(crate) tid_10: u64,
+    pub(crate) tid_11: u64,
+    pub(crate) tid_12: u64,
+    pub(crate) tid_13: u64,
+    pub(crate) tid_14: u64,
+    pub(crate) tid_15: u64,
+}
+
+impl BlockAckTidCounts {
+    fn values(&self) -> [u64; 16] {
+        [
+            self.tid_0,
+            self.tid_1,
+            self.tid_2,
+            self.tid_3,
+            self.tid_4,
+            self.tid_5,
+            self.tid_6,
+            self.tid_7,
+            self.tid_8,
+            self.tid_9,
+            self.tid_10,
+            self.tid_11,
+            self.tid_12,
+            self.tid_13,
+            self.tid_14,
+            self.tid_15,
+        ]
+    }
+
+    fn from_values(values: [u64; 16]) -> Self {
+        Self {
+            tid_0: values[0],
+            tid_1: values[1],
+            tid_2: values[2],
+            tid_3: values[3],
+            tid_4: values[4],
+            tid_5: values[5],
+            tid_6: values[6],
+            tid_7: values[7],
+            tid_8: values[8],
+            tid_9: values[9],
+            tid_10: values[10],
+            tid_11: values[11],
+            tid_12: values[12],
+            tid_13: values[13],
+            tid_14: values[14],
+            tid_15: values[15],
+        }
+    }
+
+    fn increment(&mut self, tid: u8) -> Result<()> {
+        let mut values = self.values();
+        let count = values
+            .get_mut(usize::from(tid))
+            .context("compressed Block Ack TID is outside 0..=15")?;
+        *count = count
+            .checked_add(1)
+            .context("compressed Block Ack TID count overflow")?;
+        *self = Self::from_values(values);
+        Ok(())
+    }
+
+    fn merged(&self, other: &Self) -> Result<Self> {
+        let left = self.values();
+        let right = other.values();
+        let mut values = [0u64; 16];
+        for index in 0..values.len() {
+            values[index] = left[index]
+                .checked_add(right[index])
+                .context("compressed Block Ack TID count overflow")?;
+        }
+        Ok(Self::from_values(values))
+    }
+}
+
+/// Aggregate structure for independently FCS-valid Block Ack control frames.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct BlockAckSummary {
+    pub(crate) frame_count: u64,
+    pub(crate) truncated_control_count: u64,
+    pub(crate) complete_compressed_single_tid_count: u64,
+    pub(crate) truncated_compressed_single_tid_count: u64,
+    pub(crate) trailing_compressed_single_tid_count: u64,
+    pub(crate) other_variant_count: u64,
+    pub(crate) tids: BlockAckTidCounts,
+    pub(crate) set_bitmap_bits_total: u64,
+    pub(crate) zero_bitmap_frames: u64,
+    pub(crate) nonzero_bitmap_frames: u64,
+    pub(crate) full_bitmap_frames: u64,
+}
+
+impl BlockAckSummary {
+    fn merge(&mut self, other: Self) -> Result<()> {
+        let merged = Self {
+            frame_count: self
+                .frame_count
+                .checked_add(other.frame_count)
+                .context("Block Ack frame count overflow")?,
+            truncated_control_count: self
+                .truncated_control_count
+                .checked_add(other.truncated_control_count)
+                .context("truncated Block Ack control count overflow")?,
+            complete_compressed_single_tid_count: self
+                .complete_compressed_single_tid_count
+                .checked_add(other.complete_compressed_single_tid_count)
+                .context("complete compressed Block Ack count overflow")?,
+            truncated_compressed_single_tid_count: self
+                .truncated_compressed_single_tid_count
+                .checked_add(other.truncated_compressed_single_tid_count)
+                .context("truncated compressed Block Ack count overflow")?,
+            trailing_compressed_single_tid_count: self
+                .trailing_compressed_single_tid_count
+                .checked_add(other.trailing_compressed_single_tid_count)
+                .context("trailing compressed Block Ack count overflow")?,
+            other_variant_count: self
+                .other_variant_count
+                .checked_add(other.other_variant_count)
+                .context("other Block Ack variant count overflow")?,
+            tids: self.tids.merged(&other.tids)?,
+            set_bitmap_bits_total: self
+                .set_bitmap_bits_total
+                .checked_add(other.set_bitmap_bits_total)
+                .context("Block Ack bitmap set-bit total overflow")?,
+            zero_bitmap_frames: self
+                .zero_bitmap_frames
+                .checked_add(other.zero_bitmap_frames)
+                .context("zero Block Ack bitmap count overflow")?,
+            nonzero_bitmap_frames: self
+                .nonzero_bitmap_frames
+                .checked_add(other.nonzero_bitmap_frames)
+                .context("nonzero Block Ack bitmap count overflow")?,
+            full_bitmap_frames: self
+                .full_bitmap_frames
+                .checked_add(other.full_bitmap_frames)
+                .context("full Block Ack bitmap count overflow")?,
+        };
+        *self = merged;
+        Ok(())
+    }
+}
+
+/// Aggregate counters; frame-type and IE maps describe independently valid frames.
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct Summary {
+    pub(crate) schema_version: u32,
+    pub(crate) operation: &'static str,
     pub(crate) input_linktype: u32,
     pub(crate) total_records: u64,
     pub(crate) validated_frames: u64,
@@ -40,10 +376,41 @@ pub(crate) struct Summary {
     pub(crate) control_frames: u64,
     pub(crate) data_frames: u64,
     pub(crate) protected_frames: u64,
-    pub(crate) eapol_frames: u64,
+    pub(crate) block_ack: BlockAckSummary,
+    pub(crate) eapol: EapolSummary,
+    pub(crate) advertisements: AdvertisementSummary,
     pub(crate) frames_by_type: BTreeMap<String, u64>,
     pub(crate) information_element_ids: BTreeMap<String, u64>,
     pub(crate) frames_by_frequency_mhz: BTreeMap<u16, u64>,
+}
+
+impl Default for Summary {
+    fn default() -> Self {
+        Self {
+            schema_version: 4,
+            operation: "inspect_wifi_packets",
+            input_linktype: 0,
+            total_records: 0,
+            validated_frames: 0,
+            invalid_fcs_frames: 0,
+            unknown_fcs_frames: 0,
+            absent_fcs_frames: 0,
+            malformed_frames: 0,
+            truncated_records: 0,
+            records_exceeding_snaplen: 0,
+            upstream_bad_fcs_claims: 0,
+            management_frames: 0,
+            control_frames: 0,
+            data_frames: 0,
+            protected_frames: 0,
+            block_ack: BlockAckSummary::default(),
+            eapol: EapolSummary::default(),
+            advertisements: AdvertisementSummary::default(),
+            frames_by_type: BTreeMap::new(),
+            information_element_ids: BTreeMap::new(),
+            frames_by_frequency_mhz: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,14 +518,14 @@ impl Header {
 }
 
 #[derive(Debug)]
-struct Output {
+pub(crate) struct Output {
     destination: PathBuf,
     temporary: PathBuf,
-    writer: BufWriter<File>,
+    pub(crate) writer: BufWriter<File>,
 }
 
 impl Output {
-    fn new(destination: &Path) -> Result<Self> {
+    pub(crate) fn new(destination: &Path) -> Result<Self> {
         ensure!(
             !destination.exists(),
             "output already exists: {}",
@@ -198,14 +565,14 @@ impl Output {
         }
         bail!("could not reserve temporary output")
     }
-    fn prepare(&mut self) -> Result<()> {
+    pub(crate) fn prepare(&mut self) -> Result<()> {
         self.writer.flush()?;
         self.writer
             .get_ref()
             .sync_all()
             .context("sync packet output")
     }
-    fn publish(&self) -> Result<()> {
+    pub(crate) fn publish(&self) -> Result<()> {
         fs::hard_link(&self.temporary, &self.destination)
             .with_context(|| format!("publish {} without overwriting", self.destination.display()))
     }
@@ -485,16 +852,57 @@ fn security_element(bytes: &[u8], wpa: bool) -> Result<Value> {
     Ok(result)
 }
 
+#[derive(Debug, Default)]
+struct AdvertisementPhyEvidence {
+    ht_capabilities: bool,
+    ht_operation: bool,
+    vht_capabilities: bool,
+    vht_operation: bool,
+    he_capabilities: bool,
+    he_operation: bool,
+    eht_capabilities: bool,
+    eht_operation: bool,
+    unrecognized_extension: bool,
+}
+
+#[derive(Debug, Default)]
+struct AdvertisementSecurityEvidence {
+    rsn_present: bool,
+    rsn_parsed: bool,
+    rsn_malformed: bool,
+    pmf_capable: bool,
+    pmf_required: bool,
+    wpa_present: bool,
+    wpa_parsed: bool,
+    wpa_malformed: bool,
+}
+
+#[derive(Debug, Default)]
+struct AdvertisementEvidence {
+    phy: AdvertisementPhyEvidence,
+    security: AdvertisementSecurityEvidence,
+}
+
+#[derive(Debug)]
+struct InformationElements {
+    fields: Vec<Value>,
+    layout_complete: bool,
+    evidence: AdvertisementEvidence,
+}
+
 fn information_elements(
     bytes: &[u8],
     record: &mut PacketRecord,
     summary: &mut Summary,
-) -> Vec<Value> {
+) -> InformationElements {
     let mut fields = Vec::new();
     let mut position = 0;
+    let mut layout_complete = true;
+    let mut evidence = AdvertisementEvidence::default();
     while position < bytes.len() {
         if bytes.len() - position < 2 {
             record.warnings.push("truncated_information_element_header");
+            layout_complete = false;
             break;
         }
         let id = bytes[position];
@@ -502,6 +910,7 @@ fn information_elements(
         position += 2;
         if length > bytes.len() - position {
             record.warnings.push("truncated_information_element_body");
+            layout_complete = false;
             break;
         }
         let data = &bytes[position..position + length];
@@ -544,42 +953,90 @@ fn information_elements(
             }
             3 if data.len() == 1 => field["advertised_channel"] = json!(data[0]),
             7 if data.len() >= 3 => field["country_string_hex"] = json!(hex(&data[..3])),
-            45 => field["interpretation"] = json!("HT_capabilities_raw"),
-            48 => match security_element(data, false) {
-                Ok(value) => field["rsn"] = value,
-                Err(_) => record.warnings.push("malformed_rsn_information_element"),
-            },
-            61 if !data.is_empty() => {
-                field["interpretation"] = json!("HT_operation_raw");
-                field["primary_channel"] = json!(data[0]);
+            45 => {
+                evidence.phy.ht_capabilities = true;
+                field["interpretation"] = json!("HT_capabilities_raw");
             }
-            191 => field["interpretation"] = json!("VHT_capabilities_raw"),
-            192 => field["interpretation"] = json!("VHT_operation_raw"),
+            48 => match security_element(data, false) {
+                Ok(value) => {
+                    evidence.security.rsn_present = true;
+                    evidence.security.rsn_parsed = true;
+                    evidence.security.pmf_capable |= value["pmf_capable"] == true;
+                    evidence.security.pmf_required |= value["pmf_required"] == true;
+                    field["rsn"] = value;
+                }
+                Err(_) => {
+                    evidence.security.rsn_present = true;
+                    evidence.security.rsn_malformed = true;
+                    record.warnings.push("malformed_rsn_information_element");
+                }
+            },
+            61 => {
+                evidence.phy.ht_operation = true;
+                field["interpretation"] = json!("HT_operation_raw");
+                if let Some(channel) = data.first() {
+                    field["primary_channel"] = json!(channel);
+                }
+            }
+            191 => {
+                evidence.phy.vht_capabilities = true;
+                field["interpretation"] = json!("VHT_capabilities_raw");
+            }
+            192 => {
+                evidence.phy.vht_operation = true;
+                field["interpretation"] = json!("VHT_operation_raw");
+            }
             221 if data.len() >= 4 => {
                 field["vendor_oui"] = json!(hex(&data[..3]));
                 field["vendor_type"] = json!(data[3]);
                 if data[..4] == [0, 0x50, 0xf2, 1] {
+                    evidence.security.wpa_present = true;
                     match security_element(&data[4..], true) {
-                        Ok(value) => field["wpa"] = value,
-                        Err(_) => record.warnings.push("malformed_wpa_information_element"),
+                        Ok(value) => {
+                            evidence.security.wpa_parsed = true;
+                            field["wpa"] = value;
+                        }
+                        Err(_) => {
+                            evidence.security.wpa_malformed = true;
+                            record.warnings.push("malformed_wpa_information_element");
+                        }
                     }
                 }
             }
             255 if !data.is_empty() => {
                 field["extension_id"] = json!(data[0]);
                 field["interpretation"] = json!(match data[0] {
-                    35 => "HE_capabilities_raw",
-                    36 => "HE_operation_raw",
-                    106 => "EHT_operation_raw",
-                    108 => "EHT_capabilities_raw",
-                    _ => "unrecognized_extension",
+                    35 => {
+                        evidence.phy.he_capabilities = true;
+                        "HE_capabilities_raw"
+                    }
+                    36 => {
+                        evidence.phy.he_operation = true;
+                        "HE_operation_raw"
+                    }
+                    106 => {
+                        evidence.phy.eht_operation = true;
+                        "EHT_operation_raw"
+                    }
+                    108 => {
+                        evidence.phy.eht_capabilities = true;
+                        "EHT_capabilities_raw"
+                    }
+                    _ => {
+                        evidence.phy.unrecognized_extension = true;
+                        "unrecognized_extension"
+                    }
                 });
             }
             _ => {}
         }
         fields.push(field);
     }
-    fields
+    InformationElements {
+        fields,
+        layout_complete,
+        evidence,
+    }
 }
 
 fn frame_name(kind: u8, subtype: u8) -> &'static str {
@@ -615,6 +1072,147 @@ fn frame_name(kind: u8, subtype: u8) -> &'static str {
         (2, _) => "other_data",
         _ => "extension_or_reserved",
     }
+}
+
+fn observe_block_ack(
+    payload: &[u8],
+    record: &mut PacketRecord,
+    summary: &mut BlockAckSummary,
+) -> Result<Value> {
+    const COMPRESSED_SINGLE_TID_BODY_BYTES: usize = 12;
+
+    let mut next = summary.clone();
+    next.frame_count = next
+        .frame_count
+        .checked_add(1)
+        .context("Block Ack frame count overflow")?;
+
+    let details = if payload.len() < 2 {
+        next.truncated_control_count = next
+            .truncated_control_count
+            .checked_add(1)
+            .context("truncated Block Ack control count overflow")?;
+        record.warnings.push("truncated_block_ack_control");
+        json!({"interpretation":"truncated_control"})
+    } else {
+        let control = le16(payload);
+        let ack_policy = control & 1 != 0;
+        let ba_type = (control >> 1) & 15;
+        let reserved_bits = (control >> 5) & 0x007f;
+        let tid = ((control >> 12) & 15) as u8;
+        let recognized_control = control & 0x0ffe == 0x0004;
+        if !recognized_control {
+            next.other_variant_count = next
+                .other_variant_count
+                .checked_add(1)
+                .context("other Block Ack variant count overflow")?;
+            record.warnings.push("unsupported_block_ack_variant");
+            json!({
+                "interpretation":"other_variant",
+                "ack_policy":ack_policy,
+                "ba_type":ba_type,
+                "reserved_bits":reserved_bits,
+                "tid_info":tid
+            })
+        } else if payload.len() < 4 {
+            next.truncated_compressed_single_tid_count = next
+                .truncated_compressed_single_tid_count
+                .checked_add(1)
+                .context("truncated compressed Block Ack count overflow")?;
+            record.warnings.push("truncated_compressed_block_ack_body");
+            json!({
+                "interpretation":"compressed_single_tid_truncated",
+                "ack_policy":ack_policy,
+                "tid":tid
+            })
+        } else {
+            let starting_sequence_control = le16(&payload[2..]);
+            let starting_fragment_or_bitmap_length = starting_sequence_control & 15;
+            if starting_fragment_or_bitmap_length != 0 {
+                next.other_variant_count = next
+                    .other_variant_count
+                    .checked_add(1)
+                    .context("other Block Ack variant count overflow")?;
+                record.warnings.push("unsupported_block_ack_variant");
+                json!({
+                    "interpretation":"other_variant",
+                    "ack_policy":ack_policy,
+                    "ba_type":ba_type,
+                    "reserved_bits":reserved_bits,
+                    "tid_info":tid,
+                    "starting_sequence_low_nibble":starting_fragment_or_bitmap_length
+                })
+            } else if payload.len() < COMPRESSED_SINGLE_TID_BODY_BYTES {
+                next.truncated_compressed_single_tid_count = next
+                    .truncated_compressed_single_tid_count
+                    .checked_add(1)
+                    .context("truncated compressed Block Ack count overflow")?;
+                record.warnings.push("truncated_compressed_block_ack_body");
+                json!({
+                    "interpretation":"compressed_single_tid_truncated",
+                    "ack_policy":ack_policy,
+                    "tid":tid
+                })
+            } else if payload.len() > COMPRESSED_SINGLE_TID_BODY_BYTES {
+                next.trailing_compressed_single_tid_count = next
+                    .trailing_compressed_single_tid_count
+                    .checked_add(1)
+                    .context("trailing compressed Block Ack count overflow")?;
+                record
+                    .warnings
+                    .push("compressed_block_ack_body_length_mismatch");
+                json!({
+                    "interpretation":"compressed_single_tid_length_mismatch",
+                    "ack_policy":ack_policy,
+                    "tid":tid,
+                    "observed_body_bytes":payload.len()
+                })
+            } else {
+                let bitmap = u64::from_le_bytes(
+                    payload[4..12]
+                        .try_into()
+                        .expect("exact compressed Block Ack bitmap"),
+                );
+                let bitmap_set_bit_count = u64::from(bitmap.count_ones());
+                next.complete_compressed_single_tid_count = next
+                    .complete_compressed_single_tid_count
+                    .checked_add(1)
+                    .context("complete compressed Block Ack count overflow")?;
+                next.tids.increment(tid)?;
+                next.set_bitmap_bits_total = next
+                    .set_bitmap_bits_total
+                    .checked_add(bitmap_set_bit_count)
+                    .context("Block Ack bitmap set-bit total overflow")?;
+                if bitmap == 0 {
+                    next.zero_bitmap_frames = next
+                        .zero_bitmap_frames
+                        .checked_add(1)
+                        .context("zero Block Ack bitmap count overflow")?;
+                } else {
+                    next.nonzero_bitmap_frames = next
+                        .nonzero_bitmap_frames
+                        .checked_add(1)
+                        .context("nonzero Block Ack bitmap count overflow")?;
+                }
+                if bitmap == u64::MAX {
+                    next.full_bitmap_frames = next
+                        .full_bitmap_frames
+                        .checked_add(1)
+                        .context("full Block Ack bitmap count overflow")?;
+                }
+                json!({
+                    "interpretation":"compressed_single_tid",
+                    "ack_policy":ack_policy,
+                    "tid":tid,
+                    "starting_sequence_number":starting_sequence_control >> 4,
+                    "starting_fragment_number":0,
+                    "bitmap_set_bit_count":bitmap_set_bit_count
+                })
+            }
+        }
+    };
+    *summary = next;
+    Ok(details)
 }
 
 fn mac_header_length(frame: &[u8]) -> Result<usize> {
@@ -662,6 +1260,10 @@ fn decode_frame(frame: &[u8], record: &mut PacketRecord, summary: &mut Summary) 
         details["transmitter"] = json!(address(&frame[10..16]));
     }
     if kind == 1 {
+        if subtype == 9 {
+            details["block_ack"] =
+                observe_block_ack(&frame[length..], record, &mut summary.block_ack)?;
+        }
         summary.control_frames += 1;
         return Ok(details);
     }
@@ -786,8 +1388,14 @@ fn decode_frame(frame: &[u8], record: &mut PacketRecord, summary: &mut Summary) 
         // SAE commit/confirm and other algorithm-specific authentication data
         // are not an arbitrary sequence of information elements.
         if matches!(subtype, 0..=5 | 8) || (subtype == 11 && matches!(le16(payload), 0..=2)) {
-            details["information_elements"] =
-                json!(information_elements(&payload[fixed..], record, summary));
+            let elements = information_elements(&payload[fixed..], record, summary);
+            if matches!(subtype, 5 | 8) {
+                let capabilities = le16(&payload[10..]);
+                summary
+                    .advertisements
+                    .observe(subtype, capabilities, &elements);
+            }
+            details["information_elements"] = json!(elements.fields);
         }
     } else {
         summary.data_frames += 1;
@@ -815,17 +1423,38 @@ fn decode_frame(frame: &[u8], record: &mut PacketRecord, summary: &mut Summary) 
             let ether = u16::from_be_bytes([payload[6], payload[7]]);
             details["llc_snap"] = json!({"oui":oui,"ethertype":format!("0x{ether:04x}")});
             if payload[3..6] == [0, 0, 0] && ether == 0x888e {
-                summary.eapol_frames += 1;
+                summary.eapol.frame_count += 1;
                 if payload.len() >= 12 {
+                    summary.eapol.complete_header_count += 1;
+                    let packet_type = payload[9];
+                    summary.eapol.packet_types.observe(packet_type);
                     let size = usize::from(u16::from_be_bytes([payload[10], payload[11]]));
-                    let mut eapol = json!({"version":payload[8],"packet_type":payload[9],"declared_body_length":size});
+                    let mut eapol = json!({"version":payload[8],"packet_type":packet_type,"declared_body_length":size});
                     if size > payload.len() - 12 {
+                        summary.eapol.truncated_body_count += 1;
                         record.warnings.push("truncated_eapol_body");
                     } else {
+                        summary.eapol.complete_body_count += 1;
                         eapol["body_hex"] = json!(hex(&payload[12..12 + size]));
-                        if payload[9] == 3 && size >= 3 {
+                        if packet_type == 3 && size >= 3 {
+                            summary.eapol.parsed_key_header_count += 1;
                             eapol["key_descriptor_type"] = json!(payload[12]);
                             let info = u16::from_be_bytes([payload[13], payload[14]]);
+                            if info & 8 != 0 {
+                                summary.eapol.pairwise_key_count += 1;
+                            }
+                            if info & 0x40 != 0 {
+                                summary.eapol.install_key_count += 1;
+                            }
+                            if info & 0x80 != 0 {
+                                summary.eapol.ack_key_count += 1;
+                            }
+                            if info & 0x100 != 0 {
+                                summary.eapol.mic_key_count += 1;
+                            }
+                            if info & 0x200 != 0 {
+                                summary.eapol.secure_key_count += 1;
+                            }
                             eapol["key_information"] = json!(info);
                             eapol["pairwise"] = json!(info & 8 != 0);
                             eapol["install"] = json!(info & 0x40 != 0);
@@ -836,6 +1465,7 @@ fn decode_frame(frame: &[u8], record: &mut PacketRecord, summary: &mut Summary) 
                     }
                     details["eapol"] = eapol;
                 } else {
+                    summary.eapol.truncated_header_count += 1;
                     record.warnings.push("truncated_eapol_header");
                 }
             }
@@ -938,13 +1568,20 @@ fn analyze(
             return None;
         }
     }
+    if summary.block_ack.merge(counted.block_ack).is_err() {
+        summary.malformed_frames += 1;
+        record.validation = "fcs_valid_malformed_mac";
+        record.warnings.push("block_ack_aggregate_overflow");
+        return None;
+    }
     record.validation = "fcs_valid";
     summary.validated_frames += 1;
     summary.management_frames += counted.management_frames;
     summary.control_frames += counted.control_frames;
     summary.data_frames += counted.data_frames;
     summary.protected_frames += counted.protected_frames;
-    summary.eapol_frames += counted.eapol_frames;
+    summary.eapol.merge(counted.eapol);
+    summary.advertisements.merge(counted.advertisements);
     for (key, value) in counted.frames_by_type {
         *summary.frames_by_type.entry(key).or_default() += value;
     }
@@ -1308,6 +1945,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.validated_frames, 1);
+        assert_eq!(summary.schema_version, 4);
+        assert_eq!(summary.operation, "inspect_wifi_packets");
+        let serialized = serde_json::to_value(&summary).unwrap();
+        assert_eq!(serialized["schema_version"], 4);
+        assert_eq!(serialized["operation"], "inspect_wifi_packets");
         assert_eq!(summary.upstream_bad_fcs_claims, 1);
         assert_eq!(trusted, radio(&frame, FCS_PRESENT));
         assert_eq!(rec.validation, "fcs_valid");
@@ -1411,6 +2053,295 @@ mod tests {
         frame
     }
 
+    fn data_with_fcs(payload: &[u8]) -> Vec<u8> {
+        let mut frame = data(0x0008, 0, payload);
+        frame.extend_from_slice(&crc32(&frame).to_le_bytes());
+        frame
+    }
+
+    fn analyze_data_payload(payload: &[u8], summary: &mut Summary) -> PacketRecord {
+        let frame = data_with_fcs(payload);
+        let mut rec = record();
+        assert!(
+            analyze(
+                &radio(&frame, FCS_PRESENT),
+                &header(DLT_RADIOTAP),
+                &mut rec,
+                summary,
+            )
+            .is_some()
+        );
+        rec
+    }
+
+    fn control_with_fcs(subtype: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0; 16];
+        let frame_control = 0x0004 | (u16::from(subtype) << 4);
+        frame[..2].copy_from_slice(&frame_control.to_le_bytes());
+        frame[4..10].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        frame[10..16].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&crc32(&frame).to_le_bytes());
+        frame
+    }
+
+    fn compressed_block_ack_payload(
+        tid: u8,
+        ack_policy: bool,
+        starting_sequence_control: u16,
+        bitmap: u64,
+    ) -> Vec<u8> {
+        assert!(tid < 16);
+        let control = (u16::from(tid) << 12) | 4 | u16::from(ack_policy);
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&control.to_le_bytes());
+        payload.extend_from_slice(&starting_sequence_control.to_le_bytes());
+        payload.extend_from_slice(&bitmap.to_le_bytes());
+        payload
+    }
+
+    fn analyze_control(frame: &[u8], summary: &mut Summary) -> PacketRecord {
+        let mut rec = record();
+        assert!(
+            analyze(
+                &radio(frame, FCS_PRESENT),
+                &header(DLT_RADIOTAP),
+                &mut rec,
+                summary,
+            )
+            .is_some()
+        );
+        rec
+    }
+
+    fn management_with_fcs(frame_control: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0; 24];
+        frame[..2].copy_from_slice(&frame_control.to_le_bytes());
+        frame[4..10].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        frame[10..16].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        frame[16..22].copy_from_slice(&[2, 0, 0, 0, 0, 3]);
+        frame.extend_from_slice(payload);
+        frame.extend_from_slice(&crc32(&frame).to_le_bytes());
+        frame
+    }
+
+    fn advertisement_with_fcs(subtype: u8, capabilities: u16, ies: &[u8]) -> Vec<u8> {
+        assert!(matches!(subtype, 5 | 8));
+        let mut payload = vec![0; 10];
+        payload.extend_from_slice(&capabilities.to_le_bytes());
+        payload.extend_from_slice(ies);
+        management_with_fcs(u16::from(subtype) << 4, &payload)
+    }
+
+    fn analyze_management(frame: &[u8], summary: &mut Summary) -> PacketRecord {
+        let mut rec = record();
+        assert!(
+            analyze(
+                &radio(frame, FCS_PRESENT),
+                &header(DLT_RADIOTAP),
+                &mut rec,
+                summary,
+            )
+            .is_some()
+        );
+        rec
+    }
+
+    #[test]
+    fn compressed_single_tid_block_ack_is_structured_and_private_in_summary() {
+        let mut summary = Summary::default();
+        let zero = control_with_fcs(9, &compressed_block_ack_payload(0, false, 0x1230, 0));
+        let zero_record = analyze_control(&zero, &mut summary);
+        let one = control_with_fcs(9, &compressed_block_ack_payload(4, true, 0x4560, 1));
+        let one_record = analyze_control(&one, &mut summary);
+        let full = control_with_fcs(9, &compressed_block_ack_payload(4, false, 0xab00, u64::MAX));
+        analyze_control(&full, &mut summary);
+
+        assert_eq!(summary.schema_version, 4);
+        assert_eq!(summary.validated_frames, 3);
+        assert_eq!(summary.control_frames, 3);
+        assert_eq!(summary.frames_by_type["block_ack"], 3);
+        assert_eq!(summary.block_ack.frame_count, 3);
+        assert_eq!(summary.block_ack.complete_compressed_single_tid_count, 3);
+        assert_eq!(summary.block_ack.truncated_control_count, 0);
+        assert_eq!(summary.block_ack.truncated_compressed_single_tid_count, 0);
+        assert_eq!(summary.block_ack.trailing_compressed_single_tid_count, 0);
+        assert_eq!(summary.block_ack.other_variant_count, 0);
+        assert_eq!(summary.block_ack.tids.tid_0, 1);
+        assert_eq!(summary.block_ack.tids.tid_4, 2);
+        assert_eq!(summary.block_ack.set_bitmap_bits_total, 65);
+        assert_eq!(summary.block_ack.zero_bitmap_frames, 1);
+        assert_eq!(summary.block_ack.nonzero_bitmap_frames, 2);
+        assert_eq!(summary.block_ack.full_bitmap_frames, 1);
+        assert_eq!(
+            summary.block_ack.zero_bitmap_frames + summary.block_ack.nonzero_bitmap_frames,
+            summary.block_ack.complete_compressed_single_tid_count
+        );
+        assert!(summary.block_ack.full_bitmap_frames <= summary.block_ack.nonzero_bitmap_frames);
+
+        let zero_details = &zero_record.frame.unwrap()["block_ack"];
+        assert_eq!(zero_details["interpretation"], "compressed_single_tid");
+        assert_eq!(zero_details["tid"], 0);
+        assert_eq!(zero_details["ack_policy"], false);
+        assert_eq!(zero_details["starting_sequence_number"], 0x123);
+        assert_eq!(zero_details["starting_fragment_number"], 0);
+        assert_eq!(zero_details["bitmap_set_bit_count"], 0);
+        let one_details = &one_record.frame.unwrap()["block_ack"];
+        assert_eq!(one_details["tid"], 4);
+        assert_eq!(one_details["ack_policy"], true);
+        assert_eq!(one_details["starting_sequence_number"], 0x456);
+        assert_eq!(one_details["starting_fragment_number"], 0);
+        assert_eq!(one_details["bitmap_set_bit_count"], 1);
+        let mut detail_fields = one_details
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        detail_fields.sort_unstable();
+        assert_eq!(
+            detail_fields,
+            [
+                "ack_policy",
+                "bitmap_set_bit_count",
+                "interpretation",
+                "starting_fragment_number",
+                "starting_sequence_number",
+                "tid",
+            ]
+        );
+
+        let serialized = serde_json::to_value(&summary).unwrap();
+        let block_ack = serialized["block_ack"].as_object().unwrap();
+        let mut fields = block_ack.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "complete_compressed_single_tid_count",
+                "frame_count",
+                "full_bitmap_frames",
+                "nonzero_bitmap_frames",
+                "other_variant_count",
+                "set_bitmap_bits_total",
+                "tids",
+                "trailing_compressed_single_tid_count",
+                "truncated_compressed_single_tid_count",
+                "truncated_control_count",
+                "zero_bitmap_frames",
+            ]
+        );
+        let tids = block_ack["tids"].as_object().unwrap();
+        assert_eq!(tids.len(), 16);
+        for tid in 0..16 {
+            assert!(tids.contains_key(&format!("tid_{tid}")));
+        }
+        let compact = serde_json::to_string(block_ack).unwrap();
+        for private_field in [
+            "address",
+            "receiver",
+            "transmitter",
+            "starting_sequence",
+            "fragment",
+            "bitmap_hex",
+            "payload",
+        ] {
+            assert!(!compact.contains(private_field));
+        }
+    }
+
+    #[test]
+    fn block_ack_variants_and_length_failures_partition_and_remain_fcs_gated() {
+        let mut summary = Summary::default();
+        let frames = [
+            control_with_fcs(9, &[4]),
+            control_with_fcs(9, &[4, 0]),
+            control_with_fcs(9, &[4, 0, 0, 0]),
+            control_with_fcs(9, &[4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            control_with_fcs(9, &[0, 0]),
+            control_with_fcs(9, &[6, 0]),
+            control_with_fcs(9, &[36, 0]),
+            control_with_fcs(9, &[4, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        let records = frames
+            .iter()
+            .map(|frame| analyze_control(frame, &mut summary))
+            .collect::<Vec<_>>();
+
+        assert!(records[0].warnings.contains(&"truncated_block_ack_control"));
+        assert!(
+            records[1]
+                .warnings
+                .contains(&"truncated_compressed_block_ack_body")
+        );
+        assert!(
+            records[2]
+                .warnings
+                .contains(&"truncated_compressed_block_ack_body")
+        );
+        assert!(
+            records[3]
+                .warnings
+                .contains(&"compressed_block_ack_body_length_mismatch")
+        );
+        for record in &records[4..] {
+            assert!(record.warnings.contains(&"unsupported_block_ack_variant"));
+        }
+        assert_eq!(summary.block_ack.frame_count, 8);
+        assert_eq!(summary.frames_by_type["block_ack"], 8);
+        assert_eq!(summary.block_ack.truncated_control_count, 1);
+        assert_eq!(summary.block_ack.truncated_compressed_single_tid_count, 2);
+        assert_eq!(summary.block_ack.trailing_compressed_single_tid_count, 1);
+        assert_eq!(summary.block_ack.other_variant_count, 4);
+        assert_eq!(summary.block_ack.complete_compressed_single_tid_count, 0);
+        assert_eq!(summary.block_ack.set_bitmap_bits_total, 0);
+        assert_eq!(
+            summary.block_ack.truncated_control_count
+                + summary.block_ack.truncated_compressed_single_tid_count
+                + summary.block_ack.trailing_compressed_single_tid_count
+                + summary.block_ack.other_variant_count
+                + summary.block_ack.complete_compressed_single_tid_count,
+            summary.block_ack.frame_count
+        );
+
+        let mut corrupt = control_with_fcs(9, &compressed_block_ack_payload(0, false, 0, 1));
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            analyze(
+                &radio(&corrupt, FCS_PRESENT),
+                &header(DLT_RADIOTAP),
+                &mut record(),
+                &mut summary,
+            )
+            .is_none()
+        );
+        assert_eq!(summary.invalid_fcs_frames, 1);
+        assert_eq!(summary.block_ack.frame_count, 8);
+        assert_eq!(summary.frames_by_type["block_ack"], 8);
+    }
+
+    #[test]
+    fn block_ack_aggregate_overflow_fails_without_partial_merge() {
+        let frame = control_with_fcs(9, &compressed_block_ack_payload(0, false, 0, 1));
+        let mut summary = Summary::default();
+        summary.block_ack.frame_count = u64::MAX;
+        let mut rec = record();
+        assert!(
+            analyze(
+                &radio(&frame, FCS_PRESENT),
+                &header(DLT_RADIOTAP),
+                &mut rec,
+                &mut summary,
+            )
+            .is_none()
+        );
+        assert_eq!(summary.block_ack.frame_count, u64::MAX);
+        assert_eq!(summary.block_ack.complete_compressed_single_tid_count, 0);
+        assert_eq!(summary.validated_frames, 0);
+        assert_eq!(summary.malformed_frames, 1);
+        assert!(rec.warnings.contains(&"block_ack_aggregate_overflow"));
+    }
+
     #[test]
     fn qos_four_address_eapol_and_protected_payload_boundaries() {
         let payload = unhex("aaaa03000000888e020300030201c0");
@@ -1422,7 +2353,14 @@ mod tests {
         assert_eq!(parsed["source"], "02:00:00:00:00:04");
         assert_eq!(parsed["qos"]["tid"], 5);
         assert_eq!(parsed["eapol"]["packet_type"], 3);
-        assert_eq!(summary.eapol_frames, 1);
+        assert_eq!(summary.eapol.frame_count, 1);
+        assert_eq!(summary.eapol.complete_header_count, 1);
+        assert_eq!(summary.eapol.complete_body_count, 1);
+        assert_eq!(summary.eapol.packet_types.key, 1);
+        assert_eq!(summary.eapol.parsed_key_header_count, 1);
+        assert_eq!(summary.eapol.install_key_count, 1);
+        assert_eq!(summary.eapol.ack_key_count, 1);
+        assert_eq!(summary.eapol.mic_key_count, 1);
         assert!(decode_frame(&frame[..31], &mut record(), &mut Summary::default()).is_err());
         let protected = data(0xc388, 7, &payload);
         let mut encrypted_summary = Summary::default();
@@ -1432,7 +2370,7 @@ mod tests {
             details["payload_interpretation"],
             "protected_payload_opaque"
         );
-        assert_eq!(encrypted_summary.eapol_frames, 0);
+        assert_eq!(encrypted_summary.eapol.frame_count, 0);
         assert_eq!(details["qos"]["tid"], 7);
         assert_eq!(details["ht_control_raw_hex"], "00000000");
         let aggregated = data(0x0088, 0x80, &payload);
@@ -1443,11 +2381,359 @@ mod tests {
         let mut null_summary = Summary::default();
         let details = decode_frame(&null, &mut record(), &mut null_summary).unwrap();
         assert!(details.get("eapol").is_none());
-        assert_eq!(null_summary.eapol_frames, 0);
+        assert_eq!(null_summary.eapol.frame_count, 0);
         assert_eq!(
             details["payload_interpretation"],
             "data_subtype_without_msdu"
         );
+    }
+
+    #[test]
+    fn eapol_fresh_key_shape_is_private_and_fcs_gated() {
+        let payload = unhex("aaaa03000000888e0203000302008a");
+        let mut summary = Summary::default();
+        let rec = analyze_data_payload(&payload, &mut summary);
+
+        assert_eq!(summary.validated_frames, 1);
+        assert_eq!(summary.eapol.frame_count, 1);
+        assert_eq!(summary.eapol.complete_header_count, 1);
+        assert_eq!(summary.eapol.truncated_header_count, 0);
+        assert_eq!(summary.eapol.complete_body_count, 1);
+        assert_eq!(summary.eapol.truncated_body_count, 0);
+        assert_eq!(summary.eapol.packet_types.eap_packet, 0);
+        assert_eq!(summary.eapol.packet_types.start, 0);
+        assert_eq!(summary.eapol.packet_types.logoff, 0);
+        assert_eq!(summary.eapol.packet_types.key, 1);
+        assert_eq!(summary.eapol.packet_types.asf_alert, 0);
+        assert_eq!(summary.eapol.packet_types.other, 0);
+        assert_eq!(summary.eapol.parsed_key_header_count, 1);
+        assert_eq!(summary.eapol.pairwise_key_count, 1);
+        assert_eq!(summary.eapol.install_key_count, 0);
+        assert_eq!(summary.eapol.ack_key_count, 1);
+        assert_eq!(summary.eapol.mic_key_count, 0);
+        assert_eq!(summary.eapol.secure_key_count, 0);
+
+        let raw = rec.frame.unwrap();
+        assert_eq!(raw["eapol"]["body_hex"], "02008a");
+        assert_eq!(raw["eapol"]["key_information"], 0x008a);
+        assert_eq!(raw["eapol"]["pairwise"], true);
+        assert_eq!(raw["eapol"]["ack"], true);
+        assert_eq!(raw["eapol"]["mic_present"], false);
+
+        let serialized = serde_json::to_value(&summary).unwrap();
+        assert!(serialized.get("eapol_frames").is_none());
+        let eapol = serialized["eapol"].as_object().unwrap();
+        let mut fields = eapol.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "ack_key_count",
+                "complete_body_count",
+                "complete_header_count",
+                "frame_count",
+                "install_key_count",
+                "mic_key_count",
+                "packet_types",
+                "pairwise_key_count",
+                "parsed_key_header_count",
+                "secure_key_count",
+                "truncated_body_count",
+                "truncated_header_count",
+            ]
+        );
+        let packet_types = eapol["packet_types"].as_object().unwrap();
+        let mut type_fields = packet_types.keys().map(String::as_str).collect::<Vec<_>>();
+        type_fields.sort_unstable();
+        assert_eq!(
+            type_fields,
+            ["asf_alert", "eap_packet", "key", "logoff", "other", "start"]
+        );
+        let compact = serde_json::to_string(&summary).unwrap();
+        for private_field in [
+            "body_hex",
+            "key_descriptor_type",
+            "key_information",
+            "packet_hex",
+            "source",
+            "destination",
+            "bssid",
+            "ssid",
+        ] {
+            assert!(!compact.contains(private_field));
+        }
+
+        let mut invalid = data_with_fcs(&payload);
+        *invalid.last_mut().unwrap() ^= 1;
+        assert!(
+            analyze(
+                &radio(&invalid, FCS_PRESENT),
+                &header(DLT_RADIOTAP),
+                &mut record(),
+                &mut summary,
+            )
+            .is_none()
+        );
+        assert_eq!(summary.invalid_fcs_frames, 1);
+        assert_eq!(summary.eapol.frame_count, 1);
+    }
+
+    #[test]
+    fn eapol_type_and_completeness_partitions_are_exhaustive() {
+        let mut summary = Summary::default();
+        for payload in [
+            "aaaa03000000888e02000000",
+            "aaaa03000000888e02010000",
+            "aaaa03000000888e02020000",
+            "aaaa03000000888e02040000",
+            "aaaa03000000888e02090000",
+        ] {
+            analyze_data_payload(&unhex(payload), &mut summary);
+        }
+        let short = analyze_data_payload(&unhex("aaaa03000000888e0203"), &mut summary);
+        let truncated =
+            analyze_data_payload(&unhex("aaaa03000000888e020300040203c8"), &mut summary);
+        analyze_data_payload(&unhex("aaaa03000000888e020300030203c8"), &mut summary);
+
+        assert!(short.warnings.contains(&"truncated_eapol_header"));
+        assert!(truncated.warnings.contains(&"truncated_eapol_body"));
+        assert_eq!(summary.eapol.frame_count, 8);
+        assert_eq!(summary.eapol.complete_header_count, 7);
+        assert_eq!(summary.eapol.truncated_header_count, 1);
+        assert_eq!(summary.eapol.complete_body_count, 6);
+        assert_eq!(summary.eapol.truncated_body_count, 1);
+        assert_eq!(summary.eapol.packet_types.eap_packet, 1);
+        assert_eq!(summary.eapol.packet_types.start, 1);
+        assert_eq!(summary.eapol.packet_types.logoff, 1);
+        assert_eq!(summary.eapol.packet_types.key, 2);
+        assert_eq!(summary.eapol.packet_types.asf_alert, 1);
+        assert_eq!(summary.eapol.packet_types.other, 1);
+        assert_eq!(summary.eapol.parsed_key_header_count, 1);
+        assert_eq!(summary.eapol.pairwise_key_count, 1);
+        assert_eq!(summary.eapol.install_key_count, 1);
+        assert_eq!(summary.eapol.ack_key_count, 1);
+        assert_eq!(summary.eapol.mic_key_count, 1);
+        assert_eq!(summary.eapol.secure_key_count, 1);
+        assert_eq!(
+            summary.eapol.complete_header_count,
+            summary.eapol.packet_types.eap_packet
+                + summary.eapol.packet_types.start
+                + summary.eapol.packet_types.logoff
+                + summary.eapol.packet_types.key
+                + summary.eapol.packet_types.asf_alert
+                + summary.eapol.packet_types.other
+        );
+        assert_eq!(
+            summary.eapol.complete_header_count,
+            summary.eapol.complete_body_count + summary.eapol.truncated_body_count
+        );
+        for flag_count in [
+            summary.eapol.pairwise_key_count,
+            summary.eapol.install_key_count,
+            summary.eapol.ack_key_count,
+            summary.eapol.mic_key_count,
+            summary.eapol.secure_key_count,
+        ] {
+            assert!(flag_count <= summary.eapol.parsed_key_header_count);
+        }
+    }
+
+    #[test]
+    fn advertisement_elements_are_per_frame_private_and_fcs_gated() {
+        let mut ies = Vec::new();
+        for element in [
+            unhex("2d0100"),
+            unhex("2d0101"),
+            unhex("3d0106"),
+            unhex("3d010b"),
+            unhex("bf0100"),
+            unhex("bf0101"),
+            unhex("c00100"),
+            unhex("c00101"),
+            unhex("ff0123"),
+            unhex("ff0123"),
+            unhex("ff0124"),
+            unhex("ff016a"),
+            unhex("ff016c"),
+            unhex("ff016d"),
+            unhex("ff016d"),
+            unhex("30140100000fac040100000fac040100000fac02c000"),
+            unhex("30140100000fac040100000fac040100000fac02c000"),
+            unhex("30020100"),
+            unhex("dd160050f20101000050f20401000050f20401000050f202"),
+            unhex("dd160050f20101000050f20401000050f20401000050f202"),
+            unhex("dd040050f201"),
+        ] {
+            ies.extend_from_slice(&element);
+        }
+        let beacon = advertisement_with_fcs(8, 0x0010, &ies);
+        let probe = advertisement_with_fcs(5, 0, &[]);
+        let mut summary = Summary::default();
+        let beacon_record = analyze_management(&beacon, &mut summary);
+        analyze_management(&probe, &mut summary);
+
+        let ads = &summary.advertisements;
+        assert_eq!(ads.eligible_frame_count, 2);
+        assert_eq!(ads.beacon_frames, 1);
+        assert_eq!(ads.probe_response_frames, 1);
+        assert_eq!(ads.complete_ie_layout_frames, 2);
+        assert_eq!(ads.truncated_ie_layout_frames, 0);
+        for count in [
+            ads.phy.ht_capabilities_element_frames,
+            ads.phy.ht_operation_element_frames,
+            ads.phy.vht_capabilities_element_frames,
+            ads.phy.vht_operation_element_frames,
+            ads.phy.he_capabilities_element_frames,
+            ads.phy.he_operation_element_frames,
+            ads.phy.eht_capabilities_element_frames,
+            ads.phy.eht_operation_element_frames,
+            ads.phy.unrecognized_extension_element_frames,
+        ] {
+            assert_eq!(count, 1);
+        }
+        assert_eq!(ads.security.privacy_capability_frames, 1);
+        assert_eq!(ads.security.rsn_present_frames, 1);
+        assert_eq!(ads.security.rsn_parsed_frames, 1);
+        assert_eq!(ads.security.rsn_malformed_frames, 1);
+        assert_eq!(ads.security.pmf_capable_frames, 1);
+        assert_eq!(ads.security.pmf_required_frames, 1);
+        assert_eq!(ads.security.wpa_present_frames, 1);
+        assert_eq!(ads.security.wpa_parsed_frames, 1);
+        assert_eq!(ads.security.wpa_malformed_frames, 1);
+        assert!(
+            beacon_record
+                .warnings
+                .contains(&"malformed_rsn_information_element")
+        );
+        assert!(
+            beacon_record
+                .warnings
+                .contains(&"malformed_wpa_information_element")
+        );
+
+        let serialized = serde_json::to_value(&summary).unwrap();
+        let advertisements = serialized["advertisements"].as_object().unwrap();
+        let mut fields = advertisements
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "beacon_frames",
+                "complete_ie_layout_frames",
+                "eligible_frame_count",
+                "phy",
+                "probe_response_frames",
+                "security",
+                "truncated_ie_layout_frames",
+            ]
+        );
+        let phy = advertisements["phy"].as_object().unwrap();
+        let mut phy_fields = phy.keys().map(String::as_str).collect::<Vec<_>>();
+        phy_fields.sort_unstable();
+        assert_eq!(
+            phy_fields,
+            [
+                "eht_capabilities_element_frames",
+                "eht_operation_element_frames",
+                "he_capabilities_element_frames",
+                "he_operation_element_frames",
+                "ht_capabilities_element_frames",
+                "ht_operation_element_frames",
+                "unrecognized_extension_element_frames",
+                "vht_capabilities_element_frames",
+                "vht_operation_element_frames",
+            ]
+        );
+        let security = advertisements["security"].as_object().unwrap();
+        let mut security_fields = security.keys().map(String::as_str).collect::<Vec<_>>();
+        security_fields.sort_unstable();
+        assert_eq!(
+            security_fields,
+            [
+                "pmf_capable_frames",
+                "pmf_required_frames",
+                "privacy_capability_frames",
+                "rsn_malformed_frames",
+                "rsn_parsed_frames",
+                "rsn_present_frames",
+                "wpa_malformed_frames",
+                "wpa_parsed_frames",
+                "wpa_present_frames",
+            ]
+        );
+        let compact = serde_json::to_string(advertisements).unwrap();
+        for private_field in [
+            "ssid", "bssid", "address", "data_hex", "oui", "cipher", "akm", "channel", "payload",
+        ] {
+            assert!(!compact.contains(private_field));
+        }
+
+        let mut invalid = beacon;
+        *invalid.last_mut().unwrap() ^= 1;
+        assert!(
+            analyze(
+                &radio(&invalid, FCS_PRESENT),
+                &header(DLT_RADIOTAP),
+                &mut record(),
+                &mut summary,
+            )
+            .is_none()
+        );
+        assert_eq!(summary.invalid_fcs_frames, 1);
+        assert_eq!(summary.advertisements.eligible_frame_count, 2);
+    }
+
+    #[test]
+    fn advertisement_layout_and_eligibility_boundaries_are_explicit() {
+        let mut summary = Summary::default();
+        let truncated_header = advertisement_with_fcs(8, 0, &unhex("2d0100ff"));
+        let record = analyze_management(&truncated_header, &mut summary);
+        assert!(
+            record
+                .warnings
+                .contains(&"truncated_information_element_header")
+        );
+        let truncated_body = advertisement_with_fcs(5, 0, &unhex("ff01233d0406"));
+        let record = analyze_management(&truncated_body, &mut summary);
+        assert!(
+            record
+                .warnings
+                .contains(&"truncated_information_element_body")
+        );
+
+        assert_eq!(summary.advertisements.eligible_frame_count, 2);
+        assert_eq!(summary.advertisements.beacon_frames, 1);
+        assert_eq!(summary.advertisements.probe_response_frames, 1);
+        assert_eq!(summary.advertisements.complete_ie_layout_frames, 0);
+        assert_eq!(summary.advertisements.truncated_ie_layout_frames, 2);
+        assert_eq!(summary.advertisements.phy.ht_capabilities_element_frames, 1);
+        assert_eq!(summary.advertisements.phy.he_capabilities_element_frames, 1);
+        assert_eq!(summary.advertisements.phy.ht_operation_element_frames, 0);
+
+        let mut protected = advertisement_with_fcs(8, 0, &unhex("2d0100"));
+        let protected_fc = le16(&protected) | 0x4000;
+        protected[..2].copy_from_slice(&protected_fc.to_le_bytes());
+        let protected_len = protected.len();
+        let protected_crc = crc32(&protected[..protected_len - 4]);
+        protected[protected_len - 4..].copy_from_slice(&protected_crc.to_le_bytes());
+        analyze_management(&protected, &mut summary);
+
+        let mut fragmented = advertisement_with_fcs(8, 0, &unhex("2d0100"));
+        fragmented[22] = 1;
+        let fragmented_len = fragmented.len();
+        let fragmented_crc = crc32(&fragmented[..fragmented_len - 4]);
+        fragmented[fragmented_len - 4..].copy_from_slice(&fragmented_crc.to_le_bytes());
+        analyze_management(&fragmented, &mut summary);
+
+        let association = management_with_fcs(0, &unhex("000000002d0100"));
+        analyze_management(&association, &mut summary);
+        let truncated_fixed = management_with_fcs(0x0080, &[0; 11]);
+        analyze_management(&truncated_fixed, &mut summary);
+        assert_eq!(summary.advertisements.eligible_frame_count, 2);
+        assert_eq!(summary.management_frames, 6);
     }
 
     #[test]
@@ -1467,7 +2753,8 @@ mod tests {
             &[1, 3, 0x82, 0xfa, 0xff],
             &mut record(),
             &mut Summary::default(),
-        );
+        )
+        .fields;
         assert_eq!(fields[0]["rates"][0]["mbps"], 1.0);
         assert_eq!(fields[0]["rates"][1]["bss_membership_selector"], "HE_PHY");
         assert!(fields[0]["rates"][1].get("mbps").is_none());
@@ -1480,10 +2767,19 @@ mod tests {
             &[255, 1, 106, 255, 1, 108, 255, 1, 109],
             &mut record(),
             &mut Summary::default(),
-        );
+        )
+        .fields;
         assert_eq!(extensions[0]["interpretation"], "EHT_operation_raw");
         assert_eq!(extensions[1]["interpretation"], "EHT_capabilities_raw");
         assert_eq!(extensions[2]["interpretation"], "unrecognized_extension");
+        let empty_operation =
+            information_elements(&[61, 0], &mut record(), &mut Summary::default());
+        assert!(empty_operation.evidence.phy.ht_operation);
+        assert_eq!(
+            empty_operation.fields[0]["interpretation"],
+            "HT_operation_raw"
+        );
+        assert!(empty_operation.fields[0].get("primary_channel").is_none());
     }
 
     #[test]
@@ -1508,13 +2804,15 @@ mod tests {
     fn malformed_security_and_ie_lengths_preserve_raw_candidates() {
         let mut rec = record();
         let mut summary = Summary::default();
-        let fields = information_elements(
+        let elements = information_elements(
             &[
                 0, 1, b'a', 48, 2, 1, 0, 221, 4, 0, 0x50, 0xf2, 1, 255, 1, 35, 1, 9, 0,
             ],
             &mut rec,
             &mut summary,
         );
+        assert!(!elements.layout_complete);
+        let fields = elements.fields;
         assert_eq!(fields.len(), 4);
         assert!(rec.warnings.contains(&"malformed_rsn_information_element"));
         assert!(rec.warnings.contains(&"malformed_wpa_information_element"));

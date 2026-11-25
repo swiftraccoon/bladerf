@@ -1,0 +1,136 @@
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -932,6 +932,60 @@
+     scores
+ }
+ 
++fn coded_scan_preamble_priorities(demod: &[f32], limit: usize) -> Vec<u16> {
++    // Compare the balanced coded pattern against symbol averages with local
++    // mean removed. Hard streaks retain priority in each bounded search region.
++    const MIN_CORRELATION_SQUARED: f64 = 0.65 * 0.65;
++    const PERIOD: usize = CODED_PREAMBLE_PATTERN.len();
++    let mut priorities: Vec<_> = coded_scan_preamble_scores(demod)
++        .into_iter()
++        .take(limit)
++        .map(|streak| if streak >= 5 { 256 + u16::from(streak) } else { 0 })
++        .collect();
++    let count = CODED_PREAMBLE_SYMBOLS as f64;
++    for phase in 0..BLE_SPS {
++        let (symbols, _) = demod[phase..].as_chunks::<BLE_SPS>();
++        let mut sum = Vec::with_capacity(symbols.len() + 1);
++        let mut energy = Vec::with_capacity(symbols.len() + 1);
++        sum.push(0.0);
++        energy.push(0.0);
++        let mut sum_prefix = 0.0;
++        let mut energy_prefix = 0.0;
++        for samples in symbols {
++            let value = samples.iter().map(|&value| f64::from(value)).sum::<f64>()
++                / BLE_SPS as f64;
++            sum_prefix += value;
++            energy_prefix += value * value;
++            sum.push(sum_prefix);
++            energy.push(energy_prefix);
++        }
++        // The middle four symbols of 00111100 carry positive weight. A
++        // one-period shift changes just the first and last correlations.
++        let period_dot = |start: usize| {
++            2.0 * (sum[start + 6] - sum[start + 2]) - (sum[start + PERIOD] - sum[start])
++        };
++        let mut dot = [0.0; PERIOD];
++        for start in 0..limit.saturating_sub(phase).div_ceil(BLE_SPS) {
++            let end = start + CODED_PREAMBLE_SYMBOLS;
++            let period = start % PERIOD;
++            dot[period] = if start < PERIOD {
++                (start..end).step_by(PERIOD).map(period_dot).sum()
++            } else {
++                dot[period] - period_dot(start - PERIOD) + period_dot(end - PERIOD)
++            };
++            let centered_energy = energy[end] - energy[start]
++                - (sum[end] - sum[start]).powi(2) / count;
++            let power = count * centered_energy;
++            let numerator = dot[period] * dot[period];
++            let priority = &mut priorities[phase + start * BLE_SPS];
++            if *priority == 0 && power > 0.0 && numerator >= MIN_CORRELATION_SQUARED * power {
++                *priority = ((numerator / power).min(1.0) * 255.0) as u16;
++            }
++        }
++    }
++    priorities
++}
++
+ /// Decode CRC-valid LE Coded packets in a 2 MSps scan window.
+ /// Try both sample phases, with up to eight alignments per preamble-sized
+ /// region and 128 per window. Timestamps use the original window time base.
+@@ -981,10 +1035,10 @@
+         return Vec::new();
+     }
+ 
+-    let scores = coded_scan_preamble_scores(demod);
+     let limit = demod.len() - minimum + 1;
++    let scores = coded_scan_preamble_priorities(demod, limit);
+     let strongest = (0..limit)
+-        .filter(|&position| scores[position] >= 5)
++        .filter(|&position| scores[position] != 0)
+         .max_by_key(|&position| {
+             use std::cmp::Reverse;
+ 
+@@ -1002,13 +1056,13 @@
+     let mut cursor = 0;
+     let mut attempts = 0;
+     while cursor < limit && attempts < chronological_limit {
+-        let Some(distance) = scores[cursor..limit].iter().position(|&score| score >= 5) else {
++        let Some(distance) = scores[cursor..limit].iter().position(|&score| score != 0) else {
+             break;
+         };
+         let start = cursor + distance;
+         let region_end = (start + CODED_PREAMBLE_SYMBOLS * BLE_SPS).min(limit);
+         positions.clear();
+-        positions.extend((start..region_end).filter(|&i| scores[i] >= 5));
++        positions.extend((start..region_end).filter(|&i| scores[i] != 0));
+         positions.sort_unstable_by_key(|&i| (std::cmp::Reverse(scores[i]), i));
+ 
+         cursor = region_end;
+@@ -2146,6 +2200,42 @@
+     }
+ 
+     #[test]
++    fn continuous_coded_scan_recovers_soft_preambles_below_the_hard_streak() {
++        let pdu = [0x02, 6, 1, 2, 3, 4, 5, 6];
++        for phase in 0..BLE_SPS {
++            for valid_crc in [true, false] {
++                let mut packet = coded_scan_fixture(&pdu, 1, valid_crc);
++                let preamble_samples = CODED_PREAMBLE_SYMBOLS * BLE_SPS;
++                let (periods, _) = packet[..preamble_samples]
++                    .as_chunks_mut::<{ CODED_PREAMBLE_PATTERN.len() * BLE_SPS }>();
++                for period in periods {
++                    for symbol in [1, 5] {
++                        for value in &mut period[symbol * BLE_SPS..(symbol + 1) * BLE_SPS] {
++                            *value *= -0.05;
++                        }
++                    }
++                }
++                let start = 512 + phase;
++                let mut window = vec![0.0; start];
++                window.extend(packet);
++                window.extend(std::iter::repeat_n(0.0, 512));
++                assert!(coded_scan_preamble_scores(&window)[start] < 5);
++                let limit = window.len()
++                    - (CODED_PREAMBLE_SYMBOLS + CODED_BLOCK1_SYMBOLS) * BLE_SPS
++                    + 1;
++                assert!((1..256).contains(&coded_scan_preamble_priorities(&window, limit)[start]));
++                let packets = ble_coded_scan_packets(
++                    &window, 2402, Timespec { tv_sec: 0, tv_nsec: 0 }, &mut |_| None,
++                );
++                assert_eq!(packets.len(), usize::from(valid_crc));
++                if let Some(packet) = packets.first() {
++                    assert_eq!(&packet.data[5..5 + pdu.len()], &pdu);
++                }
++            }
++        }
++    }
++
++    #[test]
+     fn continuous_coded_scan_checks_exact_connected_address_and_crc() {
+         // Access address and CRC initialization from Core Vol 6 Part C's
+         // data-channel sample. Use nonempty ACL data without CTEInfo.

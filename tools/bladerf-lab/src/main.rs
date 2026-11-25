@@ -35,6 +35,9 @@ enum Command {
     /// Capture RX1 or RX2 IQ with actual settings in a JSON sidecar.
     #[cfg(feature = "radio")]
     Capture(radio::CaptureArgs),
+    /// Save closed, timestamp-checked segments from one stock RX1 stream.
+    #[cfg(all(feature = "radio", target_os = "linux", target_env = "gnu"))]
+    CaptureSegments(radio::SegmentCaptureArgs),
     /// Produce IQ statistics and a PNG power spectral density plot.
     #[cfg(feature = "analysis")]
     Analyze(analysis::AnalyzeArgs),
@@ -81,6 +84,8 @@ fn dispatch(command: Command) -> Result<()> {
     match command {
         #[cfg(feature = "radio")]
         Command::Capture(args) => radio::capture(args),
+        #[cfg(all(feature = "radio", target_os = "linux", target_env = "gnu"))]
+        Command::CaptureSegments(args) => radio::capture_segments(args),
         #[cfg(feature = "analysis")]
         Command::Analyze(args) => analysis::run(args),
         #[cfg(feature = "radio")]

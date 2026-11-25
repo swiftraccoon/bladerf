@@ -1,0 +1,1199 @@
+diff --git a/crates/app/src/main.rs b/crates/app/src/main.rs
+index e62ea07..ded9fcf 100644
+--- a/crates/app/src/main.rs
++++ b/crates/app/src/main.rs
+@@ -28,7 +28,7 @@ struct Cli {
+     #[arg(short = 'i', long, alias = "extcap-interface")]
+     interface: Option<String>,
+ 
+-    /// Sample format for file input: ci8, ci16, cf32
++    /// Sample format for file input: ci8, ci16, cf32, sc16q11
+     #[arg(long, default_value = "ci16")]
+     format: String,
+ 
+@@ -152,7 +152,8 @@ struct Cli {
+ 
+     /// Enable continuous LE Coded PHY (Long Range) scan on advertising channels.
+     /// Captures samples on channels 37/38/39 regardless of squelch, catching
+-    /// weak coded signals that don't trigger normal burst detection.
++    /// weak coded signals that don't trigger normal burst detection. Scan
++    /// results are emitted only after a successful CRC check.
+     /// Without this flag, coded decoding still runs on squelch-triggered bursts.
+     #[arg(long)]
+     coded_scan: bool,
+@@ -543,8 +544,12 @@ fn main() {
+             "ci8" => bd_sdr::file::SampleFormat::Ci8,
+             "ci16" => bd_sdr::file::SampleFormat::Ci16,
+             "cf32" => bd_sdr::file::SampleFormat::Cf32,
++            "sc16q11" => bd_sdr::file::SampleFormat::Sc16Q11,
+             other => {
+-                eprintln!("unknown sample format: {} (use ci8, ci16, or cf32)", other);
++                eprintln!(
++                    "unknown sample format: {} (use ci8, ci16, cf32, or sc16q11)",
++                    other
++                );
+                 std::process::exit(1);
+             }
+         };
+@@ -592,6 +597,7 @@ fn main() {
+             cli.write_bursts.as_deref(),
+             cli.burst_limit_mb.saturating_mul(1024 * 1024),
+             cli.check_crc,
++            cli.coded_scan,
+             cli.squelch,
+             cli.stats,
+             &classic_uaps,
+@@ -671,7 +677,8 @@ fn main() {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::parse_classic_address;
++    use super::{Cli, parse_classic_address};
++    use clap::Parser;
+ 
+     #[test]
+     fn classic_address_maps_uap_and_lap() {
+@@ -691,4 +698,12 @@ mod tests {
+             assert!(parse_classic_address(value).is_err());
+         }
+     }
++
++    #[test]
++    fn file_replay_accepts_coded_scan_flag() {
++        let cli = Cli::try_parse_from(["blue-dragon", "--file", "capture.sc16q11", "--coded-scan"])
++            .unwrap();
++        assert!(cli.file.is_some());
++        assert!(cli.coded_scan);
++    }
+ }
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+index 5b63ac0..ce24c45 100644
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -27,6 +27,42 @@ use bd_sdr::SdrSource;
+ 
+ use crate::burst_file::{FileBurstReader, FileBurstWriter};
+ 
++// The decoder receives two samples per 1 Msym/s physical symbol. A minimum
++// S=2 packet is 462 symbols; 2,000 samples remains only an ordering heuristic.
++const CODED_MIN_S2_PACKET_SAMPLES: usize = 924;
++const CODED_PRIORITY_THRESHOLD_SAMPLES: usize = 2_000;
++
++fn aligned_file_block_size(num_channels: usize) -> Result<usize, String> {
++    if num_channels < 2 || num_channels % 2 != 0 {
++        return Err("file input requires an even channel count of at least 2".to_string());
++    }
++    let complex_samples_per_step = num_channels / 2;
++    let steps_per_block = (65_536 / complex_samples_per_step).max(1);
++    Ok(steps_per_block * complex_samples_per_step)
++}
++
++fn is_primary_advertising_frequency(freq_mhz: u32) -> bool {
++    matches!(freq_mhz, 2402 | 2426 | 2480)
++}
++
++fn uses_coded_scan_catcher(freq_mhz: u32, coded_scan: bool) -> bool {
++    coded_scan && is_primary_advertising_frequency(freq_mhz)
++}
++
++fn validate_coded_scan_grid(channel_freqs: &[u32], coded_scan: bool) -> Result<(), String> {
++    if coded_scan
++        && !channel_freqs
++            .iter()
++            .any(|&freq| is_primary_advertising_frequency(freq))
++    {
++        return Err(
++            "--coded-scan requires an exact FFT bin at 2402, 2426, or 2480 MHz; adjust --center-freq or --channels"
++                .to_string(),
++        );
++    }
++    Ok(())
++}
++
+ fn open_burst_writer(
+     path: Option<&Path>,
+     max_bytes: u64,
+@@ -73,6 +109,7 @@ pub fn run_file(
+     burst_path: Option<&Path>,
+     burst_limit_bytes: u64,
+     check_crc: bool,
++    coded_scan: bool,
+     squelch_db: f32,
+     print_stats: bool,
+     classic_uaps: &[(u32, u8)],
+@@ -80,40 +117,9 @@ pub fn run_file(
+     let sample_rate = num_channels as u32 * 1_000_000; // 1 MHz per channel
+     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
+ 
+-    // Build channel frequency table (matching C FFT bin ordering)
+-    // Bin 0 = center freq, bins 1..M/2-1 = center+1..center+M/2-1
+-    // Bins M/2..M-1 = center-M/2..center-1
+-    let channel_freqs: Vec<u32> = (0..num_channels)
+-        .map(|i| {
+-            if i < num_channels / 2 {
+-                center_freq_mhz + i as u32
+-            } else {
+-                (center_freq_mhz as i32 - num_channels as i32 + i as i32) as u32
+-            }
+-        })
+-        .collect();
+-
+-    // Map FFT bins to valid BLE channels (even MHz, 2402-2480).
+-    // live_ch[ble_channel] = fft_bin_index, where ble_channel = (freq - 2402) / 2
+-    let mut live_ch: [i32; 40] = [-1; 40];
+-    let mut first_live: usize = 40;
+-    let mut last_live: usize = 0;
+-    for (fft_bin, &freq) in channel_freqs.iter().enumerate() {
+-        if freq >= 2402 && freq <= 2480 && (freq & 1) == 0 {
+-            let ch_num = ((freq - 2402) / 2) as usize;
+-            live_ch[ch_num] = fft_bin as i32;
+-            if ch_num < first_live {
+-                first_live = ch_num;
+-            }
+-            if ch_num > last_live {
+-                last_live = ch_num;
+-            }
+-        }
+-    }
+-
+-    if first_live > last_live {
+-        return Err("no valid BLE channels in frequency range".to_string());
+-    }
++    let (channel_freqs, live_ch, first_live, last_live) =
++        build_channel_map(center_freq_mhz, num_channels)?;
++    validate_coded_scan_grid(&channel_freqs, coded_scan)?;
+ 
+     let active_channels = (first_live..=last_live)
+         .filter(|&ch| live_ch[ch] >= 0)
+@@ -151,11 +157,17 @@ pub fn run_file(
+     let sps = 2usize; // 2 samples per symbol (type 2 PFB output rate)
+ 
+     // One catcher per in-band Classic channel (every MHz, 2402-2480).
++    // With --coded-scan, exact primary-advertising bins also continuously
++    // accumulate overlapping windows for coded-PHY search.
+     let mut burst_catchers: Vec<Option<BurstCatcher>> = channel_freqs
+         .iter()
+         .map(|&freq| {
+             if (2402..=2480).contains(&freq) {
+-                Some(BurstCatcher::new(freq, squelch_db))
++                if uses_coded_scan_catcher(freq, coded_scan) {
++                    Some(BurstCatcher::new_scan(freq, squelch_db))
++                } else {
++                    Some(BurstCatcher::new(freq, squelch_db))
++                }
+             } else {
+                 None
+             }
+@@ -193,6 +205,7 @@ pub fn run_file(
+         sample_rate,
+         center_freq_hz,
+     );
++    source.set_block_size(aligned_file_block_size(num_channels)?);
+ 
+     let (tx, rx) = channel::bounded(64);
+ 
+@@ -270,7 +283,27 @@ pub fn run_file(
+                 };
+ 
+                 let sample = fft_buf[fft_bin];
+-                if let Some(burst) = catcher.execute(sample, &ts) {
++                let ordinary_burst = catcher.execute(sample, &ts);
++                if let Some(scan_burst) = catcher.take_scan_burst() {
++                    record_burst(&mut burst_writer, &scan_burst);
++                    if let CodedScanResult::Packet(p) =
++                        decode_coded_scan_burst(&scan_burst, &mut fsk, &mut conn_table)
++                    {
++                        total_ble += 1;
++                        total_crc += 1;
++                        valid_crc += 1;
++                        if let Some(ref mut writer) = pcap_writer {
++                            if let Err(e) = writer.write_ble(&p, None) {
++                                if pcap_errors == 0 {
++                                    eprintln!("PCAP write error: {}", e);
++                                }
++                                pcap_errors += 1;
++                            }
++                        }
++                    }
++                }
++
++                if let Some(burst) = ordinary_burst {
+                     total_bursts += 1;
+                     record_burst(&mut burst_writer, &burst);
+ 
+@@ -405,7 +438,7 @@ pub fn run_file(
+                             let mut pkt = None;
+ 
+                             // Try coded first on long bursts
+-                            if burst_len > 2000 {
++                            if burst_len > CODED_PRIORITY_THRESHOLD_SAMPLES {
+                                 pkt = ble::ble_coded_burst(
+                                     &fsk_result.demod,
+                                     freq,
+@@ -460,8 +493,8 @@ pub fn run_file(
+                                 }
+                             }
+ 
+-                            // Try coded on shorter bursts too (S=2 min ~2000 samples)
+-                            if pkt.is_none() && burst_len <= 2000 {
++                            // Try coded after the uncoded paths below the ordering threshold.
++                            if pkt.is_none() && burst_len <= CODED_PRIORITY_THRESHOLD_SAMPLES {
+                                 pkt = ble::ble_coded_burst(
+                                     &fsk_result.demod,
+                                     freq,
+@@ -476,6 +509,13 @@ pub fn run_file(
+                                 p.rssi_db = rssi;
+                                 p.noise_db = noise;
+ 
++                                // When continuous scan is active, suppress a
++                                // coded packet already emitted from an
++                                // overlapping scan or ordinary burst.
++                                if coded_scan && conn_table.is_coded_copy(&p) {
++                                    continue;
++                                }
++
+                                 // Track CONNECT_IND
+                                 if p.aa == ble::BLE_ADV_AA && p.crc_valid {
+                                     conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
+@@ -564,8 +604,8 @@ pub fn run_file(
+             0.0
+         };
+         eprintln!(
+-            "done ({:.1}s): BLE: {} BT: {} bursts: {} CRC: {:.1}% ({}/{})",
+-            elapsed, total_ble, total_bt, total_bursts, crc_pct, valid_crc, total_crc,
++            "done ({:.1}s): BLE: {} BT: {} bursts: {} CRC: {:.1}% ({}/{}) samples: {}",
++            elapsed, total_ble, total_bt, total_bursts, crc_pct, valid_crc, total_crc, sample_count,
+         );
+     }
+ 
+@@ -574,6 +614,104 @@ pub fn run_file(
+     Ok(())
+ }
+ 
++#[cfg(test)]
++mod file_mode_tests {
++    use super::{
++        CodedScanResult, aligned_file_block_size, build_channel_map, classify_coded_scan_packet,
++        uses_coded_scan_catcher, validate_coded_scan_grid,
++    };
++    use bd_protocol::Timespec;
++    use bd_protocol::ble::{BLE_ADV_AA, BlePacket, BlePhy};
++    use bd_protocol::ble_connection::ConnectionTable;
++
++    fn coded_packet(crc_checked: bool, crc_valid: bool, data: &[u8]) -> BlePacket {
++        BlePacket {
++            aa: BLE_ADV_AA,
++            rssi_db: 0,
++            noise_db: 0,
++            freq: 2426,
++            len: data.len(),
++            timestamp: Timespec {
++                tv_sec: 1,
++                tv_nsec: 2,
++            },
++            crc_checked,
++            crc_valid,
++            is_data: false,
++            conn_valid: false,
++            phy: BlePhy::PhyCoded,
++            ext_header: None,
++            data: data.to_vec(),
++        }
++    }
++
++    #[test]
++    fn aligns_file_blocks_to_complete_channelizer_steps() {
++        let block_size = aligned_file_block_size(20).unwrap();
++        assert_eq!(block_size, 65_530);
++        assert_eq!(block_size % (20 / 2), 0);
++        let total_samples = 20_000_000;
++        let full_blocks = total_samples / block_size;
++        let final_samples = total_samples % block_size;
++        let processed = full_blocks * block_size + final_samples / (20 / 2) * (20 / 2);
++        assert_eq!(processed, total_samples);
++        assert!(aligned_file_block_size(1).is_err());
++        assert!(aligned_file_block_size(21).is_err());
++    }
++
++    #[test]
++    fn coded_scan_requires_a_primary_advertising_bin() {
++        let (eligible, _, _, _) = build_channel_map(2435, 20).unwrap();
++        assert!(eligible.contains(&2426));
++        assert!(validate_coded_scan_grid(&eligible, true).is_ok());
++
++        let (ineligible, _, _, _) = build_channel_map(2437, 20).unwrap();
++        assert!(
++            !ineligible
++                .iter()
++                .any(|freq| matches!(freq, 2402 | 2426 | 2480))
++        );
++        assert!(validate_coded_scan_grid(&ineligible, true).is_err());
++        assert!(validate_coded_scan_grid(&ineligible, false).is_ok());
++    }
++
++    #[test]
++    fn coded_scan_catchers_are_limited_to_requested_primary_bins() {
++        for freq in [2402, 2426, 2480] {
++            assert!(uses_coded_scan_catcher(freq, true));
++            assert!(!uses_coded_scan_catcher(freq, false));
++        }
++        for freq in [2404, 2425, 2478] {
++            assert!(!uses_coded_scan_catcher(freq, true));
++        }
++    }
++
++    #[test]
++    fn coded_scan_accepts_only_checked_valid_packets_and_drops_copies() {
++        let mut table = ConnectionTable::new();
++        assert!(matches!(
++            classify_coded_scan_packet(coded_packet(false, true, &[1]), -40, -90, &mut table),
++            CodedScanResult::Rejected
++        ));
++        assert!(matches!(
++            classify_coded_scan_packet(coded_packet(true, false, &[2]), -40, -90, &mut table),
++            CodedScanResult::Rejected
++        ));
++
++        let accepted =
++            classify_coded_scan_packet(coded_packet(true, true, &[3]), -40, -90, &mut table);
++        let CodedScanResult::Packet(packet) = accepted else {
++            panic!("checked valid coded packet was rejected");
++        };
++        assert_eq!(packet.rssi_db, -40);
++        assert_eq!(packet.noise_db, -90);
++        assert!(matches!(
++            classify_coded_scan_packet(coded_packet(true, true, &[3]), -40, -90, &mut table),
++            CodedScanResult::Duplicate
++        ));
++    }
++}
++
+ /// Replay compact channelized bursts without rerunning the wideband channelizer.
+ pub fn run_burst_file(
+     path: &Path,
+@@ -1267,6 +1405,58 @@ fn try_enrich_edr(
+     attempt
+ }
+ 
++enum CodedScanResult {
++    NoPacket,
++    Rejected,
++    Duplicate,
++    Packet(ble::BlePacket),
++}
++
++fn classify_coded_scan_packet(
++    mut packet: ble::BlePacket,
++    rssi_db: i32,
++    noise_db: i32,
++    conn_table: &mut ConnectionTable,
++) -> CodedScanResult {
++    packet.rssi_db = rssi_db;
++    packet.noise_db = noise_db;
++    if packet.phy != ble::BlePhy::PhyCoded || !packet.crc_checked || !packet.crc_valid {
++        return CodedScanResult::Rejected;
++    }
++    if conn_table.is_coded_copy(&packet) {
++        return CodedScanResult::Duplicate;
++    }
++    CodedScanResult::Packet(packet)
++}
++
++/// Decode a continuous scan window as coded PHY only. Scan output is stricter
++/// than ordinary burst decoding: only CRC-checked, CRC-valid packets survive.
++fn decode_coded_scan_burst(
++    burst: &bd_dsp::burst::Burst,
++    fsk: &mut FskDemod,
++    conn_table: &mut ConnectionTable,
++) -> CodedScanResult {
++    let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
++    let packet = ble::ble_coded_burst_search(
++        &raw_demod,
++        burst.freq,
++        burst.timestamp.clone(),
++        2,
++        true,
++        &mut |aa| conn_table.crc_init_for_aa(aa, burst.timestamp.tv_sec),
++        raw_demod.len(),
++    );
++    match packet {
++        Some(packet) => classify_coded_scan_packet(
++            packet,
++            burst.rssi_db as i32,
++            burst.noise_db as i32,
++            conn_table,
++        ),
++        None => CodedScanResult::NoPacket,
++    }
++}
++
+ /// Process a burst: FSK demod -> BLE/BT detect -> PCAP write + ZMQ publish.
+ #[allow(clippy::too_many_arguments)]
+ fn process_burst(
+@@ -1290,29 +1480,18 @@ fn process_burst(
+ ) {
+     // Scan bursts: coded PHY search only (no BT/BLE 1M/2M)
+     if burst.scan {
+-        let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+         stats.coded_attempts += 1;
+-        if let Some(mut p) = ble::ble_coded_burst_search(
+-            &raw_demod,
+-            burst.freq,
+-            burst.timestamp.clone(),
+-            2,
+-            check_crc,
+-            &mut |aa| conn_table.crc_init_for_aa(aa, burst.timestamp.tv_sec),
+-            raw_demod.len(), // search full scan window
+-        ) {
+-            p.rssi_db = burst.rssi_db as i32;
+-            p.noise_db = burst.noise_db as i32;
+-            // Require valid CRC for coded packets from scan to avoid
+-            // false positives (garbled AA/MAC = phantom devices)
+-            if p.crc_checked && !p.crc_valid {
+-                return;
+-            }
+-            if conn_table.is_coded_copy(&p) {
+-                stats.coded_copies += 1;
+-                return;
+-            }
+-            emit_ble(&p, pcap_writer, #[cfg(feature = "zmq")] zmq_pub, gps_fix, stats);
++        match decode_coded_scan_burst(burst, fsk, conn_table) {
++            CodedScanResult::Packet(packet) => emit_ble(
++                &packet,
++                pcap_writer,
++                #[cfg(feature = "zmq")]
++                zmq_pub,
++                gps_fix,
++                stats,
++            ),
++            CodedScanResult::Duplicate => stats.coded_copies += 1,
++            CodedScanResult::NoPacket | CodedScanResult::Rejected => {}
+         }
+         return;
+     }
+@@ -1337,9 +1516,9 @@ fn process_burst(
+     let fsk_result = match fsk.demodulate(normal_samples) {
+         Some(r) => r,
+         None => {
+-            // FSK demod failed. Try raw FM + coded for any burst >= 1500 samples
+-            // (coded S=2 min ~2000 samples, S=8 min ~4000 samples).
+-            if blen >= 1500 {
++            // FSK demod failed. Try raw FM for every complete minimum-length
++            // S=2 packet; the S=8 minimum is 1,440 samples at the same 2 SPS.
++            if blen >= CODED_MIN_S2_PACKET_SAMPLES {
+                 stats.fsk_reject_long += 1;
+                 let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+                 stats.coded_attempts += 1;
+@@ -1437,13 +1616,12 @@ fn process_burst(
+         return;
+     }
+ 
+-    // For long bursts (> 2000 samples), try coded FIRST since coded packets
+-    // are always long (min ~2700 at S=2, ~6800+ at S=8). The coded preamble
+-    // check is cheap and highly distinctive (80 symbols of 00111100).
++    // Above the ordering threshold, try coded first because the preamble check
++    // is cheap and highly distinctive. Shorter bursts are still tried below.
+     let mut pkt = None;
+     let burst_len = fsk_result.demod.len();
+ 
+-    if burst_len > 2000 {
++    if burst_len > CODED_PRIORITY_THRESHOLD_SAMPLES {
+         stats.coded_attempts += 1;
+         stats.coded_fsk_ok += 1;
+         pkt = ble::ble_coded_burst(
+@@ -1482,8 +1660,8 @@ fn process_burst(
+         }
+     }
+ 
+-    // Also try coded on shorter bursts (S=2 min is ~2000 samples)
+-    if pkt.is_none() && burst_len <= 2000 {
++    // Also try coded on shorter bursts, down to the decoder's checked extent.
++    if pkt.is_none() && burst_len <= CODED_PRIORITY_THRESHOLD_SAMPLES {
+         stats.coded_attempts += 1;
+         pkt = ble::ble_coded_burst(
+             &fsk_result.demod,
+@@ -1661,7 +1839,7 @@ struct PipelineStats {
+     edr_best_sync_score: Option<f32>,
+     /// Debug: bursts that reached the coded decoder (all prior decoders returned None)
+     coded_attempts: u64,
+-    /// Debug: FSK demod failures >= 1500 samples
++    /// Debug: FSK demod failures at or above the minimum S=2 packet extent.
+     fsk_reject_long: u64,
+     /// Debug: coded attempts from FSK-success path
+     coded_fsk_ok: u64,
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+index ae35c17..8987bdd 100644
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -772,9 +772,8 @@ pub fn ble_burst_2m(
+ const CODED_PREAMBLE_PATTERN: [u8; 8] = [0, 0, 1, 1, 1, 1, 0, 0];
+ const CODED_PREAMBLE_REPS: usize = 10;
+ const CODED_PREAMBLE_SYMBOLS: usize = 8 * CODED_PREAMBLE_REPS; // 80
++const CODED_BLOCK1_SYMBOLS: usize = 74 * 4; // 74 FEC bits, P=4
+ 
+-/// Build GFSK-filtered correlation template for LE Coded advertising detection.
+-/// Includes preamble (80 symbols) + FEC-encoded advertising AA at S=8 (512 symbols)
+ /// Find LE Coded advertising packet in demod signal.
+ /// max_search_samples: how far into the burst to search (0 = auto).
+ /// Returns the sample index where the preamble starts, or None.
+@@ -790,7 +789,10 @@ pub fn find_coded_preamble(demod: &[f32], sps: usize, max_search_samples: usize)
+ /// transmitter's GFSK filter and the PFB channelizer's response.
+ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: usize, _freq: u32) -> Option<usize> {
+     // Need at least preamble + Block 1 worth of samples
+-    let min_samples = CODED_PREAMBLE_SYMBOLS * sps + 600 * sps;
++    if sps == 0 {
++        return None;
++    }
++    let min_samples = (CODED_PREAMBLE_SYMBOLS + CODED_BLOCK1_SYMBOLS).checked_mul(sps)?;
+     if demod.len() < min_samples {
+         return None;
+     }
+@@ -895,7 +897,7 @@ pub fn find_coded_preamble_freq(demod: &[f32], sps: usize, max_search_samples: u
+ /// Structure:
+ /// - Preamble: 80 symbols (`00111100` x10)
+ /// - FEC Block 1 (S=8): AA(32 bits) + CI(2 bits) + TERM1(3 bits) = 37 data bits
+-///   -> conv encode -> 74 coded bits -> pattern map S=8 -> 592 symbols
++///   -> conv encode -> 74 coded bits -> pattern map P=4 -> 296 symbols
+ /// - FEC Block 2 (S=CI): PDU + CRC(24 bits) + TERM2(3 bits)
+ ///   -> conv encode -> pattern map at S=2 or S=8
+ ///
+@@ -911,6 +913,25 @@ pub fn ble_coded_burst(
+     ble_coded_burst_search(demod, freq, timestamp, sps, check_crc, &mut crc_init_fn, 0)
+ }
+ 
++fn coded_soft_symbols(
++    demod: &[f32],
++    start: usize,
++    symbol_count: usize,
++    sps: usize,
++) -> Option<Vec<f32>> {
++    if sps == 0 {
++        return None;
++    }
++    let sample_count = symbol_count.checked_mul(sps)?;
++    let samples = demod.get(start..start.checked_add(sample_count)?)?;
++    Some(
++        samples
++            .chunks_exact(sps)
++            .map(|symbol| symbol.iter().sum::<f32>() / sps as f32)
++            .collect(),
++    )
++}
++
+ /// LE Coded burst decoder with configurable search depth.
+ /// max_search: how far into burst to search for preamble (0 = default 5000).
+ pub fn ble_coded_burst_search(
+@@ -924,6 +945,10 @@ pub fn ble_coded_burst_search(
+ ) -> Option<BlePacket> {
+     use crate::fec;
+ 
++    if sps == 0 {
++        return None;
++    }
++
+     // Find coded preamble (80 symbols of 00111100 pattern)
+     let preamble_start = match find_coded_preamble_freq(demod, sps, max_search, freq) {
+         Some(idx) => idx,
+@@ -931,33 +956,28 @@ pub fn ble_coded_burst_search(
+     };
+     let preamble_samples = CODED_PREAMBLE_SYMBOLS * sps;
+ 
+-    // FEC Block 1: 37 data bits -> 74 coded bits -> 592 symbols at S=8
+-    let block1_symbols = 74 * 8; // 592
++    // FEC Block 1: 37 data bits -> 74 coded bits -> 296 symbols at S=8.
++    let block1_symbols = CODED_BLOCK1_SYMBOLS;
+     let nominal_block1 = preamble_start + preamble_samples;
+ 
+-    // Block 1 search: try SPS=1 with normal and inverted polarity over a
+-    // range of sample offsets.  The PFBCH2 outputs at 2 Msps but the coded
+-    // signal resolves at 1 sample per symbol (minimum S=8 run length = 4
+-    // samples), so SPS=1 is the correct extraction rate.
++    // Search raw-sample phase and polarity, averaging every symbol's samples
++    // before pattern demapping and FEC decoding.
+     let mut best_hd: u32 = 33;
+     let mut best_ci: u8 = 0;
+     let mut best_block1_start: usize = 0;
+     let mut best_best_state: u8 = 0;
++    let mut best_termination_metric = f32::NEG_INFINITY;
+     let mut best_invert: bool = false;
+ 
+-    'search: for off in -8isize..=8 {
++    for off in -8isize..=8 {
+         let block1_start_raw = nominal_block1 as isize + off;
+         if block1_start_raw < 0 {
+             continue;
+         }
+         let block1_start = block1_start_raw as usize;
+-        if block1_start + block1_symbols > demod.len() {
++        let Some(block1_soft) = coded_soft_symbols(demod, block1_start, block1_symbols, sps) else {
+             continue;
+-        }
+-
+-        let block1_soft: Vec<f32> = (0..block1_symbols)
+-            .map(|i| demod[block1_start + i])
+-            .collect();
++        };
+ 
+         for &invert in &[false, true] {
+             let mut soft_coded = fec::pattern_demap_s8(&block1_soft);
+@@ -968,7 +988,8 @@ pub fn ble_coded_burst_search(
+             }
+ 
+             let decoded = fec::viterbi_decode(&soft_coded);
+-            let (_, vit_best_state, _) = fec::viterbi_decode_terminated(&soft_coded);
++            let (_, vit_best_state, termination_metric) =
++                fec::viterbi_decode_terminated(&soft_coded);
+ 
+             if decoded.len() < 37 {
+                 continue;
+@@ -981,15 +1002,13 @@ pub fn ble_coded_burst_search(
+ 
+             let hd = (aa ^ BLE_ADV_AA).count_ones();
+ 
+-            if hd < best_hd {
++            if hd < best_hd || (hd == best_hd && termination_metric > best_termination_metric) {
+                 best_hd = hd;
+                 best_ci = decoded[32] | (decoded[33] << 1);
+                 best_block1_start = block1_start;
+                 best_best_state = vit_best_state;
++                best_termination_metric = termination_metric;
+                 best_invert = invert;
+-                if hd == 0 {
+-                    break 'search;
+-                }
+             }
+         }
+     }
+@@ -1005,13 +1024,13 @@ pub fn ble_coded_burst_search(
+ 
+     // Re-decode Block 1 with terminated Viterbi for reliable CI extraction
+     if terminated {
+-        let block1_soft_best: Vec<f32> = (0..block1_symbols)
+-            .map(|i| {
+-                let idx = best_block1_start + i;
+-                let val = if idx < demod.len() { demod[idx] } else { 0.0 };
+-                if best_invert { -val } else { val }
+-            })
+-            .collect();
++        let mut block1_soft_best =
++            coded_soft_symbols(demod, best_block1_start, block1_symbols, sps)?;
++        if best_invert {
++            for value in &mut block1_soft_best {
++                *value = -*value;
++            }
++        }
+         let soft_coded_b1 = fec::pattern_demap_s8(&block1_soft_best);
+         let (decoded_b1, _, _) = fec::viterbi_decode_terminated(&soft_coded_b1);
+         if decoded_b1.len() >= 37 {
+@@ -1019,8 +1038,8 @@ pub fn ble_coded_burst_search(
+         }
+     }
+ 
+-    // FEC Block 2 starts after Block 1 (SPS=1: one sample per symbol)
+-    let block2_start = best_block1_start + block1_symbols;
++    // FEC Block 2 starts after every sampled Block 1 symbol.
++    let block2_start = best_block1_start.checked_add(block1_symbols.checked_mul(sps)?)?;
+ 
+     let remaining_samples = if block2_start < demod.len() {
+         demod.len() - block2_start
+@@ -1028,14 +1047,14 @@ pub fn ble_coded_burst_search(
+         return None;
+     };
+ 
+-    // Extract soft symbols for Block 2 using same polarity as Block 1
+-    let block2_soft: Vec<f32> = (0..remaining_samples)
+-        .map(|i| {
+-            let idx = block2_start + i;
+-            let val = if idx < demod.len() { demod[idx] } else { 0.0 };
+-            if best_invert { -val } else { val }
+-        })
+-        .collect();
++    // Extract soft symbols for Block 2 using the same sample rate and polarity.
++    let remaining_symbols = remaining_samples / sps;
++    let mut block2_soft = coded_soft_symbols(demod, block2_start, remaining_symbols, sps)?;
++    if best_invert {
++        for value in &mut block2_soft {
++            *value = -*value;
++        }
++    }
+ 
+     let channel = freq_to_channel(freq);
+     let is_data = aa != BLE_ADV_AA;
+@@ -1053,8 +1072,6 @@ pub fn ble_coded_burst_search(
+ 
+     let mut best_result: Option<(Vec<u8>, usize, bool, bool, bool, usize)> = None; // (dewhitened, pdu_len, crc_checked, crc_valid, conn_valid, coding_s)
+ 
+-    let remaining_symbols = remaining_samples; // SPS=1: symbols == samples
+-
+     for &coding_s in &try_order {
+         if remaining_symbols < coding_s * 20 {
+             continue;
+@@ -1604,10 +1621,36 @@ mod tests {
+         assert!(parse_ext_adv(&pdu).is_none());
+     }
+ 
+-    /// Test LE Coded PHY end-to-end with synthetic signal.
+-    /// Uses SPS=1 to match the decoder's stride-1 block extraction.
+-    /// The real pipeline passes sps=2 for preamble finding (channelizer is 2 Msps)
+-    /// but the FEC block extraction reads every sample at stride 1.
++    #[test]
++    fn coded_preamble_accepts_the_exact_block1_extent() {
++        use crate::fec;
++
++        let mut demod = vec![0.0f32; 100];
++        for _ in 0..CODED_PREAMBLE_REPS {
++            demod.extend(
++                CODED_PREAMBLE_PATTERN
++                    .iter()
++                    .map(|bit| if *bit == 1 { 1.0 } else { -1.0 }),
++            );
++        }
++        let block1 = fec::pattern_map_s8(&fec::conv_encode(&[0; 34]));
++        assert_eq!(block1.len(), CODED_BLOCK1_SYMBOLS);
++        demod.extend(
++            block1
++                .iter()
++                .map(|bit| if *bit == 1 { 1.0 } else { -1.0 }),
++        );
++
++        assert_eq!(find_coded_preamble(&demod, 1, 0), Some(100));
++        assert_eq!(find_coded_preamble(&demod, 0, 0), None);
++        let truncated_len = CODED_PREAMBLE_SYMBOLS + CODED_BLOCK1_SYMBOLS - 1;
++        assert_eq!(
++            find_coded_preamble(&demod[..truncated_len], 1, 0),
++            None
++        );
++    }
++
++    /// Test both LE Coded schemes end-to-end at both supported sample rates.
+     #[test]
+     fn test_ble_coded_burst_synthetic() {
+         use crate::fec;
+@@ -1615,7 +1658,6 @@ mod tests {
+ 
+         let freq = 2402u32;
+         let channel = freq_to_channel(freq);
+-        let sps = 1usize;
+ 
+         // Build a minimal ADV packet
+         let pdu_header: [u8; 2] = [0x02, 0x06]; // type=2, len=6
+@@ -1641,17 +1683,7 @@ mod tests {
+             }
+         }
+ 
+-        // CI = 0 (S=8 for PDU)
+-        let ci_bits = vec![0u8, 0]; // CI=0 means S=8
+-
+-        // FEC Block 1: AA(32) + CI(2), conv_encode adds 3 flush bits (= TERM1)
+-        let mut block1_data = Vec::new();
+-        block1_data.extend_from_slice(&aa_bits);
+-        block1_data.extend_from_slice(&ci_bits);
+-        let block1_coded = fec::conv_encode(&block1_data);
+-        let block1_symbols = fec::pattern_map_s8(&block1_coded);
+-
+-        // FEC Block 2: PDU + CRC (whitened), then FEC + pattern map at S=8
++        // FEC Block 2 payload before the CI-selected pattern mapping.
+         let mut pdu_crc = Vec::new();
+         pdu_crc.extend_from_slice(&pdu);
+         pdu_crc.extend_from_slice(&crc_bytes);
+@@ -1667,50 +1699,55 @@ mod tests {
+         }
+ 
+         let block2_coded = fec::conv_encode(&pdu_crc_bits);
+-        let block2_symbols = fec::pattern_map_s8(&block2_coded);
+ 
+-        // Build full demod signal at SPS=1 (one sample per symbol)
+-        let mut demod = Vec::new();
+-
+-        // Leading silence (anchors DC offset estimate near 0.0, matching real bursts)
+-        for _ in 0..100 { demod.push(0.0f32); }
+-
+-        // Preamble: 80 symbols of 00111100
+-        for _ in 0..CODED_PREAMBLE_REPS {
+-            for &bit in &CODED_PREAMBLE_PATTERN {
+-                let val = if bit == 1 { 1.0f32 } else { -1.0 };
+-                demod.push(val);
++        for (coding_indicator, block2_symbols) in [
++            (0u8, fec::pattern_map_s8(&block2_coded)),
++            (1u8, fec::pattern_map_s2(&block2_coded)),
++        ] {
++            // Block 1 always uses S=8 and carries the Block 2 coding indicator.
++            let mut block1_data = aa_bits.clone();
++            block1_data.extend_from_slice(&[coding_indicator, 0]);
++            let block1_coded = fec::conv_encode(&block1_data);
++            let block1_symbols = fec::pattern_map_s8(&block1_coded);
++
++            for sps in [1usize, 2] {
++                let mut demod = vec![0.0f32; 100 * sps];
++
++                for _ in 0..CODED_PREAMBLE_REPS {
++                    for &bit in &CODED_PREAMBLE_PATTERN {
++                        let value = if bit == 1 { 1.0f32 } else { -1.0 };
++                        demod.extend(std::iter::repeat_n(value, sps));
++                    }
++                }
++                for &symbol in &block1_symbols {
++                    let value = if symbol == 1 { 1.0f32 } else { -1.0 };
++                    demod.extend(std::iter::repeat_n(value, sps));
++                }
++                for &symbol in &block2_symbols {
++                    let value = if symbol == 1 { 1.0f32 } else { -1.0 };
++                    demod.extend(std::iter::repeat_n(value, sps));
++                }
++                demod.extend(std::iter::repeat_n(0.0f32, 40 * sps));
++
++                let ts = crate::Timespec {
++                    tv_sec: 0,
++                    tv_nsec: 0,
++                };
++                let pkt = ble_coded_burst(&demod, freq, ts, sps, true, |_| None)
++                    .expect("ble_coded_burst failed to decode known packet");
++                assert_eq!(pkt.aa, BLE_ADV_AA);
++                assert_eq!(pkt.phy, BlePhy::PhyCoded);
++                assert!(pkt.crc_checked, "CRC not checked at {sps} SPS");
++                assert!(
++                    pkt.crc_valid,
++                    "CRC invalid for CI={coding_indicator} at {sps} SPS: data={:02X?}",
++                    pkt.data
++                );
++                assert_eq!(pkt.data[4], coding_indicator, "CI mismatch");
++                assert_eq!(pkt.data[5], 0x02, "PDU type mismatch");
++                assert_eq!(pkt.data[6], 0x06, "PDU length mismatch");
++                assert_eq!(pkt.timestamp.tv_nsec, 100_000);
+             }
+         }
+-
+-        // FEC Block 1 symbols
+-        for &sym in &block1_symbols {
+-            let val = if sym == 1 { 1.0f32 } else { -1.0 };
+-            demod.push(val);
+-        }
+-
+-        // FEC Block 2 symbols
+-        for &sym in &block2_symbols {
+-            let val = if sym == 1 { 1.0f32 } else { -1.0 };
+-            demod.push(val);
+-        }
+-
+-        // Trail
+-        for _ in 0..40 { demod.push(0.0f32); }
+-
+-        let ts = crate::Timespec { tv_sec: 0, tv_nsec: 0 };
+-        let pkt = ble_coded_burst(&demod, freq, ts, sps, true, |_| None);
+-        assert!(pkt.is_some(), "ble_coded_burst failed to decode known packet");
+-        let pkt = pkt.unwrap();
+-        assert_eq!(pkt.aa, BLE_ADV_AA);
+-        assert_eq!(pkt.phy, BlePhy::PhyCoded);
+-        assert!(pkt.crc_checked, "CRC not checked");
+-        assert!(pkt.crc_valid, "CRC INVALID on coded burst: data={:02X?}", &pkt.data);
+-        // Verify CI byte is present in output
+-        assert_eq!(pkt.data[4], 0, "CI should be 0 (S=8)");
+-        // Verify dewhitened PDU
+-        assert_eq!(pkt.data[5], 0x02, "PDU type mismatch");
+-        assert_eq!(pkt.data[6], 0x06, "PDU length mismatch");
+-        assert_eq!(pkt.timestamp.tv_nsec, 100_000);
+     }
+ }
+diff --git a/crates/protocol/src/fec.rs b/crates/protocol/src/fec.rs
+index 8aa43bb..48a9307 100644
+--- a/crates/protocol/src/fec.rs
++++ b/crates/protocol/src/fec.rs
+@@ -1,14 +1,14 @@
+ // Copyright 2025-2026 CEMAXECUTER LLC
+ 
+-/// Forward error correction for BLE LE Coded PHY.
+-///
+-/// Convolutional code per Bluetooth Core Spec v5.4, Vol 6, Part B, Section 3.3:
+-///   Rate 1/2, constraint length K=4 (3 memory bits, 8 trellis states)
+-///   g0(D) = 1 + D + D^2 + D^3  (octal 17, 0b1111 = 15)
+-///   g1(D) = 1 + D^2 + D^3       (octal 15, 0b1011 in register layout)
+-///
+-/// Pattern mapping: S=2 maps coded bit 0->"11", 1->"01".
+-///                  S=8 maps coded bit 0->"11110000", 1->"00001111".
++//! Forward error correction for BLE LE Coded PHY.
++//!
++//! Convolutional code per Bluetooth Core Spec v5.4, Vol 6, Part B, Section 3.3:
++//!   Rate 1/2, constraint length K=4 (3 memory bits, 8 trellis states)
++//!   g0(D) = 1 + D + D^2 + D^3  (octal 17, 0b1111 = 15)
++//!   g1(D) = 1 + D^2 + D^3       (octal 15, 0b1011 in register layout)
++//!
++//! Pattern mapping: S=2 uses P=1 and leaves each coded bit unchanged.
++//!                  S=8 uses P=4 and maps 0->"0011", 1->"1100".
+ 
+ /// Number of memory bits in the shift register.
+ const FEC_MEM: usize = 3;
+@@ -63,29 +63,19 @@ pub fn conv_encode(data: &[u8]) -> Vec<u8> {
+     coded
+ }
+ 
+-/// Pattern map at S=2: coded bit 0 -> [1,1], coded bit 1 -> [0,1]
++/// Pattern map at S=2 (P=1): each coded bit becomes one transmitted symbol.
+ pub fn pattern_map_s2(coded: &[u8]) -> Vec<u8> {
+-    let mut symbols = Vec::with_capacity(coded.len() * 2);
+-    for &bit in coded {
+-        if bit == 0 {
+-            symbols.push(1);
+-            symbols.push(1);
+-        } else {
+-            symbols.push(0);
+-            symbols.push(1);
+-        }
+-    }
+-    symbols
++    coded.iter().map(|bit| bit & 1).collect()
+ }
+ 
+-/// Pattern map at S=8: coded bit 0 -> [1,1,1,1,0,0,0,0], coded bit 1 -> [0,0,0,0,1,1,1,1]
++/// Pattern map at S=8 (P=4): coded bit 0 -> 0011, coded bit 1 -> 1100.
+ pub fn pattern_map_s8(coded: &[u8]) -> Vec<u8> {
+-    let mut symbols = Vec::with_capacity(coded.len() * 8);
++    let mut symbols = Vec::with_capacity(coded.len() * 4);
+     for &bit in coded {
+         if bit == 0 {
+-            symbols.extend_from_slice(&[1, 1, 1, 1, 0, 0, 0, 0]);
++            symbols.extend_from_slice(&[0, 0, 1, 1]);
+         } else {
+-            symbols.extend_from_slice(&[0, 0, 0, 0, 1, 1, 1, 1]);
++            symbols.extend_from_slice(&[1, 1, 0, 0]);
+         }
+     }
+     symbols
+@@ -95,33 +85,25 @@ pub fn pattern_map_s8(coded: &[u8]) -> Vec<u8> {
+ /// Takes soft demod values (positive = 1, negative = 0).
+ /// Returns soft coded bits: positive = more likely 0, negative = more likely 1.
+ ///
+-/// S=2 mapping: coded 0 -> [+1, +1], coded 1 -> [-1, +1]
+-/// The first symbol differentiates: if positive -> coded 0, if negative -> coded 1.
++/// S=2 mapping uses one physical symbol per coded bit. Negating the demodulated
++/// symbol converts positive-for-one input into positive-for-zero soft output.
+ pub fn pattern_demap_s2(symbols: &[f32]) -> Vec<f32> {
+-    let n = symbols.len() / 2;
+-    let mut soft_coded = Vec::with_capacity(n);
+-    for i in 0..n {
+-        // S=2: pattern 0 = [+1, +1], pattern 1 = [-1, +1]
+-        // Metric = 2*s[0] (positive = coded 0)
+-        soft_coded.push(symbols[i * 2]);
+-    }
+-    soft_coded
++    symbols.iter().map(|symbol| -*symbol).collect()
+ }
+ 
+ /// Soft pattern demap at S=8.
+ /// Takes soft demod values, returns soft coded bits.
+ ///
+-/// S=8 mapping: coded 0 -> [+1,+1,+1,+1,-1,-1,-1,-1]
+-///              coded 1 -> [-1,-1,-1,-1,+1,+1,+1,+1]
+-/// Metric: sum of first 4 minus sum of last 4 (positive = coded 0).
++/// S=8 mapping: coded 0 -> [-1,-1,+1,+1], coded 1 -> [+1,+1,-1,-1].
++/// Metric: sum of the second half minus the first (positive = coded 0).
+ pub fn pattern_demap_s8(symbols: &[f32]) -> Vec<f32> {
+-    let n = symbols.len() / 8;
++    let n = symbols.len() / 4;
+     let mut soft_coded = Vec::with_capacity(n);
+     for i in 0..n {
+-        let base = i * 8;
+-        let first_half: f32 = symbols[base..base + 4].iter().sum();
+-        let second_half: f32 = symbols[base + 4..base + 8].iter().sum();
+-        soft_coded.push(first_half - second_half);
++        let base = i * 4;
++        let first_half: f32 = symbols[base..base + 2].iter().sum();
++        let second_half: f32 = symbols[base + 2..base + 4].iter().sum();
++        soft_coded.push(second_half - first_half);
+     }
+     soft_coded
+ }
+@@ -342,6 +324,22 @@ mod tests {
+         assert_eq!(coded[9], 0); // c1[4]
+     }
+ 
++    #[test]
++    fn test_conv_encode_core_sample_access_address() {
++        // Bluetooth Core 6.2, Vol 6, Part C, Section 2.2.
++        let input = [
++            0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0,
++            1, 1, 1, 0, 0, 0, 1,
++        ];
++        let expected = [
++            0, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0,
++            1, 0, 1, 1, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0,
++            0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1,
++        ];
++
++        assert_eq!(&conv_encode(&input)[..expected.len()], expected);
++    }
++
+     #[test]
+     fn test_conv_roundtrip() {
+         // Encode, pattern map at S=8, demap, Viterbi decode, should match
+@@ -416,17 +414,13 @@ mod tests {
+     fn test_pattern_map_s8_values() {
+         let coded = vec![0, 1];
+         let symbols = pattern_map_s8(&coded);
+-        assert_eq!(symbols.len(), 16);
+-        assert_eq!(&symbols[..8], &[1, 1, 1, 1, 0, 0, 0, 0]); // coded 0
+-        assert_eq!(&symbols[8..], &[0, 0, 0, 0, 1, 1, 1, 1]); // coded 1
++        assert_eq!(symbols, [0, 0, 1, 1, 1, 1, 0, 0]);
+     }
+ 
+     #[test]
+     fn test_pattern_map_s2_values() {
+         let coded = vec![0, 1];
+         let symbols = pattern_map_s2(&coded);
+-        assert_eq!(symbols.len(), 4);
+-        assert_eq!(&symbols[..2], &[1, 1]); // coded 0
+-        assert_eq!(&symbols[2..], &[0, 1]); // coded 1
++        assert_eq!(symbols, coded);
+     }
+ }
+diff --git a/crates/sdr/src/file.rs b/crates/sdr/src/file.rs
+index ea90b9a..cdc62ee 100644
+--- a/crates/sdr/src/file.rs
++++ b/crates/sdr/src/file.rs
+@@ -6,8 +6,21 @@ use std::fs::File;
+ use std::io::{self, BufReader, Read};
+ use std::path::Path;
+ 
+-/// IQ sample format for file input (alias for shared IqFormat)
+-pub type SampleFormat = crate::IqFormat;
++/// IQ sample format for file input.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SampleFormat {
++    /// Complex signed 8-bit samples, interleaved I/Q.
++    Ci8,
++    /// Complex signed 16-bit little-endian samples, interleaved I/Q.
++    Ci16,
++    /// Complex 32-bit float little-endian samples, interleaved I/Q.
++    Cf32,
++    /// bladeRF SC16 Q11 little-endian samples, interleaved I/Q.
++    ///
++    /// Each component must be in `-2048..=2047` and is scaled left by four
++    /// bits to match the live bladeRF source's full-range `i16` convention.
++    Sc16Q11,
++}
+ 
+ /// IQ file reader: reads samples from a file and sends them as SampleBuf blocks.
+ pub struct FileSource {
+@@ -84,6 +97,47 @@ impl FileSource {
+         Ok(Some(out))
+     }
+ 
++    fn read_block_sc16_q11(
++        reader: &mut BufReader<File>,
++        num_samples: usize,
++    ) -> io::Result<Option<Vec<i16>>> {
++        let bytes_needed = num_samples * 4; // 4 bytes per complex sample
++        let mut buf = vec![0u8; bytes_needed];
++        let mut n = 0;
++        while n < bytes_needed {
++            match reader.read(&mut buf[n..]) {
++                Ok(0) => break,
++                Ok(read) => n += read,
++                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
++                Err(error) => return Err(error),
++            }
++        }
++        if n == 0 {
++            return Ok(None);
++        }
++        if n % 4 != 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "SC16 Q11 input ends within an interleaved I/Q sample",
++            ));
++        }
++        let mut out = Vec::with_capacity(n / 2);
++        for (component_index, raw) in buf[..n].chunks_exact(2).enumerate() {
++            let value = i16::from_le_bytes([raw[0], raw[1]]);
++            if !(-2048..=2047).contains(&value) {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!(
++                        "SC16 Q11 component {} is outside -2048..=2047: {}",
++                        component_index, value
++                    ),
++                ));
++            }
++            out.push(value << 4);
++        }
++        Ok(Some(out))
++    }
++
+     fn read_block_cf32(
+         reader: &mut BufReader<File>,
+         num_samples: usize,
+@@ -129,6 +183,7 @@ impl SdrSource for FileSource {
+                 SampleFormat::Ci8 => Self::read_block_ci8(&mut reader, self.block_size),
+                 SampleFormat::Ci16 => Self::read_block_ci16(&mut reader, self.block_size),
+                 SampleFormat::Cf32 => Self::read_block_cf32(&mut reader, self.block_size),
++                SampleFormat::Sc16Q11 => Self::read_block_sc16_q11(&mut reader, self.block_size),
+             };
+ 
+             match result {
+@@ -163,3 +218,67 @@ impl SdrSource for FileSource {
+         self.center_freq
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Write;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
++
++    fn q11_file(components: &[i16], trailing: &[u8]) -> std::path::PathBuf {
++        let path = std::env::temp_dir().join(format!(
++            "blue-dragon-q11-{}-{}",
++            std::process::id(),
++            SEQUENCE.fetch_add(1, Ordering::Relaxed)
++        ));
++        let mut file = File::create(&path).unwrap();
++        for value in components {
++            file.write_all(&value.to_le_bytes()).unwrap();
++        }
++        file.write_all(trailing).unwrap();
++        file.flush().unwrap();
++        path
++    }
++
++    #[test]
++    fn sc16_q11_matches_live_bladerf_scaling() {
++        let file = q11_file(&[-2048, 2047, -1, 1], &[]);
++        let input = File::open(&file).unwrap();
++        let mut reader = BufReader::new(input);
++        let samples = FileSource::read_block_sc16_q11(&mut reader, 8)
++            .unwrap()
++            .unwrap();
++        assert_eq!(samples, [-32768, 32752, -16, 16]);
++        assert!(
++            FileSource::read_block_sc16_q11(&mut reader, 8)
++                .unwrap()
++                .is_none()
++        );
++        std::fs::remove_file(file).unwrap();
++    }
++
++    #[test]
++    fn sc16_q11_rejects_invalid_components_and_partial_samples() {
++        let file = q11_file(&[2048, 0], &[]);
++        let mut reader = BufReader::new(File::open(&file).unwrap());
++        assert_eq!(
++            FileSource::read_block_sc16_q11(&mut reader, 1)
++                .unwrap_err()
++                .kind(),
++            io::ErrorKind::InvalidData
++        );
++        std::fs::remove_file(file).unwrap();
++
++        let file = q11_file(&[0], &[0]);
++        let mut reader = BufReader::new(File::open(&file).unwrap());
++        assert_eq!(
++            FileSource::read_block_sc16_q11(&mut reader, 1)
++                .unwrap_err()
++                .kind(),
++            io::ErrorKind::InvalidData
++        );
++        std::fs::remove_file(file).unwrap();
++    }
++}

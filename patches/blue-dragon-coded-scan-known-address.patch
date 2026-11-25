@@ -1,0 +1,361 @@
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -1480,7 +1480,11 @@
+         &raw_demod,
+         burst.freq,
+         burst.timestamp.clone(),
+-        &mut |aa| conn_table.crc_init_for_aa(aa, burst.timestamp.tv_sec),
++        &mut |aa| {
++            conn_table
++                .lookup(aa)
++                .map(|connection| (connection.crc_init, true))
++        },
+     );
+     let (rssi_db, noise_db) = (burst.rssi_db as i32, burst.noise_db as i32);
+     packets
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -1075,6 +1075,14 @@
+     .map(|(packet, _)| packet)
+ }
+ 
++struct CodedBlock1 {
++    access_address: u32,
++    coding_indicator: u8,
++    start_sample: usize,
++    inverted: bool,
++    terminated: bool,
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn decode_coded_at(
+     demod: &[f32],
+@@ -1102,6 +1110,7 @@
+     let mut best_best_state: u8 = 0;
+     let mut best_termination_metric = f32::NEG_INFINITY;
+     let mut best_invert: bool = false;
++    let mut strongest_connected: Option<(f32, CodedBlock1)> = None;
+ 
+     for off in -8isize..=8 {
+         let block1_start_raw = nominal_block1 as isize + off;
+@@ -1135,45 +1144,124 @@
+             }
+ 
+             let hd = (aa ^ BLE_ADV_AA).count_ones();
++            let ci = decoded[32] | (decoded[33] << 1);
+ 
+             if hd < best_hd || (hd == best_hd && termination_metric > best_termination_metric) {
+                 best_hd = hd;
+-                best_ci = decoded[32] | (decoded[33] << 1);
++                best_ci = ci;
+                 best_block1_start = block1_start;
+                 best_best_state = vit_best_state;
+                 best_termination_metric = termination_metric;
+                 best_invert = invert;
+             }
++
++            // Keep one terminated alternative for a strict scan. Resolve its
++            // exact address once, after the advertising path has run.
++            if exact_pdu_length
++                && check_crc
++                && aa != BLE_ADV_AA
++                && ci <= 1
++                && vit_best_state == 0
++                && termination_metric.is_finite()
++                && strongest_connected
++                    .as_ref()
++                    .is_none_or(|(score, _)| termination_metric > *score)
++            {
++                strongest_connected = Some((
++                    termination_metric,
++                    CodedBlock1 {
++                        access_address: aa,
++                        coding_indicator: ci,
++                        start_sample: block1_start,
++                        inverted: invert,
++                        terminated: true,
++                    },
++                ));
++            }
+         }
+     }
+ 
+-    let aa_hd = best_hd;
+     let terminated = best_best_state == 0;
+-
+-    if aa_hd > BLE_MAX_HD {
+-        return None;
+-    }
+-
+-    let aa = BLE_ADV_AA; // snap to advertising AA if close enough
+-
+-    // Re-decode Block 1 with terminated Viterbi for reliable CI extraction
+-    if terminated {
+-        let mut block1_soft_best =
+-            coded_soft_symbols(demod, best_block1_start, block1_symbols, sps)?;
+-        if best_invert {
+-            for value in &mut block1_soft_best {
+-                *value = -*value;
++    let advertising = if best_hd <= BLE_MAX_HD {
++        // Keep the advertising address tolerance and terminated CI unchanged.
++        if terminated {
++            let mut soft = coded_soft_symbols(demod, best_block1_start, block1_symbols, sps)?;
++            if best_invert {
++                for value in &mut soft {
++                    *value = -*value;
++                }
++            }
++            let encoded = fec::pattern_demap_s8(&soft);
++            let (decoded, _, _) = fec::viterbi_decode_terminated(&encoded);
++            if decoded.len() >= 37 {
++                best_ci = decoded[32] | (decoded[33] << 1);
+             }
+         }
+-        let soft_coded_b1 = fec::pattern_demap_s8(&block1_soft_best);
+-        let (decoded_b1, _, _) = fec::viterbi_decode_terminated(&soft_coded_b1);
+-        if decoded_b1.len() >= 37 {
+-            best_ci = decoded_b1[32] | (decoded_b1[33] << 1);
+-        }
++        decode_coded_block2(
++            demod,
++            freq,
++            &timestamp,
++            sps,
++            check_crc,
++            Some((0x555555, false)),
++            preamble_start,
++            exact_pdu_length,
++            CodedBlock1 {
++                access_address: BLE_ADV_AA,
++                coding_indicator: best_ci,
++                start_sample: best_block1_start,
++                inverted: best_invert,
++                terminated,
++            },
++        )
++    } else {
++        None
++    };
++    if advertising.as_ref().is_some_and(|(packet, _)| packet.crc_valid) {
++        return advertising;
+     }
+ 
++    let connected = strongest_connected.and_then(|(_, block1)| {
++        let context = crc_init_fn(block1.access_address).filter(|&(_, confirmed)| confirmed)?;
++        decode_coded_block2(
++            demod,
++            freq,
++            &timestamp,
++            sps,
++            check_crc,
++            Some(context),
++            preamble_start,
++            exact_pdu_length,
++            block1,
++        )
++        .filter(|(packet, end)| packet.crc_checked && packet.crc_valid && *end <= demod.len())
++    });
++    connected.or(advertising)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn decode_coded_block2(
++    demod: &[f32],
++    freq: u32,
++    timestamp: &Timespec,
++    sps: usize,
++    check_crc: bool,
++    crc_init_val: Option<(u32, bool)>,
++    preamble_start: usize,
++    exact_pdu_length: bool,
++    block1: CodedBlock1,
++) -> Option<(BlePacket, usize)> {
++    use crate::fec;
++
++    let CodedBlock1 {
++        access_address: aa,
++        coding_indicator: best_ci,
++        start_sample: block1_start,
++        inverted: best_invert,
++        terminated,
++    } = block1;
+     // FEC Block 2 starts after every sampled Block 1 symbol.
+-    let block2_start = best_block1_start.checked_add(block1_symbols.checked_mul(sps)?)?;
++    let block2_start = block1_start.checked_add(CODED_BLOCK1_SYMBOLS.checked_mul(sps)?)?;
+ 
+     let remaining_samples = if block2_start < demod.len() {
+         demod.len() - block2_start
+@@ -1196,12 +1284,6 @@
+ 
+     let channel = freq_to_channel(freq);
+     let is_data = aa != BLE_ADV_AA;
+-    let crc_init_val = if aa == BLE_ADV_AA {
+-        Some((0x555555u32, false))
+-    } else {
+-        crc_init_fn(aa)
+-    };
+-
+     // Try BOTH S=8 and S=2 for Block 2.
+     // The CI decode from Block 1 may have errors, and trying both is cheap.
+     // Order: CI-indicated value first, then the alternative.
+@@ -1348,7 +1430,7 @@
+     // PDU + CRC (already dewhitened)
+     data[5..].copy_from_slice(pdu_crc_bytes);
+ 
+-    let ext_header = if crc_valid && pdu_crc_bytes.len() > 0 {
++    let ext_header = if !is_data && crc_valid && !pdu_crc_bytes.is_empty() {
+         parse_ext_adv(&pdu_crc_bytes[..2 + pdu_length])
+     } else {
+         None
+@@ -1359,7 +1441,7 @@
+         freq,
+         len: pkt_len,
+         data,
+-        timestamp: timestamp_with_sample_offset(&timestamp, preamble_start, sps),
++        timestamp: timestamp_with_sample_offset(timestamp, preamble_start, sps),
+         rssi_db: 0,
+         noise_db: 0,
+         crc_checked,
+@@ -1801,17 +1883,28 @@
+     }
+ 
+     fn coded_scan_fixture(pdu: &[u8], ci: u8, valid_crc: bool) -> Vec<f32> {
++        coded_scan_fixture_on_channel(pdu, ci, BLE_ADV_AA, 0x555555, 37, valid_crc)
++    }
++
++    fn coded_scan_fixture_on_channel(
++        pdu: &[u8],
++        ci: u8,
++        access_address: u32,
++        crc_init: u32,
++        channel: u32,
++        valid_crc: bool,
++    ) -> Vec<f32> {
+         use crate::fec;
+ 
+         let bits = |byte: u8| (0..8).map(move |bit| (byte >> bit) & 1);
+-        let mut block1: Vec<_> = BLE_ADV_AA.to_le_bytes().into_iter().flat_map(bits).collect();
++        let mut block1: Vec<_> = access_address.to_le_bytes().into_iter().flat_map(bits).collect();
+         block1.extend_from_slice(&[ci, 0]);
+-        let crc = crc24(pdu, 0x555555) ^ u32::from(!valid_crc);
++        let crc = crc24(pdu, crc_init) ^ u32::from(!valid_crc);
+         let pdu_crc = pdu.iter().copied().chain(crc.to_le_bytes().into_iter().take(3));
+         let block2: Vec<_> = pdu_crc
+             .flat_map(bits)
+             .enumerate()
+-            .map(|(index, bit)| bit ^ whitening_bit(37, index as u32))
++            .map(|(index, bit)| bit ^ whitening_bit(channel, index as u32))
+             .collect();
+         let encoded = fec::conv_encode(&block2);
+         let block2 = if ci == 0 {
+@@ -1830,6 +1923,108 @@
+     }
+ 
+     #[test]
++    fn continuous_coded_scan_checks_exact_connected_address_and_crc() {
++        // Access address and CRC initialization from Core Vol 6 Part C's
++        // data-channel sample. Use nonempty ACL data without CTEInfo.
++        let aa = 0xaa08_192b;
++        let crc_init = 0xc4c181;
++        let frequency = 2444;
++        let channel = freq_to_channel(frequency);
++        let pdu = [0x16, 5, 1, 2, 3, 4, 5];
++        let timestamp = Timespec { tv_sec: 0, tv_nsec: 0 };
++        assert!((aa ^ BLE_ADV_AA).count_ones() > BLE_MAX_HD);
++
++        for ci in [0, 1] {
++            let mut demod = vec![0.0; 512];
++            demod.extend(coded_scan_fixture_on_channel(&pdu, ci, aa, crc_init, channel, true));
++            demod.extend(std::iter::repeat_n(0.0, 256));
++
++            let packets =
++                ble_coded_scan_packets(&demod, frequency, timestamp.clone(), &mut |address| {
++                    (address == aa).then_some((crc_init, true))
++                });
++            assert_eq!(packets.len(), 1);
++            let packet = &packets[0];
++            assert_eq!(packet.aa, aa);
++            assert!(packet.is_data && packet.conn_valid && packet.crc_checked && packet.crc_valid);
++            assert_eq!(packet.data[4], ci);
++            assert_eq!(&packet.data[5..5 + pdu.len()], &pdu);
++            assert_eq!(&packet.data[5 + pdu.len()..], &[0x45, 0xd0, 0xd2]);
++
++            for context in [None, Some((crc_init ^ 1, true)), Some((crc_init, false))] {
++                let packets =
++                    ble_coded_scan_packets(&demod, frequency, timestamp.clone(), &mut |address| {
++                        (address == aa).then_some(context).flatten()
++                    });
++                assert!(packets.is_empty(), "accepted unverified context {context:?}");
++            }
++
++            for check_crc in [false, true] {
++                let ordinary = ble_coded_burst(
++                    &demod,
++                    frequency,
++                    timestamp.clone(),
++                    BLE_SPS,
++                    check_crc,
++                    |address| (address == aa).then_some((crc_init, true)),
++                );
++                assert!(ordinary.is_none_or(|packet| !packet.is_data));
++            }
++
++            let mut truncated = vec![0.0; 512];
++            truncated.extend(coded_scan_fixture_on_channel(
++                &pdu, ci, aa, crc_init, channel, true,
++            ));
++            let coding_s = if ci == 0 { 8 } else { 2 };
++            truncated.truncate(truncated.len() - 3 * coding_s * BLE_SPS);
++            let packets =
++                ble_coded_scan_packets(&truncated, frequency, timestamp.clone(), &mut |address| {
++                    (address == aa).then_some((crc_init, true))
++                });
++            assert!(packets.is_empty(), "accepted truncated packet without TERM2 extent");
++
++            let mut corrupt = vec![0.0; 512];
++            corrupt.extend(coded_scan_fixture_on_channel(
++                &pdu, ci, aa, crc_init, channel, false,
++            ));
++            let packets =
++                ble_coded_scan_packets(&corrupt, frequency, timestamp.clone(), &mut |address| {
++                    (address == aa).then_some((crc_init, true))
++                });
++            assert!(
++                packets.is_empty(),
++                "accepted corrupt packet with a known address"
++            );
++        }
++    }
++
++    #[test]
++    fn continuous_coded_scan_preserves_advertising_address_tolerance() {
++        let pdu = [0x02, 0x06, 1, 2, 3, 4, 5, 6];
++        let address_with_error = BLE_ADV_AA ^ 1;
++        let frequency = 2444;
++        let timestamp = Timespec { tv_sec: 0, tv_nsec: 0 };
++        let mut demod = vec![0.0; 512];
++        demod.extend(coded_scan_fixture_on_channel(
++            &pdu,
++            1,
++            address_with_error,
++            0x555555,
++            freq_to_channel(frequency),
++            true,
++        ));
++        let packets = ble_coded_scan_packets(&demod, frequency, timestamp, &mut |address| {
++            (address == address_with_error).then_some((0xc4c181, true))
++        });
++
++        assert_eq!(packets.len(), 1);
++        assert_eq!(packets[0].aa, BLE_ADV_AA);
++        assert!(!packets[0].is_data && !packets[0].conn_valid);
++        assert!(packets[0].crc_checked && packets[0].crc_valid);
++        assert_eq!(&packets[0].data[5..5 + pdu.len()], &pdu);
++    }
++
++    #[test]
+     fn continuous_coded_scan_recovers_both_phases_after_a_bad_crc() {
+         let pdu = [0x02, 0x06, 1, 2, 3, 4, 5, 6];
+         for indicators in [[0, 1], [1, 0]] {

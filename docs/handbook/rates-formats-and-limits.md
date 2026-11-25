@@ -110,9 +110,11 @@ rejects this packed format; do not infer asynchronous support from the format
 enum alone.
 
 SoapySDR also distinguishes a requested stream format from the native stream
-format and its full-scale value. Use those queries rather than assuming every
-signed 16-bit I/Q stream has the same normalization. See its
-[native-format API](https://pothosware.github.io/SoapySDR/doxygen/latest/classSoapySDR_1_1Device.html).
+format and its full-scale value. Use the
+[native-format query](https://github.com/kevinmehall/rust-soapysdr/blob/92211fe904f6683f57278cda0bd71344bc43fb9a/src/device.rs#L460-L476)
+to check normalization. The pinned
+[SoapyBladeRF implementation](https://github.com/pothosware/SoapyBladeRF/blob/d0279d584daef1a90daee3703216627de7de1bae/bladeRF_Streaming.cpp#L34-L43)
+shows the formats and scale for that driver.
 
 ## Record requests, readbacks, and observations separately
 

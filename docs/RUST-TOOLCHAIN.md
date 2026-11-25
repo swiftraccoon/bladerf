@@ -19,7 +19,7 @@ features, both enabled by default:
 
 | Feature | Function | Native prerequisites |
 | --- | --- | --- |
-| `radio` | Receive capture and finite stream checks through `soapysdr` | SoapySDR development files, SoapyBladeRF plugin, libbladeRF |
+| `radio` | Receive capture and finite stream checks through `soapysdr` | SoapySDR development files, SoapyBladeRF plugin, libbladeRF, C toolchain for `ring` |
 | `analysis` | IQ statistics and FFT/PNG plots | Native font support used by Plotters |
 | Neither | Diagnostics, verified image downloads and setup commands | A host C linker and the external tools invoked by the selected command |
 
@@ -80,9 +80,26 @@ toolchain and root lockfile. Its default `decode` feature enables the pinned
 `crafter` dependency's `radio` feature for offline legacy OFDM, DSSS/CCK and
 single-stream HT20 decoding. The dependency requires the platform's **libpcap
 development/link library**, even though this project feeds it saved IQ rather
-than a libpcap device. The dependency specifies an exact Git revision, matching
-the [libcrafter submodule](../repos/libcrafter); the submodule retains the source
-and independent waveform fixtures for review and upstream tests.
+than a libpcap device. The dependency uses the
+[libcrafter submodule](../repos/libcrafter) at fetchable `v0.3.5` revision
+`f9ef000b` plus the tracked
+[OFDM observability/recovery patch](../patches/libcrafter-ofdm-observability-recovery.patch),
+then resolves that patched package through a repository-relative path. The
+combined patch reproduces the qualified linear endpoint `f4266c51` through
+commits `261c4b44`, `5f2167e4`, `17fe56c9` and `f4266c51`; later experimental
+MCS7 shadow changes are excluded. The submodule also retains independent
+waveform fixtures for review and upstream tests. Before a default-feature build,
+apply the complete [ordered patch set](../projects/wifi-monitor/docs/guide.md#build-and-check).
+It includes a
+[terminal DATA-failure accounting patch](../patches/libcrafter-ofdm-data-failure-accounting.patch)
+that adds closed legacy, HT-BCC and HT-LDPC failure counters. The
+[Barker equalization patch](../patches/libcrafter-dsss-barker-equalization.patch)
+adds a trained fallback for 1 and 2 Mbps DSSS. The
+[HE signal patch](../patches/libcrafter-he20-su-signal.patch) provides the HE20
+header diagnostic API used by the decoder. A separate
+[Rust-2021 formatting-boundary patch](../patches/libcrafter-rustfmt-boundary.patch)
+prevents root stable-workspace formatting checks from restyling the nested
+upstream repository; it changes no compiled code.
 
 ```sh
 cargo build --locked -p wifi-monitor --release
@@ -106,7 +123,7 @@ Its reproducibility inputs are
 [pinned submodule](../repos/FutureSDR) and
 [passive receive/FCS patch](../patches/futuresdr-wlan-passive-rx.patch).
 Build it with explicit `--bin rx` and the `soapy` feature, using the
-[project instructions](../projects/wifi-monitor/README.md#build-the-optional-live-engine).
+[project instructions](../projects/wifi-monitor/docs/guide.md#build-the-optional-live-engine).
 Runtime reception requires SoapySDR, SoapyBladeRF and libbladeRF.
 
 ## RF observatory
@@ -115,12 +132,14 @@ Runtime reception requires SoapySDR, SoapyBladeRF and libbladeRF.
 toolchain and lockfile. Its Rust references, saved-IQ processing and controlled
 waveform generation need no native SDR library. Live ordinary-IQ recording
 launches the separately built `bladerf-lab` radio adapter.
+Building the observatory or [digital monitor](../projects/digital-monitor/README.md)
+requires a C toolchain for `ring`'s bundled SHA-256 backend.
 
 The FPGA arithmetic and stream wrapper are VHDL-2008, integrated into Nuand's
 existing VHDL design. This target-specific hardware description is separate
-from the Rust host code. HDL verification uses **GHDL 3.0.0** for simulation and
+from the Rust host code. HDL verification uses **GHDL 6.0.0** for simulation and
 generic synthesis. That does not produce a device bitstream or establish timing.
 Cyclone V builds use **Quartus Prime Lite 23.1.1**, Cyclone V device support and
-matching Nios II tools. The pinned upstream source originally specified 20.1.1;
-the selected version follows Nuand's current build guidance. See the
-[HDL build guide](../projects/rf-observatory/hdl/README.md) for exact stages.
+matching Nios II tools. See the
+[HDL build guide](../projects/rf-observatory/hdl/README.md) for toolchain setup
+and the checks required to qualify an image.

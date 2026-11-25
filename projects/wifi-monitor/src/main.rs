@@ -64,6 +64,10 @@ enum Action {
     },
     /// Decode an existing 20 MSps IQ file in a bounded worker, without a radio.
     DecodeIq(Replay),
+    /// Decode HE20 single-user payloads from saved 20 MSps IQ with the pinned receiver.
+    DecodeHeIq(ModernReplay),
+    /// Decode VHT20 single-user payloads from saved 20 MSps IQ with the pinned receiver.
+    DecodeVhtIq(ModernReplay),
     #[command(hide = true)]
     DecodeWorker(Worker),
 }
@@ -144,18 +148,78 @@ struct Receive {
 }
 
 #[derive(Debug, Args)]
-struct Replay {
+struct ReplayInput {
     input: PathBuf,
     #[arg(long, value_enum, default_value = "sc16q11")]
     format: InputFormat,
     #[arg(long, default_value_t = 2412)]
     frequency_mhz: u32,
+    /// Actual IQ tuning in hertz when the Wi-Fi channel center differs.
+    #[arg(long)]
+    capture_frequency_hz: Option<u64>,
     #[arg(long, default_value_t = 20_000_000)]
     max_samples: u64,
     #[arg(long, default_value_t = 120.0)]
     decode_timeout: f64,
+    /// Double SC16 Q11 components before translation and CS8 conversion.
+    #[arg(long)]
+    double_q11: bool,
     #[arg(long)]
     output: Option<PathBuf>,
+}
+
+impl ReplayInput {
+    fn validate(&self) -> Result<(PathBuf, u64, Duration)> {
+        let budget = positive_seconds(self.decode_timeout, 3600.0, "decode timeout")?;
+        ensure!(
+            (1..=200_000_000).contains(&self.max_samples),
+            "max samples must be 1..=200000000"
+        );
+        ensure!(
+            (70..=6000).contains(&self.frequency_mhz),
+            "frequency MHz must be 70..=6000"
+        );
+        ensure!(
+            !self.double_q11 || matches!(self.format, InputFormat::Sc16q11),
+            "--double-q11 requires SC16 Q11 input"
+        );
+        let frequency_hz = u64::from(self.frequency_mhz) * 1_000_000;
+        replay_frequency_shift(self.capture_frequency_hz, frequency_hz)?;
+        Ok((self.input.canonicalize()?, frequency_hz, budget))
+    }
+}
+
+#[derive(Debug, Args)]
+struct Replay {
+    #[command(flatten)]
+    iq: ReplayInput,
+    /// Save decoder-reported sample spans in candidate PCAP record order.
+    #[arg(long)]
+    frame_spans: bool,
+    /// Save sample positions and fields of observed integrity-checked HT headers.
+    #[arg(long)]
+    ht_signal_events: bool,
+    /// Save sample positions and fields of validated HE20 single-user headers.
+    #[arg(long)]
+    he_su_signal_events: bool,
+    /// Save aggregate decoding errors with their preamble sample positions.
+    #[arg(long)]
+    ampdu_error_events: bool,
+}
+
+#[derive(Debug, Args)]
+struct ModernReplay {
+    #[command(flatten)]
+    iq: ReplayInput,
+    /// Executable built from the pinned libcrafter radio_receive example.
+    #[arg(long)]
+    decoder: PathBuf,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModernPhy {
+    He20Su,
+    Vht20Su,
 }
 
 #[derive(Debug, Args)]
@@ -168,9 +232,39 @@ struct Worker {
     #[arg(long)]
     frequency_hz: u64,
     #[arg(long)]
+    capture_frequency_hz: Option<u64>,
+    #[arg(long)]
     max_samples: u64,
     #[arg(long)]
     time_origin_ns: Option<u128>,
+    #[arg(long)]
+    frame_spans: bool,
+    #[arg(long)]
+    ht_signal_events: bool,
+    #[arg(long)]
+    he_su_signal_events: bool,
+    #[arg(long)]
+    ampdu_error_events: bool,
+    #[arg(long)]
+    double_q11: bool,
+}
+
+fn replay_frequency_shift(capture_hz: Option<u64>, center_hz: u64) -> Result<Option<i64>> {
+    let Some(capture_hz) = capture_hz else {
+        return Ok(None);
+    };
+    ensure!(capture_hz != 0, "capture frequency must be nonzero");
+    let distance = capture_hz.abs_diff(center_hz);
+    ensure!(
+        distance <= 5_000_000,
+        "capture frequency must lie within 5 MHz of the Wi-Fi channel center"
+    );
+    let shift = if capture_hz < center_hz {
+        -(distance as i64)
+    } else {
+        distance as i64
+    };
+    Ok((shift != 0).then_some(shift))
 }
 
 fn frequency(band: Band, channel: Option<u16>) -> Result<(u16, u64)> {
@@ -331,9 +425,10 @@ fn inspect(input: &Path, directory: &Path) -> Result<()> {
         )
     })?;
     json_file(&directory.join("summary.json"), &summary)?;
-    println!("{}", serde_json::to_string_pretty(&summary)?);
-    println!("Output directory: {}", directory.display());
-    Ok(())
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{}", serde_json::to_string_pretty(&summary)?)?;
+    writeln!(stdout, "Output directory: {}", directory.display())?;
+    stdout.flush().context("flush inspection output")
 }
 
 /// Owns and reaps one subprocess. Explicit shutdown waits up to five seconds
@@ -350,6 +445,10 @@ impl OwnedChild {
             .stdout(f.try_clone()?)
             .stderr(f)
             .stdin(Stdio::null());
+        Self::spawn_configured(command)
+    }
+
+    fn spawn_configured(command: &mut Command) -> Result<Self> {
         Ok(Self {
             child: command.spawn().context("start worker")?,
             reaped: false,
@@ -494,6 +593,26 @@ fn decode_worker(
     if let Some(origin) = worker.time_origin_ns {
         command.arg("--time-origin-ns").arg(origin.to_string());
     }
+    if let Some(capture_hz) = worker.capture_frequency_hz {
+        command
+            .arg("--capture-frequency-hz")
+            .arg(capture_hz.to_string());
+    }
+    if worker.frame_spans {
+        command.arg("--frame-spans");
+    }
+    if worker.ht_signal_events {
+        command.arg("--ht-signal-events");
+    }
+    if worker.he_su_signal_events {
+        command.arg("--he-su-signal-events");
+    }
+    if worker.ampdu_error_events {
+        command.arg("--ampdu-error-events");
+    }
+    if worker.double_q11 {
+        command.arg("--double-q11");
+    }
     run_completed(&mut command, &directory.join("decoder.log"), budget, stop)?;
     inspect(&worker.pcap, directory)
 }
@@ -632,8 +751,14 @@ fn capture_iq(
             pcap: directory.join("candidates.pcap"),
             format: InputFormat::Sc16q11,
             frequency_hz: hz,
+            capture_frequency_hz: None,
             max_samples: samples,
             time_origin_ns: Some(origin),
+            frame_spans: false,
+            ht_signal_events: false,
+            he_su_signal_events: false,
+            ampdu_error_events: false,
+            double_q11: false,
         },
         directory,
         Duration::from_secs_f64(args.radio.decode_timeout),
@@ -779,6 +904,45 @@ fn capture_into(
     }
 }
 
+fn replay_modern(root: &Path, args: ModernReplay, phy: ModernPhy, stop: &AtomicBool) -> Result<()> {
+    #[cfg(feature = "decode")]
+    {
+        let (input, frequency_hz, budget) = args.iq.validate()?;
+        let decoder = args
+            .decoder
+            .canonicalize()
+            .context("resolve replay decoder")?;
+        let (default_output, receipt) = match phy {
+            ModernPhy::He20Su => ("artifacts/wifi-he-decoded", "he-replay.json"),
+            ModernPhy::Vht20Su => ("artifacts/wifi-vht-decoded", "vht-replay.json"),
+        };
+        let directory = output(root, args.iq.output.as_deref(), default_output)?;
+        let evidence = decode::modern::replay(decode::modern::Request {
+            input: &input,
+            directory: &directory,
+            decoder: &decoder,
+            format: match args.iq.format {
+                InputFormat::Sc16q11 => decode::IqFormat::Sc16Q11,
+                InputFormat::Cs8 => decode::IqFormat::Cs8,
+            },
+            frequency_hz,
+            capture_frequency_hz: args.iq.capture_frequency_hz,
+            max_samples: args.iq.max_samples,
+            double_q11: args.iq.double_q11,
+            budget,
+            stop,
+            phy,
+        })?;
+        inspect(&directory.join("candidates.pcap"), &directory)?;
+        json_file(&directory.join(receipt), &evidence)
+    }
+    #[cfg(not(feature = "decode"))]
+    {
+        let _ = (root, &args.iq, &args.decoder, phy, stop);
+        bail!("IQ decoding was disabled at build time");
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     if let Action::DecodeWorker(worker) = cli.command {
         #[cfg(feature = "decode")]
@@ -792,11 +956,20 @@ fn run(cli: Cli) -> Result<()> {
                     InputFormat::Cs8 => decode::IqFormat::Cs8,
                 },
                 worker.max_samples,
-                worker.time_origin_ns,
+                decode::DecodeSettings {
+                    time_origin_ns: worker.time_origin_ns,
+                    frame_spans: worker.frame_spans,
+                    ht_signal_events: worker.ht_signal_events,
+                    he_su_signal_events: worker.he_su_signal_events,
+                    ampdu_error_events: worker.ampdu_error_events,
+                    capture_frequency_hz: worker.capture_frequency_hz,
+                    double_q11: worker.double_q11,
+                },
             )?;
             json_file(&worker.pcap.with_extension("decode.json"), &summary)?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-            return Ok(());
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{}", serde_json::to_string_pretty(&summary)?)?;
+            return stdout.flush().context("flush decoder summary");
         }
         #[cfg(not(feature = "decode"))]
         {
@@ -807,7 +980,11 @@ fn run(cli: Cli) -> Result<()> {
     let root = if cli.workspace.is_none()
         && matches!(
             cli.command,
-            Action::Inspect { .. } | Action::DecodeIq(_) | Action::Inventory(_)
+            Action::Inspect { .. }
+                | Action::DecodeIq(_)
+                | Action::DecodeHeIq(_)
+                | Action::DecodeVhtIq(_)
+                | Action::Inventory(_)
         ) {
         workspace(None).or_else(|_| std::env::current_dir())?
     } else {
@@ -845,30 +1022,33 @@ fn run(cli: Cli) -> Result<()> {
         Action::Watch(args) => monitor::watch(&root, cli.receiver.as_deref(), args, &stop)?,
         Action::Inventory(args) => monitor::inventory(&root, args, &stop)?,
         Action::DecodeIq(args) => {
-            let budget = positive_seconds(args.decode_timeout, 3600.0, "decode timeout")?;
-            ensure!(
-                (1..=200_000_000).contains(&args.max_samples),
-                "max samples must be 1..=200000000"
-            );
-            ensure!(
-                (70..=6000).contains(&args.frequency_mhz),
-                "frequency MHz must be 70..=6000"
-            );
-            let input = args.input.canonicalize()?;
-            let directory = output(&root, args.output.as_deref(), "artifacts/wifi-decoded")?;
+            let (input, frequency_hz, budget) = args.iq.validate()?;
+            let directory = output(&root, args.iq.output.as_deref(), "artifacts/wifi-decoded")?;
             decode_worker(
                 &Worker {
                     input,
                     pcap: directory.join("candidates.pcap"),
-                    format: args.format,
-                    frequency_hz: u64::from(args.frequency_mhz) * 1_000_000,
-                    max_samples: args.max_samples,
+                    format: args.iq.format,
+                    frequency_hz,
+                    capture_frequency_hz: args.iq.capture_frequency_hz,
+                    max_samples: args.iq.max_samples,
                     time_origin_ns: None,
+                    frame_spans: args.frame_spans,
+                    ht_signal_events: args.ht_signal_events,
+                    he_su_signal_events: args.he_su_signal_events,
+                    ampdu_error_events: args.ampdu_error_events,
+                    double_q11: args.iq.double_q11,
                 },
                 &directory,
                 budget,
                 &stop,
             )?;
+        }
+        Action::DecodeHeIq(args) => {
+            replay_modern(&root, args, ModernPhy::He20Su, &stop)?;
+        }
+        Action::DecodeVhtIq(args) => {
+            replay_modern(&root, args, ModernPhy::Vht20Su, &stop)?;
         }
         Action::Inspect { .. } | Action::DecodeWorker(_) => unreachable!(),
     }
@@ -879,7 +1059,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{e:#}");
+            let _ = writeln!(std::io::stderr().lock(), "{e:#}");
             ExitCode::FAILURE
         }
     }
@@ -888,6 +1068,21 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_iq_translation_accepts_the_mirrored_five_megahertz_boundary() {
+        let center_hz = 2_437_000_000;
+        for (capture_hz, shift_hz) in [(2_432_000_000, -5_000_000), (2_442_000_000, 5_000_000)] {
+            assert_eq!(
+                replay_frequency_shift(Some(capture_hz), center_hz).unwrap(),
+                Some(shift_hz),
+            );
+        }
+        for capture_hz in [2_431_999_999, 2_442_000_001] {
+            assert!(replay_frequency_shift(Some(capture_hz), center_hz).is_err());
+        }
+    }
+
     #[test]
     fn validates_channel_math_and_iq_bounds_before_receiver() {
         assert_eq!(

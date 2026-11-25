@@ -1,0 +1,21 @@
+[package]
+name = "ieee802154-futuresdr-worker"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Bounded file-only FutureSDR IEEE 802.15.4 demodulation worker"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { features = ["derive"], version = "4" }
+futuresdr = { path = "../../../repos/FutureSDR", default-features = false }
+zigbee = { path = "../../../repos/FutureSDR/examples/zigbee", default-features = false }
+
+[dev-dependencies]
+futuresdr = { path = "../../../repos/FutureSDR", default-features = false, features = ["mocker"] }
+ieee802154-monitor = { path = ".." }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"

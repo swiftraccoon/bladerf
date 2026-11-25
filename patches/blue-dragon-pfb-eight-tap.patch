@@ -1,0 +1,89 @@
+--- a/crates/dsp/src/pfb.rs
++++ b/crates/dsp/src/pfb.rs
+@@ -161,12 +161,13 @@
+ /// with SSE2 fallback for remainders.
+ #[cfg(target_arch = "x86_64")]
+ #[target_feature(enable = "avx2")]
+-unsafe fn dotprod_avx2(
++unsafe fn dotprod_avx2<const EIGHT_TAPS: bool>(
+     r: *const i16,
+     i_data: *const i16,
+     coeffs: *const i16,
+     len: usize,
+ ) -> (i32, i32) {
++    let len = if EIGHT_TAPS { 8 } else { len };
+     let mut r_acc256 = _mm256_setzero_si256();
+     let mut i_acc256 = _mm256_setzero_si256();
+     let mut j = 0usize;
+@@ -281,14 +282,19 @@
+ ) -> (i32, i32) {
+     match simd {
+         #[cfg(target_arch = "x86_64")]
+-        SimdLevel::Avx2 => unsafe {
+-            dotprod_avx2(
+-                w.r.as_ptr().add(w.read_index),
+-                w.i.as_ptr().add(w.read_index),
+-                coeffs_ptr,
+-                len,
+-            )
+-        },
++        SimdLevel::Avx2 => {
++            // SAFETY: detect_simd verified AVX2. Each delay line window and
++            // the selected coefficient phase contain len contiguous elements.
++            unsafe {
++                let real = w.r.as_ptr().add(w.read_index);
++                let imag = w.i.as_ptr().add(w.read_index);
++                if len == 8 {
++                    dotprod_avx2::<true>(real, imag, coeffs_ptr, len)
++                } else {
++                    dotprod_avx2::<false>(real, imag, coeffs_ptr, len)
++                }
++            }
++        }
+         #[cfg(target_arch = "x86_64")]
+         SimdLevel::Sse2 => unsafe {
+             dotprod_sse2(
+@@ -449,6 +455,43 @@
+ mod tests {
+     use super::*;
+
++    #[cfg(target_arch = "x86_64")]
++    #[test]
++    fn eight_tap_avx2_preserves_wrapping_dot_products() {
++        if !is_x86_feature_detected!("avx2") {
++            return;
++        }
++
++        let extremes = [i16::MIN, i16::MAX, 0, -1, 1, -2048, 2047, 107];
++        let mixed = std::array::from_fn::<_, 24, _>(|index| extremes[index % extremes.len()]);
++        let negative = [i16::MIN; 24];
++        let positive = [i16::MAX; 24];
++        let wrapping_dot = |samples: &[i16], coefficients: &[i16]| {
++            samples
++                .iter()
++                .zip(coefficients)
++                .map(|(&sample, &coefficient)| i64::from(sample) * i64::from(coefficient))
++                .sum::<i64>() as i32
++        };
++
++        for coefficients in [&negative, &positive, &mixed] {
++            for offset in 0..16 {
++                let real = &negative[offset..offset + 8];
++                let imag = &mixed[offset..offset + 8];
++                let coefficients = &coefficients[offset..offset + 8];
++                let expected = (
++                    wrapping_dot(real, coefficients),
++                    wrapping_dot(imag, coefficients),
++                );
++                // SAFETY: AVX2 was checked above and each slice contains eight values.
++                let actual = unsafe {
++                    dotprod_avx2::<true>(real.as_ptr(), imag.as_ptr(), coefficients.as_ptr(), 8)
++                };
++                assert_eq!(actual, expected, "tap offset {offset}");
++            }
++        }
++    }
++
+     #[test]
+     fn test_pfb_construction() {
+         let m = 8;

@@ -1,0 +1,1955 @@
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_channel_bank.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_channel_bank.vhd
+new file mode 100644
+index 00000000..d92ef7b6
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_channel_bank.vhd
+@@ -0,0 +1,217 @@
++-- Four independently tuned complex DDCs with third-order CIC decimation by 20.
++-- Synchronous active-high reset starts a new accepted-sample epoch. Configuration
++-- must remain stable until reset. Input transfer is s_valid AND s_ready; gaps
++-- introduce no numerical samples while accepted tokens drain the pipeline.
++-- Oscillator and accepted index advance only on transfer. This index is not an
++-- RF or wall-clock timestamp. An ADC-facing wrapper must report input loss if
++-- its unstallable source cannot honor s_ready.
++--
++-- Each oscillator uses the high eight bits of its 32-bit phase accumulator.
++-- Downmix=(I*cos+Q*sin, Q*cos-I*sin)>>15, retaining 18 signed bits. Three
++-- 48-bit modular integrators use the current, updated preceding stage. Every
++-- twentieth transfer runs three modular combs. Arithmetic >>13 normalizes the
++-- CIC's gain of 8000 by 8192; the resulting gain is 0.9765625. Output is signed
++-- 16-bit saturated, with a per-channel clipping flag. Raw CIC output is not a
++-- complete broadcast-FM anti-alias filter; a host FIR stage follows it.
++--
++-- The arithmetic is registered as coefficients, products, mixed samples, three
++-- integrators, three combs and saturated output. Each token uses the updated
++-- preceding integrator value, preserving the same sample-domain recurrence.
++-- Output valid follows its twentieth input by nine advancing clocks. A blocked
++-- output freezes all pipeline tokens/state and holds data/index/clipping until
++-- transfer. Reset discards every pending token. No accepted input is silently
++-- discarded. This portable RTL uses no vendor FFT/DDS IP.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++library work;
++use work.rf_observatory_p.all;
++
++entity rf_channel_bank is
++    port (
++        clock              : in std_logic;
++        reset              : in std_logic;
++        phase_steps        : in phase_steps_t;
++        s_valid            : in std_logic;
++        s_ready            : out std_logic;
++        s_i                : in signed(15 downto 0);
++        s_q                : in signed(15 downto 0);
++        m_valid            : out std_logic;
++        m_ready            : in std_logic;
++        m_i                : out iq_words_t;
++        m_q                : out iq_words_t;
++        m_clipped          : out std_logic_vector(3 downto 0);
++        m_last_input_index : out unsigned(63 downto 0)
++    );
++end entity;
++
++architecture rtl of rf_channel_bank is
++    subtype accumulator_t is signed(47 downto 0);
++    type states_t is array (0 to 3, 0 to 2) of accumulator_t;
++    type products_t is array (0 to 3) of signed(31 downto 0);
++    type mixed_words_t is array (0 to 3) of signed(17 downto 0);
++    type indices_t is array (0 to 8) of unsigned(63 downto 0);
++    signal phase : phase_steps_t := (others => (others => '0'));
++    signal input_i, input_q : signed(15 downto 0) := (others => '0');
++    signal sine, cosine : iq_words_t := (others => (others => '0'));
++    signal product_ic, product_qs, product_qc, product_is : products_t := (others => (others => '0'));
++    signal mixed_i, mixed_q : mixed_words_t := (others => (others => '0'));
++    signal integrator_i, integrator_q : states_t := (others => (others => (others => '0')));
++    signal comb_delay_i, comb_delay_q : states_t := (others => (others => (others => '0')));
++    signal comb_result_i, comb_result_q : states_t := (others => (others => (others => '0')));
++    -- Stages 0..5 carry every accepted sample; 6..8 carry only decimated groups.
++    signal token_valid : std_logic_vector(0 to 8) := (others => '0');
++    signal token_decimate : std_logic_vector(0 to 5) := (others => '0');
++    signal token_index : indices_t := (others => (others => '0'));
++    signal count : natural range 0 to 19 := 0;
++    signal index : unsigned(63 downto 0) := (others => '0');
++    signal advance : std_logic;
++    signal valid : std_logic := '0';
++    signal output_i, output_q : iq_words_t := (others => (others => '0'));
++    signal clipped : std_logic_vector(3 downto 0) := (others => '0');
++    signal last_index : unsigned(63 downto 0) := (others => '0');
++
++    function saturate(value : accumulator_t) return signed is
++    begin
++        if value > to_signed(32767, value'length) then
++            return to_signed(32767, 16);
++        elsif value < to_signed(-32768, value'length) then
++            return to_signed(-32768, 16);
++        end if;
++        return resize(value, 16);
++    end function;
++begin
++    advance <= not valid or m_ready;
++    s_ready <= advance and not reset;
++    m_valid <= valid;
++    m_i <= output_i;
++    m_q <= output_q;
++    m_clipped <= clipped;
++    m_last_input_index <= last_index;
++
++    process(clock)
++        variable rom_index : natural range 0 to 255;
++        variable sum_i, sum_q : signed(32 downto 0);
++        variable normalized_i, normalized_q : accumulator_t;
++    begin
++        if rising_edge(clock) then
++            if reset = '1' then
++                phase <= (others => (others => '0'));
++                input_i <= (others => '0'); input_q <= (others => '0');
++                sine <= (others => (others => '0'));
++                cosine <= (others => (others => '0'));
++                product_ic <= (others => (others => '0'));
++                product_qs <= (others => (others => '0'));
++                product_qc <= (others => (others => '0'));
++                product_is <= (others => (others => '0'));
++                mixed_i <= (others => (others => '0'));
++                mixed_q <= (others => (others => '0'));
++                integrator_i <= (others => (others => (others => '0')));
++                integrator_q <= (others => (others => (others => '0')));
++                comb_delay_i <= (others => (others => (others => '0')));
++                comb_delay_q <= (others => (others => (others => '0')));
++                comb_result_i <= (others => (others => (others => '0')));
++                comb_result_q <= (others => (others => (others => '0')));
++                token_valid <= (others => '0');
++                token_decimate <= (others => '0');
++                token_index <= (others => (others => '0'));
++                count <= 0;
++                index <= (others => '0');
++                valid <= '0';
++                output_i <= (others => (others => '0'));
++                output_q <= (others => (others => '0'));
++                clipped <= (others => '0');
++                last_index <= (others => '0');
++            elsif advance = '1' then
++                valid <= '0';
++                token_valid(0) <= s_valid;
++                token_valid(1 to 5) <= token_valid(0 to 4);
++                token_valid(6) <= token_valid(5) and token_decimate(5);
++                token_valid(7 to 8) <= token_valid(6 to 7);
++                token_decimate(0) <= '0';
++                token_decimate(1 to 5) <= token_decimate(0 to 4);
++                for stage in 1 to 8 loop
++                    token_index(stage) <= token_index(stage - 1);
++                end loop;
++
++                if s_valid = '1' then
++                    input_i <= s_i; input_q <= s_q;
++                    token_index(0) <= index;
++                    for channel in 0 to 3 loop
++                        rom_index := to_integer(phase(channel)(31 downto 24));
++                        sine(channel) <= to_signed(SINE_Q15(rom_index), 16);
++                        cosine(channel) <= to_signed(SINE_Q15((rom_index + 64) mod 256), 16);
++                        phase(channel) <= phase(channel) + phase_steps(channel);
++                    end loop;
++                    if count = 19 then
++                        count <= 0;
++                        token_decimate(0) <= '1';
++                    else
++                        count <= count + 1;
++                    end if;
++                    index <= index + 1;
++                end if;
++
++                for channel in 0 to 3 loop
++                    if token_valid(0) = '1' then
++                        product_ic(channel) <= input_i * cosine(channel);
++                        product_qs(channel) <= input_q * sine(channel);
++                        product_qc(channel) <= input_q * cosine(channel);
++                        product_is(channel) <= input_i * sine(channel);
++                    end if;
++                    if token_valid(1) = '1' then
++                        sum_i := resize(product_ic(channel), 33) + resize(product_qs(channel), 33);
++                        sum_q := resize(product_qc(channel), 33) - resize(product_is(channel), 33);
++                        mixed_i(channel) <= resize(shift_right(sum_i, 15), 18);
++                        mixed_q(channel) <= resize(shift_right(sum_q, 15), 18);
++                    end if;
++                    if token_valid(2) = '1' then
++                        integrator_i(channel, 0) <= integrator_i(channel, 0) + resize(mixed_i(channel), 48);
++                        integrator_q(channel, 0) <= integrator_q(channel, 0) + resize(mixed_q(channel), 48);
++                    end if;
++                    for stage in 1 to 2 loop
++                        if token_valid(stage + 2) = '1' then
++                            integrator_i(channel, stage) <= integrator_i(channel, stage)
++                                + integrator_i(channel, stage - 1);
++                            integrator_q(channel, stage) <= integrator_q(channel, stage)
++                                + integrator_q(channel, stage - 1);
++                        end if;
++                    end loop;
++                    if token_valid(5) = '1' and token_decimate(5) = '1' then
++                        comb_result_i(channel, 0) <= integrator_i(channel, 2) - comb_delay_i(channel, 0);
++                        comb_result_q(channel, 0) <= integrator_q(channel, 2) - comb_delay_q(channel, 0);
++                        comb_delay_i(channel, 0) <= integrator_i(channel, 2);
++                        comb_delay_q(channel, 0) <= integrator_q(channel, 2);
++                    end if;
++                    for stage in 1 to 2 loop
++                        if token_valid(stage + 5) = '1' then
++                            comb_result_i(channel, stage) <= comb_result_i(channel, stage - 1)
++                                - comb_delay_i(channel, stage);
++                            comb_result_q(channel, stage) <= comb_result_q(channel, stage - 1)
++                                - comb_delay_q(channel, stage);
++                            comb_delay_i(channel, stage) <= comb_result_i(channel, stage - 1);
++                            comb_delay_q(channel, stage) <= comb_result_q(channel, stage - 1);
++                        end if;
++                    end loop;
++                    if token_valid(8) = '1' then
++                        normalized_i := shift_right(comb_result_i(channel, 2), 13);
++                        normalized_q := shift_right(comb_result_q(channel, 2), 13);
++                        output_i(channel) <= saturate(normalized_i);
++                        output_q(channel) <= saturate(normalized_q);
++                        clipped(channel) <= '0';
++                        if normalized_i > to_signed(32767, 48) or normalized_i < to_signed(-32768, 48)
++                            or normalized_q > to_signed(32767, 48) or normalized_q < to_signed(-32768, 48) then
++                            clipped(channel) <= '1';
++                        end if;
++                    end if;
++                end loop;
++                if token_valid(8) = '1' then
++                    valid <= '1';
++                    last_index <= token_index(8);
++                end if;
++            end if;
++        end if;
++    end process;
++end architecture;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_observatory_p.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_observatory_p.vhd
+new file mode 100644
+index 00000000..72c23cd7
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_observatory_p.vhd
+@@ -0,0 +1,46 @@
++-- Shared types and exact Q1.15 oscillator coefficients for the channel bank.
++-- The 256 coefficients equal round(32767*sin(2*pi*k/256)); the Rust fixed-point
++-- reference carries the same literal table and verification checks every output.
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++package rf_observatory_p is
++    type phase_steps_t is array (0 to 3) of unsigned(31 downto 0);
++    type iq_words_t is array (0 to 3) of signed(15 downto 0);
++    type sine_table_t is array (0 to 255) of integer range -32767 to 32767;
++    constant SINE_Q15 : sine_table_t := (
++        0 => 0, 1 => 804, 2 => 1608, 3 => 2410, 4 => 3212, 5 => 4011, 6 => 4808, 7 => 5602,
++        8 => 6393, 9 => 7179, 10 => 7962, 11 => 8739, 12 => 9512, 13 => 10278, 14 => 11039, 15 => 11793,
++        16 => 12539, 17 => 13279, 18 => 14010, 19 => 14732, 20 => 15446, 21 => 16151, 22 => 16846, 23 => 17530,
++        24 => 18204, 25 => 18868, 26 => 19519, 27 => 20159, 28 => 20787, 29 => 21403, 30 => 22005, 31 => 22594,
++        32 => 23170, 33 => 23731, 34 => 24279, 35 => 24811, 36 => 25329, 37 => 25832, 38 => 26319, 39 => 26790,
++        40 => 27245, 41 => 27683, 42 => 28105, 43 => 28510, 44 => 28898, 45 => 29268, 46 => 29621, 47 => 29956,
++        48 => 30273, 49 => 30571, 50 => 30852, 51 => 31113, 52 => 31356, 53 => 31580, 54 => 31785, 55 => 31971,
++        56 => 32137, 57 => 32285, 58 => 32412, 59 => 32521, 60 => 32609, 61 => 32678, 62 => 32728, 63 => 32757,
++        64 => 32767, 65 => 32757, 66 => 32728, 67 => 32678, 68 => 32609, 69 => 32521, 70 => 32412, 71 => 32285,
++        72 => 32137, 73 => 31971, 74 => 31785, 75 => 31580, 76 => 31356, 77 => 31113, 78 => 30852, 79 => 30571,
++        80 => 30273, 81 => 29956, 82 => 29621, 83 => 29268, 84 => 28898, 85 => 28510, 86 => 28105, 87 => 27683,
++        88 => 27245, 89 => 26790, 90 => 26319, 91 => 25832, 92 => 25329, 93 => 24811, 94 => 24279, 95 => 23731,
++        96 => 23170, 97 => 22594, 98 => 22005, 99 => 21403, 100 => 20787, 101 => 20159, 102 => 19519, 103 => 18868,
++        104 => 18204, 105 => 17530, 106 => 16846, 107 => 16151, 108 => 15446, 109 => 14732, 110 => 14010, 111 => 13279,
++        112 => 12539, 113 => 11793, 114 => 11039, 115 => 10278, 116 => 9512, 117 => 8739, 118 => 7962, 119 => 7179,
++        120 => 6393, 121 => 5602, 122 => 4808, 123 => 4011, 124 => 3212, 125 => 2410, 126 => 1608, 127 => 804,
++        128 => 0, 129 => -804, 130 => -1608, 131 => -2410, 132 => -3212, 133 => -4011, 134 => -4808, 135 => -5602,
++        136 => -6393, 137 => -7179, 138 => -7962, 139 => -8739, 140 => -9512, 141 => -10278, 142 => -11039, 143 => -11793,
++        144 => -12539, 145 => -13279, 146 => -14010, 147 => -14732, 148 => -15446, 149 => -16151, 150 => -16846, 151 => -17530,
++        152 => -18204, 153 => -18868, 154 => -19519, 155 => -20159, 156 => -20787, 157 => -21403, 158 => -22005, 159 => -22594,
++        160 => -23170, 161 => -23731, 162 => -24279, 163 => -24811, 164 => -25329, 165 => -25832, 166 => -26319, 167 => -26790,
++        168 => -27245, 169 => -27683, 170 => -28105, 171 => -28510, 172 => -28898, 173 => -29268, 174 => -29621, 175 => -29956,
++        176 => -30273, 177 => -30571, 178 => -30852, 179 => -31113, 180 => -31356, 181 => -31580, 182 => -31785, 183 => -31971,
++        184 => -32137, 185 => -32285, 186 => -32412, 187 => -32521, 188 => -32609, 189 => -32678, 190 => -32728, 191 => -32757,
++        192 => -32767, 193 => -32757, 194 => -32728, 195 => -32678, 196 => -32609, 197 => -32521, 198 => -32412, 199 => -32285,
++        200 => -32137, 201 => -31971, 202 => -31785, 203 => -31580, 204 => -31356, 205 => -31113, 206 => -30852, 207 => -30571,
++        208 => -30273, 209 => -29956, 210 => -29621, 211 => -29268, 212 => -28898, 213 => -28510, 214 => -28105, 215 => -27683,
++        216 => -27245, 217 => -26790, 218 => -26319, 219 => -25832, 220 => -25329, 221 => -24811, 222 => -24279, 223 => -23731,
++        224 => -23170, 225 => -22594, 226 => -22005, 227 => -21403, 228 => -20787, 229 => -20159, 230 => -19519, 231 => -18868,
++        232 => -18204, 233 => -17530, 234 => -16846, 235 => -16151, 236 => -15446, 237 => -14732, 238 => -14010, 239 => -13279,
++        240 => -12539, 241 => -11793, 242 => -11039, 243 => -10278, 244 => -9512, 245 => -8739, 246 => -7962, 247 => -7179,
++        248 => -6393, 249 => -5602, 250 => -4808, 251 => -4011, 252 => -3212, 253 => -2410, 254 => -1608, 255 => -804
++    );
++end package;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2.sdc b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2.sdc
+new file mode 100644
+index 00000000..b92f8c19
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2.sdc
+@@ -0,0 +1,67 @@
++# Profile-2 bundled-control CDC and reset-release constraints.
++#
++# The 160-bit payload is captured in the 80 MHz control domain, held for one
++# complete source cycle before request assertion, and kept stable through the
++# four-phase response. Bound the complete payload path to that 12.5 ns prepare
++# interval. Its destination capture is handshake-qualified rather than
++# edge-related, so ordinary asynchronous-clock hold analysis does not apply.
++
++set profile2_payload_sources [get_registers {
++    *rf_profile2_control_cdc:control_bridge|request_words_control*
++    *rf_profile2_control_cdc:control_bridge|request_epoch_control*
++}]
++set profile2_payload_destinations [get_registers {
++    *rf_profile2_control_cdc:control_bridge|armed_words_rx*
++    *rf_profile2_control_cdc:control_bridge|armed_epoch_rx*
++}]
++
++if {
++    [get_collection_size $profile2_payload_sources] != 160 ||
++    [get_collection_size $profile2_payload_destinations] != 160
++} {
++    error "profile-2 bundled CDC register collection changed"
++}
++
++set_max_delay 12.500 \
++    -from $profile2_payload_sources \
++    -to $profile2_payload_destinations
++set_false_path -hold \
++    -from $profile2_payload_sources \
++    -to $profile2_payload_destinations
++
++# sys_reset_i asynchronously asserts both RX reset-release registers. Their
++# deassertion is intentionally synchronized by the two-register chain, so cut
++# only the asynchronous clear pins; retain normal timing between the registers.
++set profile2_reset_clear_pins [get_pins -compatibility_mode {
++    *rf_profile2_init_reset:U_rf_profile2_init_reset|rx_reset_meta|clrn
++    *rf_profile2_init_reset:U_rf_profile2_init_reset|rx_reset_sync|clrn
++}]
++
++if {[get_collection_size $profile2_reset_clear_pins] != 2} {
++    error "profile-2 reset synchronizer clear-pin collection changed"
++}
++
++set_false_path -to $profile2_reset_clear_pins
++
++# The profile reset is released on the RX/write clock before it reaches the
++# dual-clock sample FIFO.  That FIFO has READ_ACLR_SYNCH enabled, so its two
++# read-side rdaclr registers deliberately receive an asynchronous clear whose
++# release is synchronized internally to the FX3/read clock.  This is the
++# read-side counterpart of the upstream wraclr exception for RX disable.
++set profile2_fifo_reset_source [get_registers {
++    *rf_profile2_init_reset:U_rf_profile2_init_reset|rx_reset_sync
++}]
++set profile2_fifo_read_clear_pins [get_pins -compatibility_mode {
++    *rx_fifo:U_rx_sample_fifo*|dffpipe_*:rdaclr|*|clrn
++}]
++
++if {
++    [get_collection_size $profile2_fifo_reset_source] != 1 ||
++    [get_collection_size $profile2_fifo_read_clear_pins] != 2
++} {
++    error "profile-2 sample-FIFO read-clear collection changed"
++}
++
++set_false_path \
++    -from $profile2_fifo_reset_source \
++    -to $profile2_fifo_read_clear_pins
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_control_cdc.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_control_cdc.vhd
+new file mode 100644
+index 00000000..0bd7ccc0
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_control_cdc.vhd
+@@ -0,0 +1,240 @@
++-- Profile-2 configuration handshake between the Wishbone/system clock and the
++-- AD9361 RX clock. The producer must hold apply_valid until apply_done. This
++-- block captures the 160-bit request payload in the control domain, then holds
++-- that bundled data stable from a full clock before request through response.
++-- A four-phase request/response handshake carries only control levels and the
++-- one-bit result. Keeping the producer busy through return-to-zero prevents a
++-- fast following request from being lost.
++--
++-- control_reset and rx_reset must come from one image-reset event; bounded
++-- assertion/deassertion skew is allowed, but isolated domain reset is not a
++-- recovery protocol. Digital simulation cannot qualify metastability or the
++-- eventual fitted timing constraint on the bundled payload.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++library work;
++use work.rf_observatory_p.all;
++
++entity rf_profile2_control_cdc is
++    port (
++        control_clock : in std_logic;
++        control_reset : in std_logic;
++
++        apply_valid : in std_logic;
++        apply_words : in phase_steps_t;
++        apply_epoch : in unsigned(31 downto 0);
++        apply_done : out std_logic;
++        apply_success : out std_logic;
++        rx_active_sync : out std_logic;
++
++        rx_clock : in std_logic;
++        rx_reset : in std_logic;
++        rx_enable : in std_logic;
++
++        start_pulse : out std_logic;
++        start_authorized : out std_logic;
++        active_valid : out std_logic;
++        active_words : out phase_steps_t;
++        active_epoch : out unsigned(31 downto 0)
++    );
++end entity;
++
++architecture rtl of rf_profile2_control_cdc is
++    type control_state_t is (CONTROL_IDLE, CONTROL_PREPARE_REQUEST,
++        CONTROL_WAIT_RESPONSE, CONTROL_WAIT_RESPONSE_RELEASE,
++        CONTROL_WAIT_VALID_RELEASE);
++    type rx_state_t is (RX_IDLE, RX_CAPTURE, RX_WAIT_REQUEST_RELEASE);
++
++    signal control_state : control_state_t := CONTROL_IDLE;
++    signal request_level : std_logic := '0';
++    signal response_level_rx : std_logic := '0';
++    signal response_level_sync : std_logic := '0';
++    signal response_success_rx : std_logic := '0';
++    signal response_success_sync : std_logic := '0';
++    signal apply_done_i : std_logic := '0';
++    signal apply_success_i : std_logic := '0';
++    signal request_words_control : phase_steps_t := (others => (others => '0'));
++    signal request_epoch_control : unsigned(31 downto 0) := (others => '0');
++
++    signal request_level_sync : std_logic := '0';
++    signal rx_state : rx_state_t := RX_IDLE;
++
++    signal armed_words_rx : phase_steps_t := (others => (others => '0'));
++    signal armed_epoch_rx : unsigned(31 downto 0) := (others => '0');
++    signal token_armed_rx : std_logic := '0';
++    signal previous_rx_enable : std_logic := '0';
++    signal start_pulse_i : std_logic := '0';
++    signal start_authorized_i : std_logic := '0';
++    signal active_valid_i : std_logic := '0';
++    signal active_words_i : phase_steps_t := (others => (others => '0'));
++    signal active_epoch_i : unsigned(31 downto 0) := (others => '0');
++begin
++    apply_done <= apply_done_i;
++    apply_success <= apply_success_i;
++    start_pulse <= start_pulse_i;
++    start_authorized <= start_authorized_i;
++    active_valid <= active_valid_i;
++    active_words <= active_words_i;
++    active_epoch <= active_epoch_i;
++
++    request_level_synchronizer : entity work.synchronizer
++        generic map (RESET_LEVEL => '0')
++        port map (
++            reset => rx_reset,
++            clock => rx_clock,
++            async => request_level,
++            sync => request_level_sync
++        );
++
++    response_level_synchronizer : entity work.synchronizer
++        generic map (RESET_LEVEL => '0')
++        port map (
++            reset => control_reset,
++            clock => control_clock,
++            async => response_level_rx,
++            sync => response_level_sync
++        );
++
++    response_value_sync : entity work.synchronizer
++        generic map (RESET_LEVEL => '0')
++        port map (
++            reset => control_reset,
++            clock => control_clock,
++            async => response_success_rx,
++            sync => response_success_sync
++        );
++
++    rx_active_level_sync : entity work.synchronizer
++        generic map (RESET_LEVEL => '0')
++        port map (
++            reset => control_reset,
++            clock => control_clock,
++            async => rx_enable,
++            sync => rx_active_sync
++        );
++
++    control_handshake : process(control_clock, control_reset)
++    begin
++        if control_reset = '1' then
++            control_state <= CONTROL_IDLE;
++            request_level <= '0';
++            apply_done_i <= '0';
++            apply_success_i <= '0';
++            request_words_control <= (others => (others => '0'));
++            request_epoch_control <= (others => '0');
++        elsif rising_edge(control_clock) then
++            apply_done_i <= '0';
++            case control_state is
++                when CONTROL_IDLE =>
++                    apply_success_i <= '0';
++                    if apply_valid = '1' then
++                        request_words_control <= apply_words;
++                        request_epoch_control <= apply_epoch;
++                        control_state <= CONTROL_PREPARE_REQUEST;
++                    end if;
++
++                when CONTROL_PREPARE_REQUEST =>
++                    -- Give all 160 bundled payload bits one full source clock
++                    -- of stability before the request level can cross domains.
++                    request_level <= '1';
++                    control_state <= CONTROL_WAIT_RESPONSE;
++
++                when CONTROL_WAIT_RESPONSE =>
++                    if response_level_sync = '1' then
++                        request_level <= '0';
++                        control_state <= CONTROL_WAIT_RESPONSE_RELEASE;
++                    end if;
++
++                when CONTROL_WAIT_RESPONSE_RELEASE =>
++                    if response_level_sync = '0' then
++                        -- The separately synchronized result has remained
++                        -- stable through the complete four-phase exchange.
++                        apply_success_i <= response_success_sync;
++                        apply_done_i <= '1';
++                        control_state <= CONTROL_WAIT_VALID_RELEASE;
++                    end if;
++
++                when CONTROL_WAIT_VALID_RELEASE =>
++                    -- The register samples apply_done one clock after this block
++                    -- raises it. Do not reinterpret its still-high apply_valid as
++                    -- another request while that level is being released.
++                    if apply_valid = '0' then
++                        apply_success_i <= '0';
++                        control_state <= CONTROL_IDLE;
++                    end if;
++            end case;
++        end if;
++    end process;
++
++    rx_handshake_and_start : process(rx_clock, rx_reset)
++    begin
++        if rx_reset = '1' then
++            rx_state <= RX_IDLE;
++            response_level_rx <= '0';
++            response_success_rx <= '0';
++            armed_words_rx <= (others => (others => '0'));
++            armed_epoch_rx <= (others => '0');
++            token_armed_rx <= '0';
++            previous_rx_enable <= '0';
++            start_pulse_i <= '0';
++            start_authorized_i <= '0';
++            active_valid_i <= '0';
++            active_words_i <= (others => (others => '0'));
++            active_epoch_i <= (others => '0');
++        elsif rising_edge(rx_clock) then
++            start_pulse_i <= '0';
++            start_authorized_i <= '0';
++            previous_rx_enable <= rx_enable;
++
++            if rx_enable = '1' and previous_rx_enable = '0' then
++                start_pulse_i <= '1';
++                if token_armed_rx = '1' then
++                    start_authorized_i <= '1';
++                    active_valid_i <= '1';
++                    active_words_i <= armed_words_rx;
++                    active_epoch_i <= armed_epoch_rx;
++                    token_armed_rx <= '0';
++                else
++                    active_valid_i <= '0';
++                    active_words_i <= (others => (others => '0'));
++                    active_epoch_i <= (others => '0');
++                end if;
++            elsif rx_enable = '0' then
++                active_valid_i <= '0';
++                active_words_i <= (others => (others => '0'));
++                active_epoch_i <= (others => '0');
++            end if;
++
++            case rx_state is
++                when RX_IDLE =>
++                    if request_level_sync = '1' then
++                        rx_state <= RX_CAPTURE;
++                    end if;
++
++                when RX_CAPTURE =>
++                    -- RX-enable wins any same-edge race. While stopped, a new
++                    -- successful apply replaces the one armed configuration;
++                    -- it does not queue a second future start.
++                    if rx_enable = '0' then
++                        armed_words_rx <= request_words_control;
++                        armed_epoch_rx <= request_epoch_control;
++                        token_armed_rx <= '1';
++                        response_success_rx <= '1';
++                    else
++                        response_success_rx <= '0';
++                    end if;
++                    response_level_rx <= '1';
++                    rx_state <= RX_WAIT_REQUEST_RELEASE;
++
++                when RX_WAIT_REQUEST_RELEASE =>
++                    if request_level_sync = '0' then
++                        response_level_rx <= '0';
++                        rx_state <= RX_IDLE;
++                    end if;
++            end case;
++        end if;
++    end process;
++end architecture;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_framer.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_framer.vhd
+new file mode 100644
+index 00000000..6555895c
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_framer.vhd
+@@ -0,0 +1,308 @@
++-- Profile-2 CONFIG-first channel bank and transport serializer. Every idle-
++-- epoch RX start emits exactly one eight-slot CONFIG record before any sample
++-- is admitted to the numerical bank. An unauthorized or invalid start emits
++-- the diagnostic CONFIG and then remains silent until reset.
++--
++-- Output is a conventional ready/valid stream. While m_valid is asserted and
++-- m_ready is clear, the current slot and every snapshotted record field remain
++-- unchanged. The downstream wrapper must make m_ready mean that the slot will
++-- be retained; serializer completion alone is not FIFO-persistence evidence.
++--
++-- s_ready denotes actual admission to rf_channel_bank. It remains low while
++-- CONFIG is pending and after an invalid start. Physical samples presented in
++-- that deliberate startup interval are discarded without setting input loss.
++-- Once DATA is enabled, an unstallable input presented while s_ready is low sets
++-- sticky loss. Reset discards every partial record and all numerical state; the
++-- integration wrapper must coherently clear its downstream packer/FIFO too.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++library work;
++use work.rf_observatory_p.all;
++
++entity rf_profile2_framer is
++    port (
++        clock : in std_logic;
++        reset : in std_logic;
++
++        start_pulse : in std_logic;
++        start_authorized : in std_logic;
++        active_valid : in std_logic;
++        active_words : in phase_steps_t;
++        active_epoch : in unsigned(31 downto 0);
++
++        s_valid : in std_logic;
++        s_ready : out std_logic;
++        s_i : in signed(15 downto 0);
++        s_q : in signed(15 downto 0);
++        source_rx2 : in std_logic;
++        configuration_error : in std_logic;
++        transport_loss : in std_logic;
++
++        m_valid : out std_logic;
++        m_ready : in std_logic;
++        m_i : out signed(15 downto 0);
++        m_q : out signed(15 downto 0)
++    );
++end entity;
++
++architecture rtl of rf_profile2_framer is
++    constant REQUIRED_SOURCE_RATE : unsigned(31 downto 0) :=
++        to_unsigned(20_000_000, 32);
++
++    type state_t is (
++        WAIT_START,
++        EMIT_CONFIG,
++        DATA_WAIT_GROUP,
++        EMIT_DATA,
++        DIAGNOSTIC_DONE
++    );
++
++    signal state : state_t := WAIT_START;
++    signal slot : natural range 0 to 7 := 0;
++
++    signal epoch_usable : std_logic := '0';
++    signal startup_transport_loss : std_logic := '0';
++    signal epoch_words : phase_steps_t := (others => (others => '0'));
++    signal epoch_number : unsigned(31 downto 0) := (others => '0');
++    signal epoch_source_rx2 : std_logic := '0';
++    signal config_flags : std_logic_vector(15 downto 0) := (others => '0');
++
++    signal loss_sticky : std_logic := '0';
++    signal config_sticky : std_logic := '0';
++
++    signal bank_reset : std_logic;
++    signal bank_s_valid : std_logic;
++    signal bank_s_ready : std_logic;
++    signal bank_m_valid : std_logic;
++    signal bank_m_ready : std_logic;
++    signal bank_i : iq_words_t;
++    signal bank_q : iq_words_t;
++    signal bank_clipped : std_logic_vector(3 downto 0);
++    signal bank_index : unsigned(63 downto 0);
++
++    signal held_i : iq_words_t := (others => (others => '0'));
++    signal held_q : iq_words_t := (others => (others => '0'));
++    signal held_index : unsigned(63 downto 0) := (others => '0');
++    signal held_flags : std_logic_vector(15 downto 0) := (others => '0');
++
++    signal data_phase : std_logic;
++begin
++    data_phase <= '1' when state = DATA_WAIT_GROUP or state = EMIT_DATA else '0';
++    bank_reset <= reset or not data_phase;
++    bank_s_valid <= s_valid when data_phase = '1' else '0';
++    bank_m_ready <= '1' when state = DATA_WAIT_GROUP else '0';
++
++    s_ready <= bank_s_ready when data_phase = '1' and reset = '0' else '0';
++    m_valid <= '1' when (state = EMIT_CONFIG or state = EMIT_DATA)
++        and reset = '0' else '0';
++
++    bank : entity work.rf_channel_bank
++        port map (
++            clock => clock,
++            reset => bank_reset,
++            phase_steps => epoch_words,
++            s_valid => bank_s_valid,
++            s_ready => bank_s_ready,
++            s_i => s_i,
++            s_q => s_q,
++            m_valid => bank_m_valid,
++            m_ready => bank_m_ready,
++            m_i => bank_i,
++            m_q => bank_q,
++            m_clipped => bank_clipped,
++            m_last_input_index => bank_index
++        );
++
++    serialize : process(all)
++    begin
++        m_i <= (others => '0');
++        m_q <= (others => '0');
++
++        if state = EMIT_CONFIG then
++            case slot is
++                when 0 =>
++                    m_i <= signed'(x"5246");
++                    m_q <= signed'(x"4f42");
++                when 1 =>
++                    m_i <= signed(config_flags);
++                    m_q <= to_signed(2, 16);
++                when 2 =>
++                    m_i <= signed(epoch_number(15 downto 0));
++                    m_q <= signed(epoch_number(31 downto 16));
++                when 3 =>
++                    m_i <= signed(REQUIRED_SOURCE_RATE(15 downto 0));
++                    m_q <= signed(REQUIRED_SOURCE_RATE(31 downto 16));
++                when others =>
++                    m_i <= signed(epoch_words(slot - 4)(15 downto 0));
++                    m_q <= signed(epoch_words(slot - 4)(31 downto 16));
++            end case;
++        elsif state = EMIT_DATA then
++            case slot is
++                when 0 =>
++                    m_i <= signed'(x"5246");
++                    m_q <= signed'(x"4f42");
++                when 1 =>
++                    m_i <= signed(held_flags);
++                    m_q <= to_signed(2, 16);
++                when 2 =>
++                    m_i <= signed(held_index(15 downto 0));
++                    m_q <= signed(held_index(31 downto 16));
++                when 3 =>
++                    m_i <= signed(held_index(47 downto 32));
++                    m_q <= signed(held_index(63 downto 48));
++                when others =>
++                    m_i <= held_i(slot - 4);
++                    m_q <= held_q(slot - 4);
++            end case;
++        end if;
++    end process;
++
++    control : process(clock)
++        variable flags : std_logic_vector(15 downto 0);
++        variable input_loss_now : std_logic;
++        variable config_error_now : std_logic;
++    begin
++        if rising_edge(clock) then
++            if reset = '1' then
++                state <= WAIT_START;
++                slot <= 0;
++                epoch_usable <= '0';
++                startup_transport_loss <= '0';
++                epoch_words <= (others => (others => '0'));
++                epoch_number <= (others => '0');
++                epoch_source_rx2 <= '0';
++                config_flags <= (others => '0');
++                loss_sticky <= '0';
++                config_sticky <= '0';
++                held_i <= (others => (others => '0'));
++                held_q <= (others => (others => '0'));
++                held_index <= (others => '0');
++                held_flags <= (others => '0');
++            else
++                input_loss_now := '0';
++                config_error_now := '0';
++                if data_phase = '1' then
++                    if s_valid = '1' and bank_s_ready = '0' then
++                        input_loss_now := '1';
++                    end if;
++                    if configuration_error = '1'
++                        or source_rx2 /= epoch_source_rx2
++                        or start_pulse = '1' then
++                        config_error_now := '1';
++                    end if;
++
++                    if input_loss_now = '1' or transport_loss = '1' then
++                        loss_sticky <= '1';
++                    end if;
++                    if config_error_now = '1' then
++                        config_sticky <= '1';
++                    end if;
++                end if;
++
++                case state is
++                    when WAIT_START =>
++                        if start_pulse = '1' then
++                            slot <= 0;
++                            epoch_source_rx2 <= source_rx2;
++                            loss_sticky <= '0';
++                            config_sticky <= '0';
++                            startup_transport_loss <= transport_loss;
++                            held_i <= (others => (others => '0'));
++                            held_q <= (others => (others => '0'));
++                            held_index <= (others => '0');
++                            held_flags <= (others => '0');
++
++                            flags := x"2010";
++                            flags(5) := source_rx2;
++                            if start_authorized = '1' and active_valid = '1'
++                                and active_epoch /= unsigned'(x"00000000")
++                                and configuration_error = '0'
++                                and transport_loss = '0' then
++                                epoch_usable <= '1';
++                                epoch_words <= active_words;
++                                epoch_number <= active_epoch;
++                                flags(3 downto 0) :=
++                                    std_logic_vector(active_epoch(3 downto 0));
++                            else
++                                epoch_usable <= '0';
++                                epoch_words <= (others => (others => '0'));
++                                epoch_number <= (others => '0');
++                                flags(6) := '1';
++                                flags(3 downto 0) := (others => '0');
++                            end if;
++                            config_flags <= flags;
++                            state <= EMIT_CONFIG;
++                        end if;
++
++                    when EMIT_CONFIG =>
++                        -- A new start is never allowed to replace the tuple being
++                        -- serialized. Preserve it and fail closed after CONFIG;
++                        -- no DATA may follow an in-flight lifecycle violation.
++                        if start_pulse = '1' or configuration_error = '1'
++                            or source_rx2 /= epoch_source_rx2 then
++                            config_sticky <= '1';
++                        end if;
++                        if transport_loss = '1' then
++                            startup_transport_loss <= '1';
++                        end if;
++
++                        if m_ready = '1' then
++                            if slot = 7 then
++                                slot <= 0;
++                                if epoch_usable = '1'
++                                    and startup_transport_loss = '0'
++                                    and transport_loss = '0'
++                                    and config_sticky = '0'
++                                    and start_pulse = '0'
++                                    and configuration_error = '0'
++                                    and source_rx2 = epoch_source_rx2 then
++                                    state <= DATA_WAIT_GROUP;
++                                else
++                                    state <= DIAGNOSTIC_DONE;
++                                end if;
++                            else
++                                slot <= slot + 1;
++                            end if;
++                        end if;
++
++                    when DATA_WAIT_GROUP =>
++                        if bank_m_valid = '1' then
++                            held_i <= bank_i;
++                            held_q <= bank_q;
++                            held_index <= bank_index;
++
++                            flags := x"2000";
++                            flags(11 downto 8) := bank_clipped;
++                            flags(7) := loss_sticky or transport_loss
++                                or input_loss_now;
++                            flags(6) := config_sticky or config_error_now;
++                            flags(5) := epoch_source_rx2;
++                            flags(3 downto 0) :=
++                                std_logic_vector(epoch_number(3 downto 0));
++                            held_flags <= flags;
++                            slot <= 0;
++                            state <= EMIT_DATA;
++                        end if;
++
++                    when EMIT_DATA =>
++                        if m_ready = '1' then
++                            if slot = 7 then
++                                slot <= 0;
++                                state <= DATA_WAIT_GROUP;
++                            else
++                                slot <= slot + 1;
++                            end if;
++                        end if;
++
++                    when DIAGNOSTIC_DONE =>
++                        -- A stop/reset is required before another start. Ignore
++                        -- any extra pulse rather than changing the emitted tuple.
++                        null;
++                end case;
++            end if;
++        end if;
++    end process;
++end architecture;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_init_reset.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_init_reset.vhd
+new file mode 100644
+index 00000000..29932e8f
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_init_reset.vhd
+@@ -0,0 +1,71 @@
++-- Image/PLL-lifetime initialization reset for profile-2 persistent control.
++-- The hosted FX3 system reset is a stream-lifecycle event and intentionally
++-- does not enter this block. Loss of the system PLL asynchronously asserts both
++-- outputs. After lock and a running system clock, the system-domain output is
++-- held for G_HOLD_CYCLES complete edges and then synchronously released. The RX
++-- output asynchronously asserts from that same event and synchronously releases
++-- through two RX-clock registers. If either clock is absent during release,
++-- that domain's reset remains asserted rather than relying on FPGA power-up
++-- state.
++
++library ieee;
++use ieee.std_logic_1164.all;
++
++entity rf_profile2_init_reset is
++    generic (
++        G_HOLD_CYCLES : positive := 16
++    );
++    port (
++        sys_clock : in std_logic;
++        sys_pll_locked : in std_logic;
++        rx_clock : in std_logic;
++        sys_reset : out std_logic;
++        rx_reset : out std_logic
++    );
++end entity;
++
++architecture rtl of rf_profile2_init_reset is
++    attribute ALTERA_ATTRIBUTE : string;
++    attribute PRESERVE : boolean;
++
++    signal hold_count : natural range 0 to G_HOLD_CYCLES := 0;
++    signal sys_reset_i : std_logic := '1';
++    signal rx_reset_meta : std_logic := '1';
++    signal rx_reset_sync : std_logic := '1';
++
++    attribute ALTERA_ATTRIBUTE of rx_reset_meta : signal is
++        "-name SYNCHRONIZER_IDENTIFICATION ""FORCED IF ASYNCHRONOUS""";
++    attribute ALTERA_ATTRIBUTE of rx_reset_sync : signal is
++        "-name SYNCHRONIZER_IDENTIFICATION ""FORCED IF ASYNCHRONOUS""";
++    attribute PRESERVE of rx_reset_meta : signal is true;
++    attribute PRESERVE of rx_reset_sync : signal is true;
++begin
++    sys_reset <= sys_reset_i;
++    rx_reset <= rx_reset_sync;
++
++    stretch_system_reset : process(sys_clock, sys_pll_locked)
++    begin
++        if sys_pll_locked /= '1' then
++            hold_count <= 0;
++            sys_reset_i <= '1';
++        elsif rising_edge(sys_clock) then
++            if hold_count < G_HOLD_CYCLES then
++                hold_count <= hold_count + 1;
++                sys_reset_i <= '1';
++            else
++                sys_reset_i <= '0';
++            end if;
++        end if;
++    end process;
++
++    synchronize_rx_release : process(rx_clock, sys_reset_i)
++    begin
++        if sys_reset_i = '1' then
++            rx_reset_meta <= '1';
++            rx_reset_sync <= '1';
++        elsif rising_edge(rx_clock) then
++            rx_reset_meta <= '0';
++            rx_reset_sync <= rx_reset_meta;
++        end if;
++    end process;
++end architecture;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_integration.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_integration.vhd
+new file mode 100644
+index 00000000..e9c8fcb9
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_integration.vhd
+@@ -0,0 +1,147 @@
++-- Profile-2 control, channel-bank transport and native-FIFO write boundary.
++-- The two reset classes are intentionally distinct:
++--
++-- * control_reset/profile_rx_reset are one image-lifetime event. They clear the
++--   committed configuration and one-shot start token, so a normal stream-start
++--   reset must not drive them.
++-- * stream_reset and a stopped rx_enable clear only epoch-local framing,
++--   numerical and packing state. A later start consumes a previously armed
++--   token and emits CONFIG again.
++--
++-- The wrapper owns the complete path from the terminating Wishbone slave to a
++-- single-driver 64-bit RX-FIFO write interface. fifo_full is backpressure, not
++-- a transport-loss event. Once DATA is open, the framer itself reports an
++-- unstallable ADC sample presented while that backpressure reaches the bank.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++library work;
++use work.rf_observatory_p.all;
++
++entity rf_profile2_integration is
++    port (
++        control_clock : in std_logic;
++        control_reset : in std_logic;
++
++        wb_address : in std_logic_vector(31 downto 0);
++        wb_write_data : in std_logic_vector(31 downto 0);
++        wb_read_data : out std_logic_vector(31 downto 0);
++        wb_write : in std_logic;
++        wb_select : in std_logic;
++        wb_strobe : in std_logic;
++        wb_cycle : in std_logic;
++        wb_ack : out std_logic;
++
++        rx_clock : in std_logic;
++        profile_rx_reset : in std_logic;
++        stream_reset : in std_logic;
++        rx_enable : in std_logic;
++
++        s_valid : in std_logic;
++        s_ready : out std_logic;
++        s_i : in signed(15 downto 0);
++        s_q : in signed(15 downto 0);
++        source_rx2 : in std_logic;
++        configuration_error : in std_logic;
++        transport_loss : in std_logic;
++
++        fifo_full : in std_logic;
++        fifo_write : out std_logic;
++        fifo_data : out std_logic_vector(63 downto 0)
++    );
++end entity;
++
++architecture rtl of rf_profile2_integration is
++    signal apply_valid, apply_done, apply_success : std_logic;
++    signal apply_words : phase_steps_t;
++    signal apply_epoch : unsigned(31 downto 0);
++    signal rx_active_sync : std_logic;
++
++    signal start_pulse, start_authorized : std_logic;
++    signal active_valid : std_logic;
++    signal active_words : phase_steps_t;
++    signal active_epoch : unsigned(31 downto 0);
++
++    signal epoch_reset : std_logic;
++    signal framed_valid, framed_ready : std_logic;
++    signal framed_i, framed_q : signed(15 downto 0);
++begin
++    epoch_reset <= profile_rx_reset or stream_reset or not rx_enable;
++
++    registers : entity work.rf_profile2_wb_registers
++        port map (
++            clock => control_clock,
++            reset => control_reset,
++            wb_address => wb_address,
++            wb_write_data => wb_write_data,
++            wb_read_data => wb_read_data,
++            wb_write => wb_write,
++            wb_select => wb_select,
++            wb_strobe => wb_strobe,
++            wb_cycle => wb_cycle,
++            wb_ack => wb_ack,
++            rx_active_sync => rx_active_sync,
++            apply_valid => apply_valid,
++            apply_words => apply_words,
++            apply_epoch => apply_epoch,
++            apply_done => apply_done,
++            apply_success => apply_success
++        );
++
++    control_bridge : entity work.rf_profile2_control_cdc
++        port map (
++            control_clock => control_clock,
++            control_reset => control_reset,
++            apply_valid => apply_valid,
++            apply_words => apply_words,
++            apply_epoch => apply_epoch,
++            apply_done => apply_done,
++            apply_success => apply_success,
++            rx_active_sync => rx_active_sync,
++            rx_clock => rx_clock,
++            rx_reset => profile_rx_reset,
++            rx_enable => rx_enable,
++            start_pulse => start_pulse,
++            start_authorized => start_authorized,
++            active_valid => active_valid,
++            active_words => active_words,
++            active_epoch => active_epoch
++        );
++
++    framer : entity work.rf_profile2_framer
++        port map (
++            clock => rx_clock,
++            reset => epoch_reset,
++            start_pulse => start_pulse,
++            start_authorized => start_authorized,
++            active_valid => active_valid,
++            active_words => active_words,
++            active_epoch => active_epoch,
++            s_valid => s_valid,
++            s_ready => s_ready,
++            s_i => s_i,
++            s_q => s_q,
++            source_rx2 => source_rx2,
++            configuration_error => configuration_error,
++            transport_loss => transport_loss,
++            m_valid => framed_valid,
++            m_ready => framed_ready,
++            m_i => framed_i,
++            m_q => framed_q
++        );
++
++    packer : entity work.rf_profile2_slot_packer
++        port map (
++            clock => rx_clock,
++            reset => epoch_reset,
++            m_valid => framed_valid,
++            m_ready => framed_ready,
++            m_i => framed_i,
++            m_q => framed_q,
++            fifo_full => fifo_full,
++            fifo_write => fifo_write,
++            fifo_data => fifo_data
++        );
++end architecture;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_p.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_p.vhd
+new file mode 100644
+index 00000000..03cb477b
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_p.vhd
+@@ -0,0 +1,100 @@
++-- Frozen control-register contract for RF-observatory profile 2. Profile 1
++-- keeps its existing package and wire bytes unchanged.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++package rf_profile2_p is
++    constant P2_ID : std_logic_vector(31 downto 0) := x"52460201";
++    constant P2_CAPABILITIES : std_logic_vector(31 downto 0) := x"00001f04";
++    constant P2_COMMIT_MAGIC : std_logic_vector(31 downto 0) := x"434d4954";
++    constant P2_UNKNOWN_READ : std_logic_vector(31 downto 0) := x"bad0add0";
++
++    constant P2_ADDR_ID : natural := 0;
++    constant P2_ADDR_CAPABILITIES : natural := 1;
++    constant P2_ADDR_SHADOW_FIRST : natural := 4;
++    constant P2_ADDR_COMMIT : natural := 8;
++    constant P2_ADDR_STATUS : natural := 9;
++    constant P2_ADDR_APPLIED_EPOCH : natural := 10;
++    constant P2_ADDR_OUTCOME_EPOCH : natural := 11;
++    constant P2_ADDR_APPLIED_FIRST : natural := 12;
++
++    subtype p2_reason_t is std_logic_vector(3 downto 0);
++    constant P2_REASON_NONE : p2_reason_t := x"0";
++    constant P2_REASON_BAD_MAGIC : p2_reason_t := x"1";
++    constant P2_REASON_INCOMPLETE : p2_reason_t := x"2";
++    constant P2_REASON_RX_ACTIVE : p2_reason_t := x"3";
++    constant P2_REASON_EPOCH_EXHAUSTED : p2_reason_t := x"4";
++    constant P2_REASON_APPLY_REJECTED : p2_reason_t := x"5";
++
++    function p2_epoch_available(epoch : unsigned(31 downto 0)) return boolean;
++    function p2_candidate_epoch(epoch : unsigned(31 downto 0)) return unsigned;
++    function p2_commit_reason(
++        commit_word : std_logic_vector(31 downto 0);
++        rx_active : std_logic;
++        written_mask : std_logic_vector(3 downto 0);
++        applied_epoch : unsigned(31 downto 0)
++    ) return p2_reason_t;
++    function p2_status(
++        busy : std_logic;
++        outcome_valid : std_logic;
++        outcome_success : std_logic;
++        rx_active : std_logic;
++        reason : p2_reason_t;
++        written_mask : std_logic_vector(3 downto 0)
++    ) return std_logic_vector;
++end package;
++
++package body rf_profile2_p is
++    function p2_epoch_available(epoch : unsigned(31 downto 0)) return boolean is
++    begin
++        return epoch /= unsigned'(x"ffffffff");
++    end function;
++
++    function p2_candidate_epoch(epoch : unsigned(31 downto 0)) return unsigned is
++    begin
++        if p2_epoch_available(epoch) then
++            return epoch + 1;
++        end if;
++        return epoch;
++    end function;
++
++    function p2_commit_reason(
++        commit_word : std_logic_vector(31 downto 0);
++        rx_active : std_logic;
++        written_mask : std_logic_vector(3 downto 0);
++        applied_epoch : unsigned(31 downto 0)
++    ) return p2_reason_t is
++    begin
++        if commit_word /= P2_COMMIT_MAGIC then
++            return P2_REASON_BAD_MAGIC;
++        elsif rx_active /= '0' then
++            return P2_REASON_RX_ACTIVE;
++        elsif written_mask /= "1111" then
++            return P2_REASON_INCOMPLETE;
++        elsif not p2_epoch_available(applied_epoch) then
++            return P2_REASON_EPOCH_EXHAUSTED;
++        end if;
++        return P2_REASON_NONE;
++    end function;
++
++    function p2_status(
++        busy : std_logic;
++        outcome_valid : std_logic;
++        outcome_success : std_logic;
++        rx_active : std_logic;
++        reason : p2_reason_t;
++        written_mask : std_logic_vector(3 downto 0)
++    ) return std_logic_vector is
++        variable value : std_logic_vector(31 downto 0) := (others => '0');
++    begin
++        value(31) := busy;
++        value(30) := outcome_valid;
++        value(29) := outcome_success;
++        value(28) := rx_active;
++        value(27 downto 24) := reason;
++        value(23 downto 20) := written_mask;
++        return value;
++    end function;
++end package body;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_slot_packer.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_slot_packer.vhd
+new file mode 100644
+index 00000000..c7873924
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_slot_packer.vhd
+@@ -0,0 +1,68 @@
++-- Lossless two-slot adapter from the profile-2 ready/valid stream to the
++-- native bladeRF RX FIFO's 64-bit write port. A complex int16 slot occupies
++-- one 32-bit host word with I in the low half and Q in the high half. The
++-- lower FIFO word is therefore the first accepted slot.
++--
++-- fifo_full must be the actual write-domain full output of the target FIFO.
++-- The pinned Cyclone-V DCFIFO also holds that output high while its synchronized
++-- write-side asynchronous clear is releasing. The empty half buffer may retain
++-- one slot during that interval, but a pair is accepted and written only when
++-- fifo_full is low. Reset discards an unpaired slot and suppresses writes.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++entity rf_profile2_slot_packer is
++    port (
++        clock : in std_logic;
++        reset : in std_logic;
++
++        m_valid : in std_logic;
++        m_ready : out std_logic;
++        m_i : in signed(15 downto 0);
++        m_q : in signed(15 downto 0);
++
++        fifo_full : in std_logic;
++        fifo_write : out std_logic;
++        fifo_data : out std_logic_vector(63 downto 0)
++    );
++end entity;
++
++architecture rtl of rf_profile2_slot_packer is
++    signal half_valid : std_logic := '0';
++    signal first_i : signed(15 downto 0) := (others => '0');
++    signal first_q : signed(15 downto 0) := (others => '0');
++    signal ready_i : std_logic;
++begin
++    ready_i <= '0' when reset = '1' else
++        '1' when half_valid = '0' else
++        '1' when fifo_full = '0' else '0';
++    m_ready <= ready_i;
++
++    -- The second-slot handshake and FIFO write are the same event. In
++    -- particular, accepting CONFIG slot 7 writes the final CONFIG pair.
++    fifo_write <= '1' when reset = '0' and half_valid = '1'
++        and m_valid = '1' and fifo_full = '0' else '0';
++    fifo_data <= std_logic_vector(m_q) & std_logic_vector(m_i)
++        & std_logic_vector(first_q) & std_logic_vector(first_i);
++
++    retain_first_slot : process(clock)
++    begin
++        if rising_edge(clock) then
++            if reset = '1' then
++                half_valid <= '0';
++                first_i <= (others => '0');
++                first_q <= (others => '0');
++            elsif m_valid = '1' and ready_i = '1' then
++                if half_valid = '0' then
++                    first_i <= m_i;
++                    first_q <= m_q;
++                    half_valid <= '1';
++                else
++                    half_valid <= '0';
++                end if;
++            end if;
++        end if;
++    end process;
++end architecture;
+diff --git a/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_wb_registers.vhd b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_wb_registers.vhd
+new file mode 100644
+index 00000000..6b9d4286
+--- /dev/null
++++ b/hdl/fpga/ip/nuand/rf_observatory/rf_profile2_wb_registers.vhd
+@@ -0,0 +1,210 @@
++-- Always-terminating profile-2 register slave for the pinned Nuand bridge.
++-- Capture belongs to cyc/stb; sel is the later response-wait indication.
++-- The apply payload remains stable while apply_valid is high.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++library work;
++use work.rf_observatory_p.all;
++use work.rf_profile2_p.all;
++
++entity rf_profile2_wb_registers is
++    port (
++        clock : in std_logic;
++        reset : in std_logic;
++
++        wb_address : in std_logic_vector(31 downto 0);
++        wb_write_data : in std_logic_vector(31 downto 0);
++        wb_read_data : out std_logic_vector(31 downto 0);
++        wb_write : in std_logic;
++        wb_select : in std_logic;
++        wb_strobe : in std_logic;
++        wb_cycle : in std_logic;
++        wb_ack : out std_logic;
++
++        rx_active_sync : in std_logic;
++        apply_valid : out std_logic;
++        apply_words : out phase_steps_t;
++        apply_epoch : out unsigned(31 downto 0);
++        apply_done : in std_logic;
++        apply_success : in std_logic
++    );
++end entity;
++
++architecture rtl of rf_profile2_wb_registers is
++    type bus_state_t is (IDLE, WAIT_SELECT, RESPOND, WAIT_RELEASE);
++
++    signal bus_state : bus_state_t := IDLE;
++    signal saved_address : unsigned(31 downto 0) := (others => '0');
++    signal saved_data : std_logic_vector(31 downto 0) := (others => '0');
++    signal saved_write : std_logic := '0';
++    signal response_data : std_logic_vector(31 downto 0) := (others => '0');
++
++    signal shadow_words : phase_steps_t := (others => (others => '0'));
++    signal written_mask : std_logic_vector(3 downto 0) := (others => '0');
++    signal frozen_words : phase_steps_t := (others => (others => '0'));
++    signal frozen_epoch : unsigned(31 downto 0) := (others => '0');
++    signal applied_words : phase_steps_t := (others => (others => '0'));
++    signal applied_epoch : unsigned(31 downto 0) := (others => '0');
++    signal apply_pending : std_logic := '0';
++    signal previous_apply_done : std_logic := '0';
++
++    signal outcome_valid : std_logic := '0';
++    signal outcome_success : std_logic := '0';
++    signal outcome_reason : p2_reason_t := P2_REASON_NONE;
++    signal outcome_epoch : unsigned(31 downto 0) := (others => '0');
++begin
++    wb_ack <= '1' when bus_state = RESPOND else '0';
++    wb_read_data <= response_data;
++    apply_valid <= apply_pending;
++    apply_words <= frozen_words;
++    apply_epoch <= frozen_epoch;
++
++    process(clock, reset)
++        variable address : natural range 0 to 15;
++        variable next_epoch : unsigned(31 downto 0);
++        variable commit_reason : p2_reason_t;
++    begin
++        if reset = '1' then
++            bus_state <= IDLE;
++            saved_address <= (others => '0');
++            saved_data <= (others => '0');
++            saved_write <= '0';
++            response_data <= (others => '0');
++            shadow_words <= (others => (others => '0'));
++            written_mask <= (others => '0');
++            frozen_words <= (others => (others => '0'));
++            frozen_epoch <= (others => '0');
++            applied_words <= (others => (others => '0'));
++            applied_epoch <= (others => '0');
++            apply_pending <= '0';
++            previous_apply_done <= '0';
++            outcome_valid <= '0';
++            outcome_success <= '0';
++            outcome_reason <= P2_REASON_NONE;
++            outcome_epoch <= (others => '0');
++        elsif rising_edge(clock) then
++            previous_apply_done <= apply_done;
++            if apply_done = '1' and previous_apply_done = '0'
++                and apply_pending = '1' then
++                apply_pending <= '0';
++                outcome_valid <= '1';
++                outcome_epoch <= frozen_epoch;
++                if apply_success = '1' then
++                    applied_words <= frozen_words;
++                    applied_epoch <= frozen_epoch;
++                    outcome_success <= '1';
++                    outcome_reason <= P2_REASON_NONE;
++                else
++                    outcome_success <= '0';
++                    outcome_reason <= P2_REASON_APPLY_REJECTED;
++                end if;
++            end if;
++
++            case bus_state is
++                when IDLE =>
++                    if wb_cycle = '1' and wb_strobe = '1' then
++                        saved_address <= unsigned(wb_address);
++                        saved_data <= wb_write_data;
++                        saved_write <= wb_write;
++                        bus_state <= WAIT_SELECT;
++                    end if;
++
++                when WAIT_SELECT =>
++                    if wb_select = '1' then
++                        response_data <= (others => '0');
++                        if saved_address(31 downto 4) = 0 then
++                            address := to_integer(saved_address(3 downto 0));
++                            if saved_write = '1' then
++                                case address is
++                                    when P2_ADDR_SHADOW_FIRST to P2_ADDR_SHADOW_FIRST + 3 =>
++                                        shadow_words(address - P2_ADDR_SHADOW_FIRST) <=
++                                            unsigned(saved_data);
++                                        written_mask(address - P2_ADDR_SHADOW_FIRST) <= '1';
++
++                                    when P2_ADDR_COMMIT =>
++                                        next_epoch := p2_candidate_epoch(applied_epoch);
++                                        commit_reason := P2_REASON_NONE;
++                                        if apply_pending = '1' then
++                                            null;
++                                        else
++                                            commit_reason := p2_commit_reason(
++                                                saved_data, rx_active_sync,
++                                                written_mask, applied_epoch
++                                            );
++                                        end if;
++                                        if apply_pending = '0'
++                                            and commit_reason /= P2_REASON_NONE then
++                                            outcome_valid <= '1';
++                                            outcome_success <= '0';
++                                            outcome_reason <= commit_reason;
++                                            outcome_epoch <= next_epoch;
++                                        elsif apply_pending = '0' then
++                                            frozen_words <= shadow_words;
++                                            frozen_epoch <= next_epoch;
++                                            apply_pending <= '1';
++                                            written_mask <= (others => '0');
++                                            outcome_valid <= '0';
++                                            outcome_success <= '0';
++                                            outcome_reason <= P2_REASON_NONE;
++                                            outcome_epoch <= next_epoch;
++                                        end if;
++
++                                    when others =>
++                                        null;
++                                end case;
++                            else
++                                case address is
++                                    when P2_ADDR_ID =>
++                                        response_data <= P2_ID;
++                                    when P2_ADDR_CAPABILITIES =>
++                                        response_data <= P2_CAPABILITIES;
++                                    when P2_ADDR_SHADOW_FIRST to P2_ADDR_SHADOW_FIRST + 3 =>
++                                        response_data <= std_logic_vector(
++                                            shadow_words(address - P2_ADDR_SHADOW_FIRST)
++                                        );
++                                    when P2_ADDR_COMMIT =>
++                                        response_data <= (others => '0');
++                                    when P2_ADDR_STATUS =>
++                                        response_data <= p2_status(
++                                            apply_pending, outcome_valid, outcome_success,
++                                            rx_active_sync, outcome_reason, written_mask
++                                        );
++                                    when P2_ADDR_APPLIED_EPOCH =>
++                                        response_data <= std_logic_vector(applied_epoch);
++                                    when P2_ADDR_OUTCOME_EPOCH =>
++                                        response_data <= std_logic_vector(outcome_epoch);
++                                    when P2_ADDR_APPLIED_FIRST to P2_ADDR_APPLIED_FIRST + 3 =>
++                                        response_data <= std_logic_vector(
++                                            applied_words(address - P2_ADDR_APPLIED_FIRST)
++                                        );
++                                    when others =>
++                                        response_data <= P2_UNKNOWN_READ;
++                                end case;
++                            end if;
++                        elsif saved_write = '0' then
++                            response_data <= P2_UNKNOWN_READ;
++                        end if;
++                        bus_state <= RESPOND;
++                    end if;
++
++                when RESPOND =>
++                    bus_state <= WAIT_RELEASE;
++
++                when WAIT_RELEASE =>
++                    if wb_select = '0' then
++                        if wb_cycle = '1' and wb_strobe = '1' then
++                            saved_address <= unsigned(wb_address);
++                            saved_data <= wb_write_data;
++                            saved_write <= wb_write;
++                            bus_state <= WAIT_SELECT;
++                        else
++                            bus_state <= IDLE;
++                        end if;
++                    end if;
++            end case;
++        end if;
++    end process;
++end architecture;
+diff --git a/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip b/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip
+index 2a97c1c9..d8377422 100644
+--- a/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip
++++ b/hdl/fpga/platforms/bladerf-micro/bladerf-hosted.qip
+@@ -33,6 +33,19 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip trigg
+ set_global_assignment -name QIP_FILE  [file normalize [file join $nuand_ip pll_reset/pll_reset.qip]]
+ set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip ps_sync/vhdl/ps_sync.vhd]]
+ 
++# rf-observatory profile-2 sources are supplied by the integration patch. The
++# platform build selects VHDL-2008.
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_observatory_p.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_profile2_p.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_channel_bank.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_profile2_init_reset.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_profile2_wb_registers.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_profile2_control_cdc.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_profile2_framer.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_profile2_slot_packer.vhd]]
++set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip rf_observatory/rf_profile2_integration.vhd]]
++set_global_assignment -name SDC_FILE  [file normalize [file join $nuand_ip rf_observatory/rf_profile2.sdc]]
++
+ # Implementation Details
+ set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif_p.vhd]]
+ set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif.vhd]]
+diff --git a/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd b/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd
+index 4818f26e..21a7dff7 100644
+--- a/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd
++++ b/hdl/fpga/platforms/bladerf-micro/vhdl/bladerf-hosted.vhd
+@@ -37,6 +37,8 @@ architecture hosted_bladerf of bladerf is
+     alias  sys_reset_async     : std_logic is fx3_ctl(7);
+     signal sys_reset_pclk      : std_logic;
+     signal sys_reset           : std_logic;
++    signal profile_init_reset_sys : std_logic;
++    signal profile_init_reset_rx  : std_logic;
+ 
+     signal sys_clock           : std_logic;
+     signal sys_clock_out       : std_logic;
+@@ -159,6 +161,18 @@ architecture hosted_bladerf of bladerf is
+     signal adc_streams            : sample_streams_t(adc_controls'range)  := (others => ZERO_SAMPLE);
+     signal adc_streams_last_v     : std_logic_vector(adc_controls'range)  := (others => '0');
+ 
++    -- rf-observatory profile 2 exports CONFIG-first framed channel-bank data,
++    -- not ordinary RF IQ. Persistent control uses an image-lifetime reset;
++    -- the ordinary FX3 system reset remains a stream-lifetime event.
++    signal rf_source_rx2          : std_logic;
++    signal rf_source_i, rf_source_q : signed(15 downto 0);
++    signal rf_source_valid        : std_logic;
++    signal rf_config_error        : std_logic;
++    signal rf_trigger_arm_rx      : std_logic := '0';
++    signal rf_fifo_full           : std_logic;
++    signal rf_fifo_write          : std_logic;
++    signal rf_fifo_data           : std_logic_vector(RX_FIFO_T_DEFAULT.wdata'range);
++
+     signal   ps_sync              : std_logic_vector(0 downto 0)          := (others => '0');
+ 
+ 
+@@ -171,8 +185,6 @@ architecture hosted_bladerf of bladerf is
+     signal tx_packet_empty        : std_logic;
+ 
+ 
+-    signal wbm_wb_clk_i           : std_logic;
+-    signal wbm_wb_rst_i           : std_logic;
+     signal wbm_wb_adr_o           : std_logic_vector(31 downto 0);
+     signal wbm_wb_dat_o           : std_logic_vector(31 downto 0);
+     signal wbm_wb_dat_i           : std_logic_vector(31 downto 0);
+@@ -191,7 +203,7 @@ begin
+             rx_packet_ready        => rx_packet_ready,
+ 
+             rx_enable              => rx_enable,
+-            rx_packet_enable       => packet_en_rx,
++            rx_packet_enable       => '0',
+ 
+             rx_packet_control      => rx_packet_control
+         ) ;
+@@ -256,6 +268,21 @@ begin
+             pll_reset      => fx3_pclk_pll_reset
+         );
+ 
++    -- GPIO_SYS_RST is pulsed immediately before ordinary RX start, so it may
++    -- not clear the committed profile-2 bank or its one-shot start token.
++    -- System-PLL lock instead defines the persistent image/control lifetime.
++    U_rf_profile2_init_reset : entity work.rf_profile2_init_reset
++        generic map (
++            G_HOLD_CYCLES => 16
++        )
++        port map (
++            sys_clock => sys_clock,
++            sys_pll_locked => sys_pll_locked,
++            rx_clock => rx_clock,
++            sys_reset => profile_init_reset_sys,
++            rx_reset => profile_init_reset_rx
++        );
++
+ 
+     -- ========================================================================
+     -- POWER SUPPLY SYNCHRONIZATION
+@@ -289,8 +316,11 @@ begin
+ 
+             usb_speed           =>  usb_speed_pclk,
+ 
+-            meta_enable         =>  meta_en_pclk,
+-            packet_enable       =>  packet_en_pclk,
++            -- Profile 2 always uses plain, metadata-free 32-bit records. Host
++            -- requests for unsupported native modes remain visible to the RX-
++            -- domain diagnostic but cannot stall or reinterpret the GPIF path.
++            meta_enable         =>  '0',
++            packet_enable       =>  '0',
+             rx_enable           =>  rx_enable_pclk,
+             tx_enable           =>  tx_enable_pclk,
+ 
+@@ -370,7 +400,7 @@ begin
+     U_nios_system : component nios_system
+         port map (
+             clk_clk                         => sys_clock,
+-            reset_reset_n                   => '1',
++            reset_reset_n                   => not profile_init_reset_sys,
+             dac_MISO                        => nios_sdo,
+             dac_MOSI                        => nios_sdio,
+             dac_SCLK                        => nios_sclk,
+@@ -455,8 +485,8 @@ begin
+             tx_trigger_ctl_out_port         => tx_trigger_ctl_i,
+             rx_trigger_ctl_in_port          => pack(rx_trigger_ctl),
+             tx_trigger_ctl_in_port          => pack(tx_trigger_ctl),
+-            wbm_wb_clk_i                    => wbm_wb_clk_i,
+-            wbm_wb_rst_i                    => wbm_wb_rst_i,
++            wbm_wb_clk_i                    => sys_clock,
++            wbm_wb_rst_i                    => profile_init_reset_sys,
+             wbm_wb_adr_o                    => wbm_wb_adr_o,
+             wbm_wb_dat_o                    => wbm_wb_dat_o,
+             wbm_wb_dat_i                    => wbm_wb_dat_i,
+@@ -555,7 +585,7 @@ begin
+             tx_clock             => tx_clock,
+             tx_enable            => tx_enable,
+ 
+-            meta_en              => meta_en_tx,
++            meta_en              => '0',
+             timestamp_reset      => tx_ts_reset,
+             usb_speed            => usb_speed_tx,
+             tx_underflow_led     => tx_underflow_led,
+@@ -572,7 +602,7 @@ begin
+             highly_packed_mode_en => highly_packed_en_txrx,
+ 
+             -- Packet FIFO
+-            packet_en            => packet_en_tx,
++            packet_en            => '0',
+             packet_empty         => tx_packet_empty,
+             packet_control       => tx_packet_control,
+             packet_ready         => tx_packet_ready,
+@@ -621,38 +651,108 @@ begin
+         end loop;
+     end process;
+ 
++    -- Trigger configuration originates in the persistent Nios/control domain.
++    -- Synchronize it with the same image-lifetime reset as the profile token;
++    -- the ordinary pre-enable transport reset must not erase this diagnostic.
++    U_rf_sync_trigger_arm : entity work.synchronizer
++        generic map (RESET_LEVEL => '0')
++        port map (
++            reset => profile_init_reset_rx,
++            clock => rx_clock,
++            async => rx_trigger_ctl.arm,
++            sync => rf_trigger_arm_rx
++        );
++
++    rf_source_rx2 <= '1' when
++        adc_controls(1).enable = '1' and adc_controls(0).enable = '0'
++        else '0';
++    rf_source_i <= adc_streams(1).data_i when rf_source_rx2 = '1'
++        else adc_streams(0).data_i;
++    rf_source_q <= adc_streams(1).data_q when rf_source_rx2 = '1'
++        else adc_streams(0).data_q;
++    rf_source_valid <= adc_streams(1).data_v when rf_source_rx2 = '1'
++        else adc_streams(0).data_v;
++    rf_config_error <= '1' when
++        not ((adc_controls(0).enable = '1' and adc_controls(1).enable = '0') or
++             (adc_controls(0).enable = '0' and adc_controls(1).enable = '1')) or
++        meta_en_rx = '1' or eightbit_en_rx = '1' or
++        highly_packed_en_txrx = '1' or packet_en_rx = '1' or
++        rx_mux_sel /= 0 or rf_trigger_arm_rx = '1'
++        else '0';
++
++    U_rf_profile2 : entity work.rf_profile2_integration
++        port map (
++            control_clock => sys_clock,
++            control_reset => profile_init_reset_sys,
++            wb_address => wbm_wb_adr_o,
++            wb_write_data => wbm_wb_dat_o,
++            wb_read_data => wbm_wb_dat_i,
++            wb_write => wbm_wb_we_o,
++            wb_select => wbm_wb_sel_o,
++            wb_strobe => wbm_wb_stb_o,
++            wb_cycle => wbm_wb_cyc_o,
++            wb_ack => wbm_wb_ack_i,
++            rx_clock => rx_clock,
++            profile_rx_reset => profile_init_reset_rx,
++            stream_reset => rx_reset,
++            rx_enable => rx_enable,
++            s_valid => rf_source_valid,
++            -- The physical ADC cannot consume backpressure. The framer uses
++            -- its internal ready state to mark DATA-phase input loss.
++            s_ready => open,
++            s_i => rf_source_i,
++            s_q => rf_source_q,
++            source_rx2 => rf_source_rx2,
++            configuration_error => rf_config_error,
++            transport_loss => '0',
++            fifo_full => rf_fifo_full,
++            fifo_write => rf_fifo_write,
++            fifo_data => rf_fifo_data
++        );
++
++    -- The existing FIFO/FX3 read path carries profile-2 records. Native sample
++    -- metadata, packet, trigger and alternate mux modes are disabled. The GPIF
++    -- interface is plain/raw in both directions; ordinary raw TX and the RFIC/
++    -- USB control paths remain, but TX metadata/packet modes are unsupported.
+     -- RX Submodule
+     U_rx : entity work.rx
+         generic map (
+-            NUM_STREAMS            => adc_controls'length
++            NUM_STREAMS            => adc_controls'length,
++            PROFILE2_DIRECT_FIFO   => true
+         )
+         port map (
+             rx_reset               => rx_reset,
+             rx_clock               => rx_clock,
+             rx_enable              => rx_enable,
+ 
+-            meta_en                => meta_en_rx,
++            meta_en                => '0',
+             timestamp_reset        => rx_ts_reset,
+             usb_speed              => usb_speed_rx,
+-            rx_mux_sel             => rx_mux_sel,
++            rx_mux_sel             => to_unsigned(0, rx_mux_sel'length),
+             rx_overflow_led        => rx_overflow_led,
+             rx_timestamp           => rx_timestamp,
+ 
+             -- Triggering
+-            trigger_arm            => rx_trigger_ctl.arm,
+-            trigger_fire           => rx_trigger_ctl.fire,
+-            trigger_master         => rx_trigger_ctl.master,
++            trigger_arm            => '0',
++            trigger_fire           => '0',
++            trigger_master         => '0',
+             trigger_line           => rx_trigger_line,
+ 
+             -- Packed modes
+-            eight_bit_mode_en      => eightbit_en_rx,
+-            highly_packed_mode_en  => highly_packed_en_txrx,
++            eight_bit_mode_en      => '0',
++            highly_packed_mode_en  => '0',
+ 
+             -- Packet FIFO
+-            packet_en              => packet_en_rx,
++            packet_en              => '0',
+             packet_control         => rx_packet_control,
+             packet_ready           => rx_packet_ready,
+ 
++            -- Profile-2 direct write boundary
++            profile2_fifo_write    => rf_fifo_write,
++            profile2_fifo_data     => rf_fifo_data,
++            profile2_fifo_reset    => profile_init_reset_rx,
++            profile2_fifo_full     => rf_fifo_full,
++
+             -- Samples to host via FX3
+             sample_fifo_rclock     => fx3_pclk_pll,
+             sample_fifo_raclr      => not rx_enable_pclk,
+diff --git a/hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd b/hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd
+index 5ff34e3f..131cb125 100644
+--- a/hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd
++++ b/hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd
+@@ -28,7 +28,8 @@ library work;
+ 
+ entity rx is
+     generic (
+-        NUM_STREAMS          : natural := 2
++        NUM_STREAMS          : natural := 2;
++        PROFILE2_DIRECT_FIFO : boolean := false
+     );
+     port (
+         rx_reset               : in    std_logic;
+@@ -58,6 +59,13 @@ entity rx is
+         packet_control         : in    packet_control_t;
+         packet_ready           : out   std_logic;
+ 
++        -- Optional profile-2 direct write boundary. Existing revisions retain
++        -- the native fifo_writer because the generic defaults to false.
++        profile2_fifo_write    : in    std_logic := '0';
++        profile2_fifo_data     : in    std_logic_vector(RX_FIFO_T_DEFAULT.wdata'range) := (others => '0');
++        profile2_fifo_reset    : in    std_logic := '0';
++        profile2_fifo_full     : out   std_logic := '1';
++
+         -- Samples to host via FX3
+         sample_fifo_rclock     : in    std_logic;
+         sample_fifo_raclr      : in    std_logic;
+@@ -147,7 +155,10 @@ begin
+ 
+ 
+     -- RX sample FIFO
+-    sample_fifo.aclr   <= sample_fifo_raclr;
++    -- RX stop clears the FIFO through the existing read-side lifecycle. The
++    -- profile image reset also clears it so a PLL/image reset cannot leave old
++    -- transport words ahead of the next diagnostic CONFIG.
++    sample_fifo.aclr   <= sample_fifo_raclr or profile2_fifo_reset;
+     sample_fifo.wclock <= rx_clock;
+     U_rx_sample_fifo : entity work.rx_fifo
+         generic map (
+@@ -170,6 +181,8 @@ begin
+             rdusedw             => sample_fifo_rused
+         );
+ 
++    profile2_fifo_full <= sample_fifo.wfull;
++
+ 
+     -- RX meta FIFO
+     meta_fifo.aclr   <= meta_fifo_raclr;
+@@ -223,49 +236,62 @@ begin
+         );
+ 
+ 
+-    -- Sample bridge
+-    U_fifo_writer : entity work.fifo_writer
+-        generic map (
+-            NUM_STREAMS           => NUM_STREAMS,
+-            FIFO_USEDW_WIDTH      => sample_fifo.wused'length,
+-            FIFO_DATA_WIDTH       => sample_fifo.wdata'length,
+-            META_FIFO_USEDW_WIDTH => meta_fifo.wused'length,
+-            META_FIFO_DATA_WIDTH  => meta_fifo.wdata'length
+-        )
+-        port map (
+-            clock               =>  rx_clock,
+-            reset               =>  rx_reset,
+-            enable              =>  rx_enable,
+-
+-            usb_speed           =>  usb_speed,
+-            meta_en             =>  meta_en,
+-            packet_en           =>  packet_en,
+-            timestamp           =>  rx_timestamp,
+-            mini_exp            =>  mini_exp,
+-
+-            fifo_full           =>  sample_fifo.wfull,
+-            fifo_usedw          =>  sample_fifo.wused,
+-            fifo_data           =>  sample_fifo.wdata,
+-            fifo_write          =>  sample_fifo.wreq,
+-
+-            packet_control      =>  packet_control,
+-            packet_ready        =>  packet_ready,
+-
+-            eight_bit_mode_en   => eight_bit_mode_en,
+-            highly_packed_mode_en => highly_packed_mode_en,
+-
+-            meta_fifo_full      =>  meta_fifo.wfull,
+-            meta_fifo_usedw     =>  meta_fifo.wused,
+-            meta_fifo_data      =>  meta_fifo.wdata,
+-            meta_fifo_write     =>  meta_fifo.wreq,
+-
+-            in_sample_controls  =>  adc_controls,
+-            in_samples          =>  mux_streams,
+-
+-            overflow_led        =>  rx_overflow_led,
+-            overflow_count      =>  open,
+-            overflow_duration   =>  x"ffff"
+-        );
++    G_profile2_direct_fifo : if PROFILE2_DIRECT_FIFO generate
++        -- The profile-2 wrapper is the sole sample-FIFO writer. Native
++        -- metadata, packet generation and the stretched overflow indicator
++        -- are not part of this custom framed transport.
++        sample_fifo.wreq <= profile2_fifo_write;
++        sample_fifo.wdata <= profile2_fifo_data;
++        meta_fifo.wreq <= '0';
++        meta_fifo.wdata <= (others => '0');
++        packet_ready <= '0';
++        rx_overflow_led <= '0';
++    end generate;
++
++    G_native_fifo_writer : if not PROFILE2_DIRECT_FIFO generate
++        U_fifo_writer : entity work.fifo_writer
++            generic map (
++                NUM_STREAMS           => NUM_STREAMS,
++                FIFO_USEDW_WIDTH      => sample_fifo.wused'length,
++                FIFO_DATA_WIDTH       => sample_fifo.wdata'length,
++                META_FIFO_USEDW_WIDTH => meta_fifo.wused'length,
++                META_FIFO_DATA_WIDTH  => meta_fifo.wdata'length
++            )
++            port map (
++                clock               => rx_clock,
++                reset               => rx_reset,
++                enable              => rx_enable,
++
++                usb_speed           => usb_speed,
++                meta_en             => meta_en,
++                packet_en           => packet_en,
++                timestamp           => rx_timestamp,
++                mini_exp            => mini_exp,
++
++                fifo_full           => sample_fifo.wfull,
++                fifo_usedw          => sample_fifo.wused,
++                fifo_data           => sample_fifo.wdata,
++                fifo_write          => sample_fifo.wreq,
++
++                packet_control      => packet_control,
++                packet_ready        => packet_ready,
++
++                eight_bit_mode_en   => eight_bit_mode_en,
++                highly_packed_mode_en => highly_packed_mode_en,
++
++                meta_fifo_full      => meta_fifo.wfull,
++                meta_fifo_usedw     => meta_fifo.wused,
++                meta_fifo_data      => meta_fifo.wdata,
++                meta_fifo_write     => meta_fifo.wreq,
++
++                in_sample_controls  => adc_controls,
++                in_samples          => mux_streams,
++
++                overflow_led        => rx_overflow_led,
++                overflow_count      => open,
++                overflow_duration   => x"ffff"
++            );
++    end generate;
+ 
+ 
+     loopback_fifo_control : process( rx_reset, loopback_fifo.rclock )

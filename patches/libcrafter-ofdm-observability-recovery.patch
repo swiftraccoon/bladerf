@@ -1,0 +1,2733 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 20183f22..c5bc38bd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,20 @@
+ 
+ ## Unreleased
+ 
++### Changed
++
++- Expose a closed, branch-aligned partition of legacy and HT20 OFDM rejection
++  events across serial, parallel, and windowed Wi-Fi decoders, including an
++  explicit strong-path long-training timeout that may coexist with
++  weak-short-period recovery.
++- Subpartition that strong-path timeout by the furthest eligible acquisition
++  gate reached: no long-training evaluation, repeat, known-reference, or source
++  coordinates.
++- Probe repeated OFDM long-training windows whose reference score falls just
++  below the unchanged strong acceptance gate as bounded, lower-priority
++  hypotheses while retaining the original strong search and all SIGNAL, DATA,
++  and FCS integrity gates.
++
+ ## 0.3.5 - 2026-09-20
+ 
+ ### Changed
+diff --git a/crafter/src/radio/mod.rs b/crafter/src/radio/mod.rs
+index c6643b85..6178afa4 100644
+--- a/crafter/src/radio/mod.rs
++++ b/crafter/src/radio/mod.rs
+@@ -33,9 +33,10 @@ pub use wifi::{
+     HtFormat, HtGuardInterval, HtMcs, HtSignalBits, HtSignalError, HtSignalFields, HtTransmission,
+     HtTxConfig, LegacyDsssCckRate, LegacyDsssCckTransmission, LegacyDsssCckTxConfig,
+     LegacyOfdmDecoder, LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig,
+-    LegacyWifiDecoder, LegacyWifiPhy, LegacyWifiTransmission, LegacyWifiTxConfig, OfdmSignalFields,
+-    ParallelLegacyWifiDecoder, ParallelWifiDecoder, SignalInfo, WifiDecoder, WifiFcsPolicy,
+-    WifiPacketEncoder, WifiTxEncoder, WindowedLegacyWifiDecoder, WindowedWifiDecoder,
++    LegacyWifiDecoder, LegacyWifiPhy, LegacyWifiTransmission, LegacyWifiTxConfig,
++    OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats, ParallelLegacyWifiDecoder,
++    ParallelWifiDecoder, SignalInfo, WifiDecoder, WifiFcsPolicy, WifiPacketEncoder, WifiTxEncoder,
++    WindowedLegacyWifiDecoder, WindowedWifiDecoder,
+ };
+ 
+ /// Compatibility facade for the deterministic in-memory sample sink.
+diff --git a/crafter/src/radio/wifi/decoder.rs b/crafter/src/radio/wifi/decoder.rs
+index 32b92beb..8f59948f 100644
+--- a/crafter/src/radio/wifi/decoder.rs
++++ b/crafter/src/radio/wifi/decoder.rs
+@@ -5,7 +5,9 @@ use super::super::{
+     transport::{IqChunk, IqContinuity, IqEvent},
+ };
+ use super::dsss::DsssCckDecoder;
+-use super::ofdm::{DecoderStats, LegacyOfdmDecoder};
++use super::ofdm::{
++    DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats,
++};
+ 
+ /// Combined legacy and HT20 one-stream BCC/LDPC receiver.
+ ///
+@@ -37,6 +39,12 @@ impl WifiDecoder {
+     pub fn ofdm_stats(&self) -> DecoderStats {
+         self.inner.ofdm_stats()
+     }
++    pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
++        self.inner.ofdm_rejection_stats()
++    }
++    pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        self.inner.ofdm_strong_long_training_stats()
++    }
+     pub fn dsss_stats(&self) -> DecoderStats {
+         self.inner.dsss_stats()
+     }
+@@ -77,6 +85,12 @@ impl LegacyWifiDecoder {
+     pub fn ofdm_stats(&self) -> DecoderStats {
+         self.ofdm.stats()
+     }
++    pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
++        self.ofdm.rejection_stats()
++    }
++    pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        self.ofdm.strong_long_training_stats()
++    }
+     pub fn dsss_stats(&self) -> DecoderStats {
+         self.dsss.stats()
+     }
+diff --git a/crafter/src/radio/wifi/mod.rs b/crafter/src/radio/wifi/mod.rs
+index 9d2bc3b9..eb693f44 100644
+--- a/crafter/src/radio/wifi/mod.rs
++++ b/crafter/src/radio/wifi/mod.rs
+@@ -21,7 +21,7 @@ pub use ht::{
+ };
+ pub use ofdm::{
+     DecoderStats, LegacyOfdmDecoder, LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig,
+-    OfdmSignalFields, SignalInfo,
++    OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats, SignalInfo,
+ };
+ pub use parallel::{ParallelLegacyWifiDecoder, ParallelWifiDecoder};
+ pub use tx::{
+diff --git a/crafter/src/radio/wifi/ofdm/mod.rs b/crafter/src/radio/wifi/ofdm/mod.rs
+index 6c6a4a81..7dabbaaa 100644
+--- a/crafter/src/radio/wifi/ofdm/mod.rs
++++ b/crafter/src/radio/wifi/ofdm/mod.rs
+@@ -7,6 +7,6 @@ pub(in crate::radio) mod sync;
+ mod tx;
+ pub(in crate::radio) mod waveform;
+ 
+-pub use rx::{DecoderStats, LegacyOfdmDecoder};
++pub use rx::{DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats};
+ pub use signal::SignalInfo;
+ pub use tx::{LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig, OfdmSignalFields};
+diff --git a/crafter/src/radio/wifi/ofdm/rx.rs b/crafter/src/radio/wifi/ofdm/rx.rs
+index f11badb9..f97e52cb 100644
+--- a/crafter/src/radio/wifi/ofdm/rx.rs
++++ b/crafter/src/radio/wifi/ofdm/rx.rs
+@@ -2,7 +2,7 @@
+ use super::{
+     demod::{decode_data, valid_fcs},
+     signal::{decode_signal, SignalInfo},
+-    sync::{Acquisition, SyncEvent, Synchronizer},
++    sync::{Acquisition, AcquisitionFailure, StrongLongTrainingFailure, SyncEvent, Synchronizer},
+ };
+ use crate::radio::{
+     codec::{
+@@ -33,6 +33,251 @@ pub struct DecoderStats {
+     pub truncated_frames: u64,
+     pub dropped_frames: u64,
+ }
++
++/// Closed accounting for terminal OFDM rejection branches.
++///
++/// These are decoder-hypothesis events, not physical frames. Strong,
++/// weak-short-period, and reference-relaxed acquisition paths can describe the
++/// same transmission. Diagnostics are a separate bounded, overlapping stream
++/// and are not the source of these counts.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub struct OfdmRejectionStats {
++    /// Neither the retained L-SIG path nor its optional greenfield probe could
++    /// continue. This branch also includes reservation failures.
++    pub signal_or_probe_rejected: u64,
++    /// A greenfield header reached the receiver's combined unsupported outcome.
++    /// That outcome includes unsupported fields and configured bounds.
++    pub greenfield_header_unsupported: u64,
++    /// A greenfield probe did not recognize HT and no legacy header was retained.
++    pub greenfield_probe_unrecognized: u64,
++    /// A mixed-format header reached the receiver's combined unsupported outcome.
++    /// That outcome includes unsupported fields and configured bounds.
++    pub mixed_header_unsupported: u64,
++    /// A non-HT mixed-format probe could not reserve its legacy fallback.
++    pub legacy_fallback_unreservable: u64,
++    /// A supported header reached DATA recovery, which then failed.
++    pub data_decode_failed: u64,
++    /// A synchronized hypothesis lacked a pending slot or initial sample budget.
++    pub pending_capacity_rejected: u64,
++    /// A strong short-period hypothesis timed out without accepted long
++    /// training. A weak-short-period hypothesis or reference-relaxed probe may
++    /// still recover the same waveform.
++    pub strong_long_training_not_found: u64,
++}
++
++/// Closed subpartition of strong-path long-training timeouts.
++///
++/// Each event is also counted once by
++/// [`OfdmRejectionStats::strong_long_training_not_found`]. The categories
++/// describe the furthest acquisition gate reached before the strong candidate
++/// expired. They remain decoder-hypothesis evidence, not missed frames.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub struct OfdmStrongLongTrainingStats {
++    /// The candidate expired before any eligible long-training evaluation;
++    /// this does not prove that every intervening sample remained periodic.
++    pub strong_short_periodicity_timeout: u64,
++    /// No evaluated window contained the required repeated long-training form.
++    pub strong_long_repeat_not_found: u64,
++    /// A repeated form did not pass the known long-training reference gate.
++    pub strong_long_reference_not_found: u64,
++    /// Reference evidence passed, but source-coordinate arithmetic could not
++    /// form valid packet positions. This is not generic missing history.
++    pub strong_long_coordinates_unavailable: u64,
++}
++
++impl OfdmStrongLongTrainingStats {
++    fn counts(self) -> [u64; 4] {
++        [
++            self.strong_short_periodicity_timeout,
++            self.strong_long_repeat_not_found,
++            self.strong_long_reference_not_found,
++            self.strong_long_coordinates_unavailable,
++        ]
++    }
++
++    fn from_counts(counts: [u64; 4]) -> Self {
++        let [strong_short_periodicity_timeout, strong_long_repeat_not_found, strong_long_reference_not_found, strong_long_coordinates_unavailable] =
++            counts;
++        Self {
++            strong_short_periodicity_timeout,
++            strong_long_repeat_not_found,
++            strong_long_reference_not_found,
++            strong_long_coordinates_unavailable,
++        }
++    }
++
++    /// Returns the exact sum when the public counters have not been externally
++    /// constructed with an overflowing total.
++    pub fn checked_total(self) -> Option<u64> {
++        self.counts().into_iter().try_fold(0u64, u64::checked_add)
++    }
++
++    pub(in crate::radio) fn saturating_add_to(self, other: Self, limit: u64) -> Self {
++        let Some(total) = self.checked_total() else {
++            return self;
++        };
++        debug_assert!(total <= limit);
++        let mut result = self.counts();
++        let mut remaining = limit.saturating_sub(total);
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            let increment = value.min(remaining);
++            *count += increment;
++            remaining -= increment;
++        }
++        Self::from_counts(result)
++    }
++
++    pub(in crate::radio) fn saturating_add_each(self, other: Self) -> Self {
++        let mut result = self.counts();
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            *count = count.saturating_add(value);
++        }
++        Self::from_counts(result)
++    }
++
++    pub(in crate::radio) fn saturating_sub(self, other: Self) -> Self {
++        let mut result = self.counts();
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            *count = count.saturating_sub(value);
++        }
++        Self::from_counts(result)
++    }
++}
++
++impl OfdmRejectionStats {
++    fn counts(self) -> [u64; 8] {
++        [
++            self.signal_or_probe_rejected,
++            self.greenfield_header_unsupported,
++            self.greenfield_probe_unrecognized,
++            self.mixed_header_unsupported,
++            self.legacy_fallback_unreservable,
++            self.data_decode_failed,
++            self.pending_capacity_rejected,
++            self.strong_long_training_not_found,
++        ]
++    }
++
++    fn from_counts(counts: [u64; 8]) -> Self {
++        let [signal_or_probe_rejected, greenfield_header_unsupported, greenfield_probe_unrecognized, mixed_header_unsupported, legacy_fallback_unreservable, data_decode_failed, pending_capacity_rejected, strong_long_training_not_found] =
++            counts;
++        Self {
++            signal_or_probe_rejected,
++            greenfield_header_unsupported,
++            greenfield_probe_unrecognized,
++            mixed_header_unsupported,
++            legacy_fallback_unreservable,
++            data_decode_failed,
++            pending_capacity_rejected,
++            strong_long_training_not_found,
++        }
++    }
++
++    /// Returns the exact sum when the public counters have not been externally
++    /// constructed with an overflowing total.
++    pub fn checked_total(self) -> Option<u64> {
++        self.counts().into_iter().try_fold(0u64, u64::checked_add)
++    }
++
++    pub(in crate::radio) fn saturating_add(self, other: Self) -> Self {
++        let Some(total) = self.checked_total() else {
++            return self;
++        };
++        let mut result = self.counts();
++        let mut remaining = u64::MAX - total;
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            let increment = value.min(remaining);
++            *count += increment;
++            remaining -= increment;
++        }
++        Self::from_counts(result)
++    }
++
++    pub(in crate::radio) fn saturating_add_each(self, other: Self) -> Self {
++        let mut result = self.counts();
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            *count = count.saturating_add(value);
++        }
++        Self::from_counts(result)
++    }
++
++    pub(in crate::radio) fn saturating_sub(self, other: Self) -> Self {
++        let mut result = self.counts();
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            *count = count.saturating_sub(value);
++        }
++        Self::from_counts(result)
++    }
++}
++
++#[derive(Clone, Copy)]
++enum OfdmRejection {
++    SignalOrProbe,
++    GreenfieldHeaderUnsupported,
++    GreenfieldProbeUnrecognized,
++    MixedHeaderUnsupported,
++    LegacyFallbackUnreservable,
++    DataDecodeFailed,
++    PendingCapacity,
++}
++
++fn record_rejection(
++    stats: &mut DecoderStats,
++    rejections: &mut OfdmRejectionStats,
++    reason: OfdmRejection,
++) {
++    if stats.rejected_frames == u64::MAX {
++        return;
++    }
++    stats.rejected_frames += 1;
++    let count = match reason {
++        OfdmRejection::SignalOrProbe => &mut rejections.signal_or_probe_rejected,
++        OfdmRejection::GreenfieldHeaderUnsupported => &mut rejections.greenfield_header_unsupported,
++        OfdmRejection::GreenfieldProbeUnrecognized => &mut rejections.greenfield_probe_unrecognized,
++        OfdmRejection::MixedHeaderUnsupported => &mut rejections.mixed_header_unsupported,
++        OfdmRejection::LegacyFallbackUnreservable => &mut rejections.legacy_fallback_unreservable,
++        OfdmRejection::DataDecodeFailed => &mut rejections.data_decode_failed,
++        OfdmRejection::PendingCapacity => &mut rejections.pending_capacity_rejected,
++    };
++    debug_assert_ne!(*count, u64::MAX);
++    *count += 1;
++}
++
++fn record_strong_long_training_failure(
++    stats: &mut DecoderStats,
++    rejections: &mut OfdmRejectionStats,
++    strong_long_training: &mut OfdmStrongLongTrainingStats,
++    reason: StrongLongTrainingFailure,
++) {
++    debug_assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++    debug_assert_eq!(
++        strong_long_training.checked_total(),
++        Some(rejections.strong_long_training_not_found)
++    );
++    if stats.rejected_frames == u64::MAX {
++        return;
++    }
++    debug_assert_ne!(rejections.strong_long_training_not_found, u64::MAX);
++    stats.rejected_frames += 1;
++    rejections.strong_long_training_not_found += 1;
++    let count = match reason {
++        StrongLongTrainingFailure::ShortPeriodicityTimeout => {
++            &mut strong_long_training.strong_short_periodicity_timeout
++        }
++        StrongLongTrainingFailure::LongRepeatNotFound => {
++            &mut strong_long_training.strong_long_repeat_not_found
++        }
++        StrongLongTrainingFailure::LongReferenceNotFound => {
++            &mut strong_long_training.strong_long_reference_not_found
++        }
++        StrongLongTrainingFailure::LongCoordinatesUnavailable => {
++            &mut strong_long_training.strong_long_coordinates_unavailable
++        }
++    };
++    debug_assert_ne!(*count, u64::MAX);
++    *count += 1;
++}
++
+ struct Pending {
+     weak: bool,
+     acquisition: Acquisition,
+@@ -51,6 +296,8 @@ pub struct LegacyOfdmDecoder {
+     pending: [Option<Pending>; 2],
+     terminal: bool,
+     stats: DecoderStats,
++    rejections: OfdmRejectionStats,
++    strong_long_training: OfdmStrongLongTrainingStats,
+     ht: ht::rx::Receiver,
+     // Dispatcher output budget is not a capture reconfiguration. Changing
+     // RxConfig between internal slices would discard an in-flight PPDU.
+@@ -61,8 +308,38 @@ impl LegacyOfdmDecoder {
+         Self::default()
+     }
+     pub fn stats(&self) -> DecoderStats {
++        debug_assert_eq!(
++            self.rejections.checked_total(),
++            Some(self.stats.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.strong_long_training.checked_total(),
++            Some(self.rejections.strong_long_training_not_found)
++        );
+         self.stats
+     }
++    pub fn rejection_stats(&self) -> OfdmRejectionStats {
++        debug_assert_eq!(
++            self.rejections.checked_total(),
++            Some(self.stats.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.strong_long_training.checked_total(),
++            Some(self.rejections.strong_long_training_not_found)
++        );
++        self.rejections
++    }
++    pub fn strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        debug_assert_eq!(
++            self.rejections.checked_total(),
++            Some(self.stats.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.strong_long_training.checked_total(),
++            Some(self.rejections.strong_long_training_not_found)
++        );
++        self.strong_long_training
++    }
+     pub(in crate::radio) fn with_ht() -> Self {
+         Self {
+             ht: ht::rx::Receiver::ht20(),
+@@ -198,8 +475,11 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                             // Wait for both symbols before rejecting this candidate.
+                         }
+                         _ => {
+-                            self.stats.rejected_frames =
+-                                self.stats.rejected_frames.saturating_add(1);
++                            record_rejection(
++                                &mut self.stats,
++                                &mut self.rejections,
++                                OfdmRejection::SignalOrProbe,
++                            );
+                             out.diagnostics.push(PhyDiagnostic::InvalidHeader);
+                             self.pending[slot] = None;
+                             continue;
+@@ -227,14 +507,20 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                         ht::rx::HeaderOutcome::Unsupported { diagnostics } => {
+                             out.diagnostics.extend(diagnostics);
+                             out.diagnostics.push(PhyDiagnostic::UnsupportedPhy);
+-                            self.stats.rejected_frames =
+-                                self.stats.rejected_frames.saturating_add(1);
++                            record_rejection(
++                                &mut self.stats,
++                                &mut self.rejections,
++                                OfdmRejection::GreenfieldHeaderUnsupported,
++                            );
+                             self.pending[slot] = None;
+                             continue;
+                         }
+                         ht::rx::HeaderOutcome::NotHt if p.info.is_none() => {
+-                            self.stats.rejected_frames =
+-                                self.stats.rejected_frames.saturating_add(1);
++                            record_rejection(
++                                &mut self.stats,
++                                &mut self.rejections,
++                                OfdmRejection::GreenfieldProbeUnrecognized,
++                            );
+                             out.diagnostics.push(PhyDiagnostic::InvalidHeader);
+                             self.pending[slot] = None;
+                             continue;
+@@ -263,8 +549,11 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                         ht::rx::HeaderOutcome::Unsupported { diagnostics } => {
+                             out.diagnostics.extend(diagnostics);
+                             out.diagnostics.push(PhyDiagnostic::UnsupportedPhy);
+-                            self.stats.rejected_frames =
+-                                self.stats.rejected_frames.saturating_add(1);
++                            record_rejection(
++                                &mut self.stats,
++                                &mut self.rejections,
++                                OfdmRejection::MixedHeaderUnsupported,
++                            );
+                             self.pending[slot] = None;
+                             continue;
+                         }
+@@ -275,7 +564,11 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                         .ht
+                         .reserve_legacy_fallback(&mut p.samples, info, config, reserved)
+                     {
+-                        self.stats.rejected_frames = self.stats.rejected_frames.saturating_add(1);
++                        record_rejection(
++                            &mut self.stats,
++                            &mut self.rejections,
++                            OfdmRejection::LegacyFallbackUnreservable,
++                        );
+                         out.diagnostics.push(PhyDiagnostic::InvalidHeader);
+                         self.pending[slot] = None;
+                         continue;
+@@ -339,8 +632,11 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                             }
+                         }
+                         Err(()) => {
+-                            self.stats.rejected_frames =
+-                                self.stats.rejected_frames.saturating_add(1);
++                            record_rejection(
++                                &mut self.stats,
++                                &mut self.rejections,
++                                OfdmRejection::DataDecodeFailed,
++                            );
+                             out.diagnostics.push(PhyDiagnostic::InvalidData);
+                             out.diagnostics.extend(failure_diagnostics);
+                         }
+@@ -400,8 +696,11 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                         let Some(slot) = free
+                             .filter(|_| config.max_buffer_samples.saturating_sub(reserved) >= 80)
+                         else {
+-                            self.stats.rejected_frames =
+-                                self.stats.rejected_frames.saturating_add(1);
++                            record_rejection(
++                                &mut self.stats,
++                                &mut self.rejections,
++                                OfdmRejection::PendingCapacity,
++                            );
+                             continue;
+                         };
+                         self.pending[slot] = Some(Pending {
+@@ -413,8 +712,19 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                             ht: None,
+                         });
+                     }
+-                    SyncEvent::Failure(_) => {
+-                        self.stats.rejected_frames = self.stats.rejected_frames.saturating_add(1);
++                    SyncEvent::Failure(AcquisitionFailure::LongTrainingNotFound(reason)) => {
++                        record_strong_long_training_failure(
++                            &mut self.stats,
++                            &mut self.rejections,
++                            &mut self.strong_long_training,
++                            reason,
++                        );
++                    }
++                    SyncEvent::Failure(
++                        AcquisitionFailure::Interrupted | AcquisitionFailure::UnsupportedSampleRate,
++                    ) => {
++                        // Only `begin_chunk` emits these; this receiver validates
++                        // configuration and resets gaps before per-sample search.
+                     }
+                     SyncEvent::Reset(_) => {}
+                 }
+@@ -617,6 +927,231 @@ mod tests {
+         Ok(result)
+     }
+     #[test]
++    fn radio_ofdm_rejection_events_form_a_closed_branch_partition() {
++        let mut stats = DecoderStats::default();
++        let mut rejections = OfdmRejectionStats::default();
++        let mut strong_long_training = OfdmStrongLongTrainingStats::default();
++        for reason in [
++            OfdmRejection::SignalOrProbe,
++            OfdmRejection::GreenfieldHeaderUnsupported,
++            OfdmRejection::GreenfieldProbeUnrecognized,
++            OfdmRejection::MixedHeaderUnsupported,
++            OfdmRejection::LegacyFallbackUnreservable,
++            OfdmRejection::DataDecodeFailed,
++            OfdmRejection::PendingCapacity,
++        ] {
++            record_rejection(&mut stats, &mut rejections, reason);
++        }
++        record_strong_long_training_failure(
++            &mut stats,
++            &mut rejections,
++            &mut strong_long_training,
++            StrongLongTrainingFailure::ShortPeriodicityTimeout,
++        );
++        assert_eq!(stats.rejected_frames, 8);
++        assert_eq!(rejections.checked_total(), Some(8));
++        assert_eq!(
++            rejections,
++            OfdmRejectionStats {
++                signal_or_probe_rejected: 1,
++                greenfield_header_unsupported: 1,
++                greenfield_probe_unrecognized: 1,
++                mixed_header_unsupported: 1,
++                legacy_fallback_unreservable: 1,
++                data_decode_failed: 1,
++                pending_capacity_rejected: 1,
++                strong_long_training_not_found: 1,
++            }
++        );
++        assert_eq!(
++            strong_long_training,
++            OfdmStrongLongTrainingStats {
++                strong_short_periodicity_timeout: 1,
++                ..OfdmStrongLongTrainingStats::default()
++            }
++        );
++        assert_eq!(
++            strong_long_training.checked_total(),
++            Some(rejections.strong_long_training_not_found)
++        );
++
++        let mut strong_stats = DecoderStats::default();
++        let mut strong_rejections = OfdmRejectionStats::default();
++        let mut strong_details = OfdmStrongLongTrainingStats::default();
++        for reason in [
++            StrongLongTrainingFailure::ShortPeriodicityTimeout,
++            StrongLongTrainingFailure::LongRepeatNotFound,
++            StrongLongTrainingFailure::LongReferenceNotFound,
++            StrongLongTrainingFailure::LongCoordinatesUnavailable,
++        ] {
++            record_strong_long_training_failure(
++                &mut strong_stats,
++                &mut strong_rejections,
++                &mut strong_details,
++                reason,
++            );
++        }
++        assert_eq!(strong_stats.rejected_frames, 4);
++        assert_eq!(strong_rejections.strong_long_training_not_found, 4);
++        assert_eq!(
++            strong_details,
++            OfdmStrongLongTrainingStats {
++                strong_short_periodicity_timeout: 1,
++                strong_long_repeat_not_found: 1,
++                strong_long_reference_not_found: 1,
++                strong_long_coordinates_unavailable: 1,
++            }
++        );
++        assert_eq!(strong_details.checked_total(), Some(4));
++        assert_eq!(
++            OfdmStrongLongTrainingStats {
++                strong_short_periodicity_timeout: u64::MAX,
++                strong_long_repeat_not_found: 1,
++                ..OfdmStrongLongTrainingStats::default()
++            }
++            .checked_total(),
++            None
++        );
++
++        let mut saturated_stats = DecoderStats {
++            rejected_frames: u64::MAX - 1,
++            ..DecoderStats::default()
++        };
++        let mut saturated_rejections = OfdmRejectionStats {
++            signal_or_probe_rejected: u64::MAX - 1,
++            ..OfdmRejectionStats::default()
++        };
++        record_rejection(
++            &mut saturated_stats,
++            &mut saturated_rejections,
++            OfdmRejection::DataDecodeFailed,
++        );
++        let mut saturated_details = OfdmStrongLongTrainingStats::default();
++        record_strong_long_training_failure(
++            &mut saturated_stats,
++            &mut saturated_rejections,
++            &mut saturated_details,
++            StrongLongTrainingFailure::LongRepeatNotFound,
++        );
++        assert_eq!(saturated_stats.rejected_frames, u64::MAX);
++        assert_eq!(saturated_rejections.data_decode_failed, 1);
++        assert_eq!(saturated_rejections.strong_long_training_not_found, 0);
++        assert_eq!(saturated_details, OfdmStrongLongTrainingStats::default());
++        assert_eq!(saturated_rejections.checked_total(), Some(u64::MAX));
++
++        let mut saturated_strong_stats = DecoderStats {
++            rejected_frames: u64::MAX - 1,
++            ..DecoderStats::default()
++        };
++        let mut saturated_strong_rejections = OfdmRejectionStats {
++            strong_long_training_not_found: u64::MAX - 1,
++            ..OfdmRejectionStats::default()
++        };
++        let mut saturated_strong_details = OfdmStrongLongTrainingStats {
++            strong_short_periodicity_timeout: u64::MAX - 1,
++            ..OfdmStrongLongTrainingStats::default()
++        };
++        record_strong_long_training_failure(
++            &mut saturated_strong_stats,
++            &mut saturated_strong_rejections,
++            &mut saturated_strong_details,
++            StrongLongTrainingFailure::LongRepeatNotFound,
++        );
++        record_strong_long_training_failure(
++            &mut saturated_strong_stats,
++            &mut saturated_strong_rejections,
++            &mut saturated_strong_details,
++            StrongLongTrainingFailure::LongReferenceNotFound,
++        );
++        assert_eq!(saturated_strong_stats.rejected_frames, u64::MAX);
++        assert_eq!(
++            saturated_strong_rejections.strong_long_training_not_found,
++            u64::MAX
++        );
++        assert_eq!(
++            saturated_strong_details,
++            OfdmStrongLongTrainingStats {
++                strong_short_periodicity_timeout: u64::MAX - 1,
++                strong_long_repeat_not_found: 1,
++                ..OfdmStrongLongTrainingStats::default()
++            }
++        );
++        assert_eq!(saturated_strong_details.checked_total(), Some(u64::MAX));
++        assert_eq!(
++            OfdmRejectionStats {
++                signal_or_probe_rejected: u64::MAX - 1,
++                ..OfdmRejectionStats::default()
++            }
++            .saturating_add(OfdmRejectionStats {
++                data_decode_failed: 2,
++                ..OfdmRejectionStats::default()
++            }),
++            saturated_rejections
++        );
++        assert_eq!(
++            OfdmRejectionStats {
++                strong_long_training_not_found: u64::MAX - 1,
++                ..OfdmRejectionStats::default()
++            }
++            .saturating_add(OfdmRejectionStats {
++                signal_or_probe_rejected: 2,
++                ..OfdmRejectionStats::default()
++            }),
++            OfdmRejectionStats {
++                signal_or_probe_rejected: 1,
++                strong_long_training_not_found: u64::MAX - 1,
++                ..OfdmRejectionStats::default()
++            }
++        );
++
++        let invalid_data =
++            include_bytes!("../../../../tests/fixtures/iq/ofdm-6-invalid_service.cs8");
++        let mut baseline = None;
++        for chunk in [1, 79, 4096] {
++            let mut decoder = WifiDecoder::new();
++            let output = feed(&mut decoder, invalid_data, chunk);
++            assert!(output.frames.is_empty());
++            let stats = decoder.ofdm_stats();
++            let rejections = decoder.ofdm_rejection_stats();
++            let strong_long_training = decoder.ofdm_strong_long_training_stats();
++            assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++            assert_eq!(
++                strong_long_training.checked_total(),
++                Some(rejections.strong_long_training_not_found)
++            );
++            assert!(rejections.data_decode_failed > 0);
++            if let Some((expected_stats, expected_rejections, expected_strong)) = baseline {
++                assert_eq!(stats, expected_stats);
++                assert_eq!(rejections, expected_rejections);
++                assert_eq!(strong_long_training, expected_strong);
++            } else {
++                baseline = Some((stats, rejections, strong_long_training));
++            }
++        }
++
++        let mut decoder = WifiDecoder::new();
++        let output = feed(
++            &mut decoder,
++            include_bytes!("../../../../tests/fixtures/iq/ofdm-6-bad_fcs.cs8"),
++            127,
++        );
++        assert!(output.frames.is_empty());
++        assert!(decoder.ofdm_stats().invalid_fcs > 0);
++        assert_eq!(decoder.ofdm_rejection_stats().data_decode_failed, 0);
++        assert_eq!(
++            decoder.ofdm_rejection_stats().checked_total(),
++            Some(decoder.ofdm_stats().rejected_frames)
++        );
++        assert_eq!(
++            decoder.ofdm_strong_long_training_stats().checked_total(),
++            Some(
++                decoder
++                    .ofdm_rejection_stats()
++                    .strong_long_training_not_found
++            )
++        );
++    }
++    #[test]
+     fn radio_false_short_preamble_does_not_hide_following_frame() {
+         let mut fixtures: Vec<_> = [6, 9, 12, 18, 24, 36, 48, 54]
+             .into_iter()
+@@ -666,6 +1201,217 @@ mod tests {
+         }
+     }
+     #[test]
++    fn radio_reference_relaxed_probe_preserves_strong_frame_and_recovers_impaired_ltf() {
++        let cases: [(&str, &[u8], &[u8]); 2] = [
++            (
++                "legacy",
++                include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean.cs8"),
++                include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean-training-ltf_dc.cs8"),
++            ),
++            (
++                "ht20",
++                include_bytes!("../../../../tests/fixtures/iq/ht-bcc-0-gi800-len100-clean.cs8"),
++                include_bytes!(
++                    "../../../../tests/fixtures/iq/ht-bcc-0-gi800-len100-clean-training-ltf_dc.cs8"
++                ),
++            ),
++        ];
++        for (name, clean, source) in cases {
++            let mut impaired = source.to_vec();
++            for sample in (37 + 192)..(37 + 192 + 128) {
++                let input = impaired[2 * sample] as i8;
++                let shifted = input
++                    .checked_add(12)
++                    .expect("the deterministic LTF impairment must not clip");
++                impaired[2 * sample] = shifted as u8;
++            }
++            let mut baseline_decoder = WifiDecoder::new();
++            let baseline = feed(&mut baseline_decoder, clean, 127);
++            assert_eq!(baseline.frames.len(), 1, "{name}");
++            let expected = baseline.frames[0].bytes.clone();
++            let expected_end = baseline.frames[0].end_sample_index;
++            let shift = clean.len() as u64 / 2 + 384;
++
++            let mut combined = Vec::with_capacity(clean.len() + 384 * 2 + impaired.len());
++            combined.extend_from_slice(clean);
++            combined.resize(combined.len() + 384 * 2, 0);
++            combined.extend_from_slice(&impaired);
++            for chunk in [1, 127, 65_536] {
++                let mut decoder = WifiDecoder::new();
++                let output = feed(&mut decoder, &combined, chunk);
++                assert_eq!(output.frames.len(), 2, "{name} chunk={chunk}");
++                assert_eq!(
++                    output
++                        .frames
++                        .iter()
++                        .map(|frame| frame.start.sample_index)
++                        .collect::<Vec<_>>(),
++                    [37, 37 + shift],
++                    "{name} chunk={chunk}"
++                );
++                assert_eq!(
++                    output
++                        .frames
++                        .iter()
++                        .map(|frame| frame.end_sample_index)
++                        .collect::<Vec<_>>(),
++                    [expected_end, expected_end + shift],
++                    "{name} chunk={chunk}"
++                );
++                for frame in &output.frames {
++                    assert_eq!(frame.bytes, expected, "{name} chunk={chunk}");
++                    assert_eq!(
++                        frame.integrity,
++                        FrameIntegrity::ValidFcs,
++                        "{name} chunk={chunk}"
++                    );
++                    assert!(valid_fcs(&frame.bytes), "{name} chunk={chunk}");
++                }
++                let correlations = output
++                    .frames
++                    .iter()
++                    .map(|frame| {
++                        frame
++                            .diagnostics
++                            .iter()
++                            .find_map(|diagnostic| match diagnostic {
++                                PhyDiagnostic::Ofdm {
++                                    training_correlation,
++                                    ..
++                                } => Some(*training_correlation),
++                                _ => None,
++                            })
++                            .unwrap()
++                    })
++                    .collect::<Vec<_>>();
++                assert!(correlations[0] >= 0.25, "{name} chunk={chunk}");
++                assert!(
++                    (0.19..0.25).contains(&correlations[1]),
++                    "{name} correlation={} chunk={chunk}",
++                    correlations[1]
++                );
++                if name == "legacy" {
++                    assert!((correlations[1] - 0.219_164_97).abs() < 1e-6);
++                }
++
++                let stats = decoder.ofdm_stats();
++                let rejections = decoder.ofdm_rejection_stats();
++                let strong = decoder.ofdm_strong_long_training_stats();
++                if name == "legacy" {
++                    assert_eq!(
++                        stats,
++                        DecoderStats {
++                            valid_frames: 2,
++                            rejected_frames: 1,
++                            ..DecoderStats::default()
++                        },
++                        "{name} chunk={chunk}"
++                    );
++                    assert_eq!(
++                        rejections,
++                        OfdmRejectionStats {
++                            strong_long_training_not_found: 1,
++                            ..OfdmRejectionStats::default()
++                        },
++                        "{name} chunk={chunk}"
++                    );
++                    assert_eq!(
++                        strong,
++                        OfdmStrongLongTrainingStats {
++                            strong_long_reference_not_found: 1,
++                            ..OfdmStrongLongTrainingStats::default()
++                        },
++                        "{name} chunk={chunk}"
++                    );
++                } else {
++                    assert_eq!(stats.valid_frames, 2, "{name} chunk={chunk}");
++                    assert_eq!(stats.invalid_fcs, 0, "{name} chunk={chunk}");
++                    assert_eq!(stats.truncated_frames, 0, "{name} chunk={chunk}");
++                    assert_eq!(stats.dropped_frames, 0, "{name} chunk={chunk}");
++                    assert_eq!(
++                        rejections.pending_capacity_rejected, 0,
++                        "{name} chunk={chunk}"
++                    );
++                    assert_eq!(
++                        strong.strong_long_reference_not_found, 1,
++                        "{name} chunk={chunk}"
++                    );
++                }
++                assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++                assert_eq!(
++                    strong.checked_total(),
++                    Some(rejections.strong_long_training_not_found)
++                );
++            }
++
++            if name == "legacy" {
++                let mut decoder = LegacyOfdmDecoder::new();
++                let output = feed(&mut decoder, &combined, 127);
++                assert_eq!(output.frames.len(), 2);
++                assert_eq!(decoder.stats().valid_frames, 2);
++                assert_eq!(
++                    decoder.strong_long_training_stats(),
++                    OfdmStrongLongTrainingStats {
++                        strong_long_reference_not_found: 1,
++                        ..OfdmStrongLongTrainingStats::default()
++                    }
++                );
++
++                let mut bounded = config();
++                bounded.max_pending_frames = 1;
++                let mut decoder = LegacyOfdmDecoder::new();
++                let output = feed_config(&mut decoder, &combined, 127, bounded).unwrap();
++                assert_eq!(output.frames.len(), 2);
++                assert_eq!(decoder.stats().valid_frames, 2);
++                assert_eq!(decoder.rejection_stats().pending_capacity_rejected, 0);
++            }
++        }
++    }
++    #[test]
++    fn radio_strong_acquisition_evicts_relaxed_pending_under_sample_pressure() {
++        let bytes = include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean.cs8");
++        let mut bounded = config();
++        bounded.max_chunk_samples = 127;
++        bounded.max_buffer_samples = 3_000;
++        let mut samples = Vec::with_capacity(2_960);
++        samples.resize(300, ComplexSample::ZERO);
++        let mut decoder = LegacyOfdmDecoder::new();
++        decoder.pending[0] = Some(Pending {
++            weak: true,
++            acquisition: Acquisition {
++                preamble_start: 10_000,
++                signal_start: 10_320,
++                phase_origin: 10_000,
++                frequency_rad: 0.,
++                coarse_frequency_rad: 0.,
++                channel: [ComplexSample::ZERO; 64],
++                iq_balance: [0.; 2],
++                noise_power: [0.; 2],
++                early_channel: [[ComplexSample::ZERO; 64]; 3],
++                correlation: 0.22,
++            },
++            start: IqPosition {
++                epoch: 0,
++                sequence: 0,
++                sample_index: 10_000,
++                time_anchor: None,
++                discontinuity: None,
++            },
++            samples,
++            info: None,
++            ht: None,
++        });
++
++        let output = feed_config(&mut decoder, bytes, 127, bounded).unwrap();
++        assert_eq!(output.frames.len(), 1);
++        assert_eq!(output.frames[0].start.sample_index, 37);
++        assert_eq!(output.frames[0].integrity, FrameIntegrity::ValidFcs);
++        assert!(valid_fcs(&output.frames[0].bytes));
++        assert_eq!(decoder.stats().valid_frames, 1);
++        assert_eq!(decoder.rejection_stats().pending_capacity_rejected, 0);
++        assert!(decoder.pending.iter().all(Option::is_none));
++    }
++    #[test]
+     fn radio_ht_extension_training_streaming_independent_iq() {
+         let rows: Vec<_> = include_str!("../../../../tests/fixtures/iq/ht-extension-index.tsv")
+             .lines()
+@@ -1601,6 +2347,57 @@ mod tests {
+             .is_empty());
+     }
+     #[test]
++    fn radio_gap_discards_in_progress_strong_candidate_without_rejection() {
++        let bytes = include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean.cs8");
++        let mut decoder = LegacyOfdmDecoder::new();
++        let chunk = |sample_index, sequence, data: &[u8]| {
++            IqChunk::new(
++                config(),
++                IqPosition {
++                    epoch: 0,
++                    sequence,
++                    sample_index,
++                    time_anchor: None,
++                    discontinuity: None,
++                },
++                data.iter().map(|value| *value as i8).collect(),
++            )
++            .unwrap()
++        };
++
++        // The first 200 samples establish short-period progress but end before
++        // the clean fixture's long-training pair can complete.
++        decoder
++            .consume(IqEvent::Chunk(chunk(0, 0, &bytes[..400])))
++            .unwrap();
++        assert_eq!(decoder.stats().truncated_frames, 0);
++        assert_eq!(decoder.rejection_stats(), OfdmRejectionStats::default());
++        assert_eq!(
++            decoder.strong_long_training_stats(),
++            OfdmStrongLongTrainingStats::default()
++        );
++
++        let output = decoder
++            .consume(IqEvent::Chunk(chunk(201, 1, &[0, 0])))
++            .unwrap();
++        assert_eq!(decoder.stats().truncated_frames, 1);
++        assert!(output
++            .diagnostics
++            .iter()
++            .any(|diagnostic| matches!(diagnostic, PhyDiagnostic::TruncatedFrame)));
++        let stats = decoder.stats();
++        let rejections = decoder.rejection_stats();
++        let details = decoder.strong_long_training_stats();
++        assert_eq!(stats.rejected_frames, 0);
++        assert_eq!(rejections, OfdmRejectionStats::default());
++        assert_eq!(details, OfdmStrongLongTrainingStats::default());
++        assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++        assert_eq!(
++            details.checked_total(),
++            Some(rejections.strong_long_training_not_found)
++        );
++    }
++    #[test]
+     fn radio_data_end_gap_and_buffer_bound() {
+         let bytes = include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean.cs8");
+         let mut decoder = LegacyOfdmDecoder::new();
+diff --git a/crafter/src/radio/wifi/ofdm/sync.rs b/crafter/src/radio/wifi/ofdm/sync.rs
+index 24ea8989..2b47a734 100644
+--- a/crafter/src/radio/wifi/ofdm/sync.rs
++++ b/crafter/src/radio/wifi/ofdm/sync.rs
+@@ -82,6 +82,12 @@ pub(in crate::radio) const LONG: [i8; 53] = [
+     1, 1, -1, -1, 1, 1, -1, 1, -1, 1, 1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1, 1, 1, 1, 0, 1, -1,
+     -1, 1, 1, -1, 1, -1, 1, -1, -1, -1, -1, -1, 1, 1, -1, -1, 1, -1, 1, -1, 1, 1, 1, 1,
+ ];
++const STRONG_REPEAT_THRESHOLD: f32 = 0.5;
++const STRONG_REFERENCE_THRESHOLD: f32 = 0.25;
++const REFERENCE_RELAXED_THRESHOLD: f32 = 0.19;
++const WEAK_REPEAT_THRESHOLD: f32 = 0.16;
++const REFERENCE_RELAXED_INTERVAL_SAMPLES: u64 = 32;
++const WEAK_REPORT_INTERVAL_SAMPLES: u64 = 32;
+ fn long_time() -> [ComplexSample; 64] {
+     let mut bins = [ComplexSample::ZERO; 64];
+     for (i, v) in LONG.iter().enumerate() {
+@@ -104,8 +110,20 @@ pub(in crate::radio) struct Acquisition {
+     pub correlation: f32,
+ }
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(in crate::radio) enum StrongLongTrainingFailure {
++    /// The candidate expired before any long-training window was eligible for
++    /// evaluation; intervening samples are not asserted to remain periodic.
++    ShortPeriodicityTimeout,
++    /// No evaluated window passed the repeated-training gate.
++    LongRepeatNotFound,
++    /// Repetition passed, but no evaluated window passed the known-LTF gate.
++    LongReferenceNotFound,
++    /// Known-LTF evidence passed, but packet coordinates could not be formed.
++    LongCoordinatesUnavailable,
++}
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(in crate::radio) enum AcquisitionFailure {
+-    LongTrainingNotFound,
++    LongTrainingNotFound(StrongLongTrainingFailure),
+     Interrupted,
+     UnsupportedSampleRate,
+ }
+@@ -120,6 +138,32 @@ pub(in crate::radio) enum SyncEvent {
+ struct Candidate {
+     detected: u64,
+     coarse: f32,
++    furthest_long_failure: Option<StrongLongTrainingFailure>,
++}
++impl Candidate {
++    fn note_long_failure(&mut self, failure: StrongLongTrainingFailure) {
++        if self
++            .furthest_long_failure
++            .is_none_or(|current| failure.rank() > current.rank())
++        {
++            self.furthest_long_failure = Some(failure);
++        }
++    }
++
++    fn terminal_long_failure(self) -> StrongLongTrainingFailure {
++        self.furthest_long_failure
++            .unwrap_or(StrongLongTrainingFailure::ShortPeriodicityTimeout)
++    }
++}
++impl StrongLongTrainingFailure {
++    const fn rank(self) -> u8 {
++        match self {
++            Self::ShortPeriodicityTimeout => 0,
++            Self::LongRepeatNotFound => 1,
++            Self::LongReferenceNotFound => 2,
++            Self::LongCoordinatesUnavailable => 3,
++        }
++    }
+ }
+ #[derive(Clone, Copy)]
+ struct LongWindow {
+@@ -139,6 +183,7 @@ pub(in crate::radio) struct Synchronizer {
+     weak_candidate: Option<Candidate>,
+     weak_strength: f32,
+     weak_report: Option<u64>,
++    reference_relaxed_report: Option<u64>,
+     long_window: Option<LongWindow>,
+     candidate: Option<Candidate>,
+     reference: [ComplexSample; 64],
+@@ -156,6 +201,7 @@ impl Default for Synchronizer {
+             weak_candidate: None,
+             weak_strength: 0.,
+             weak_report: None,
++            reference_relaxed_report: None,
+             long_window: None,
+             candidate: None,
+             reference: long_time(),
+@@ -174,6 +220,7 @@ impl Synchronizer {
+         self.weak_candidate = None;
+         self.weak_strength = 0.;
+         self.weak_report = None;
++        self.reference_relaxed_report = None;
+         self.long_window = None;
+         interrupted
+     }
+@@ -248,9 +295,11 @@ impl Synchronizer {
+         // replace a stale search before that search's timeout can hide its LTF.
+         let periodic = self.count >= 80 && a > 0.001 && b > 0.001 && p.power() > 0.6 * a * b;
+         if periodic && (!self.short_periodic || self.candidate.is_none()) {
++            self.reference_relaxed_report = None;
+             self.candidate = Some(Candidate {
+                 detected: index,
+                 coarse: p.phase() / 16.,
++                furthest_long_failure: None,
+             });
+         }
+         self.short_periodic = periodic;
+@@ -264,6 +313,7 @@ impl Synchronizer {
+                 self.weak_candidate = Some(Candidate {
+                     detected: index,
+                     coarse: p.phase() / 16.,
++                    furthest_long_failure: None,
+                 });
+                 self.weak_strength = strength;
+                 self.weak_report = None;
+@@ -276,11 +326,49 @@ impl Synchronizer {
+         if let Some(c) = self.candidate {
+             if index - c.detected > 320 {
+                 self.candidate = None;
+-                failure = Some(SyncEvent::Failure(AcquisitionFailure::LongTrainingNotFound));
++                self.reference_relaxed_report = None;
++                failure = Some(SyncEvent::Failure(
++                    AcquisitionFailure::LongTrainingNotFound(c.terminal_long_failure()),
++                ));
+             } else if index - c.detected >= 128 && self.count >= 128 && !periodic {
+-                if let Some(acquisition) = self.acquire_long(index, c.coarse, 0.5) {
+-                    self.clear();
+-                    return Some(SyncEvent::Acquired(acquisition));
++                match self.acquire_long(
++                    index,
++                    c.coarse,
++                    STRONG_REPEAT_THRESHOLD,
++                    STRONG_REFERENCE_THRESHOLD,
++                ) {
++                    Ok(acquisition) => {
++                        self.clear();
++                        return Some(SyncEvent::Acquired(acquisition));
++                    }
++                    Err(StrongLongTrainingFailure::LongReferenceNotFound) => {
++                        // A bounded reference-relaxed hypothesis must not consume
++                        // the original strong search. SIGNAL and FCS still decide
++                        // whether this lower-priority path can publish a frame.
++                        if let Some(candidate) = self.candidate.as_mut() {
++                            candidate.note_long_failure(
++                                StrongLongTrainingFailure::LongReferenceNotFound,
++                            );
++                        }
++                        if let Ok(acquisition) = self.acquire_long(
++                            index,
++                            c.coarse,
++                            STRONG_REPEAT_THRESHOLD,
++                            REFERENCE_RELAXED_THRESHOLD,
++                        ) {
++                            if self.reference_relaxed_report.is_none_or(|last| {
++                                index - last >= REFERENCE_RELAXED_INTERVAL_SAMPLES
++                            }) {
++                                self.reference_relaxed_report = Some(index);
++                                return Some(SyncEvent::WeakAcquired(acquisition));
++                            }
++                        }
++                    }
++                    Err(reason) => {
++                        if let Some(candidate) = self.candidate.as_mut() {
++                            candidate.note_long_failure(reason);
++                        }
++                    }
+                 }
+             }
+         }
+@@ -293,9 +381,16 @@ impl Synchronizer {
+             } else if index - c.detected >= 128
+                 && self.count >= 128
+                 && !weak_periodic
+-                && self.weak_report.map_or(true, |last| index - last >= 32)
++                && self
++                    .weak_report
++                    .is_none_or(|last| index - last >= WEAK_REPORT_INTERVAL_SAMPLES)
+             {
+-                if let Some(acquisition) = self.acquire_long(index, c.coarse, 0.16) {
++                if let Ok(acquisition) = self.acquire_long(
++                    index,
++                    c.coarse,
++                    WEAK_REPEAT_THRESHOLD,
++                    STRONG_REFERENCE_THRESHOLD,
++                ) {
+                     self.weak_report = Some(index);
+                     return Some(SyncEvent::WeakAcquired(acquisition));
+                 }
+@@ -352,7 +447,8 @@ impl Synchronizer {
+         index: u64,
+         coarse: f32,
+         repeat_threshold: f32,
+-    ) -> Option<Acquisition> {
++        reference_threshold: f32,
++    ) -> Result<Acquisition, StrongLongTrainingFailure> {
+         let window = self.training_window(index);
+         let mut cross = window.cross;
+         let [repeat_a, repeat_b] = window.energy;
+@@ -360,7 +456,7 @@ impl Synchronizer {
+         // preserves its magnitude and both energies. Reject nonrepeating
+         // candidates before phase correction and reference matching.
+         if cross.power() < repeat_threshold * repeat_a * repeat_b || repeat_a + repeat_b < 0.002 {
+-            return None;
++            return Err(StrongLongTrainingFailure::LongRepeatNotFound);
+         }
+         cross = cross.mul(ComplexSample::rotation(-coarse * 64.));
+         let fine = cross.phase() / 64.;
+@@ -385,11 +481,18 @@ impl Synchronizer {
+         let score = match_sum.power() / (energy * (52. / 64.) + f32::MIN_POSITIVE);
+         // Multipath spreads training energy across delayed copies; the direct
+         // path need not dominate. Repetition, SIGNAL and PSDU FCS still gate RX.
+-        if score < 0.25 || energy < 0.001 {
+-            return None;
++        if score < reference_threshold || energy < 0.001 {
++            return Err(StrongLongTrainingFailure::LongReferenceNotFound);
+         }
+-        let first_index = index.checked_sub(127)?;
+-        let preamble_start = first_index.checked_sub(192)?;
++        let first_index = index
++            .checked_sub(127)
++            .ok_or(StrongLongTrainingFailure::LongCoordinatesUnavailable)?;
++        let preamble_start = first_index
++            .checked_sub(192)
++            .ok_or(StrongLongTrainingFailure::LongCoordinatesUnavailable)?;
++        let signal_start = index
++            .checked_add(1)
++            .ok_or(StrongLongTrainingFailure::LongCoordinatesUnavailable)?;
+         let bins = fft64(std::array::from_fn(|n| first[n].add(second[n]).scale(0.5)));
+         let mut channel = [ComplexSample::ZERO; 64];
+         for (i, v) in LONG.iter().enumerate() {
+@@ -459,12 +562,12 @@ impl Synchronizer {
+             }
+             shifted
+         });
+-        Some(Acquisition {
++        Ok(Acquisition {
+             early_channel,
+             noise_power,
+             iq_balance,
+             preamble_start,
+-            signal_start: index + 1,
++            signal_start,
+             phase_origin: first_index,
+             frequency_rad: frequency,
+             coarse_frequency_rad: coarse,
+@@ -522,6 +625,343 @@ mod tests {
+             }
+         }
+     }
++    #[test]
++    fn radio_sync_long_training_gate_failures_and_progress_are_typed() {
++        let mut no_repeat = Synchronizer::default();
++        assert!(matches!(
++            no_repeat.acquire_long(127, 0., STRONG_REPEAT_THRESHOLD, STRONG_REFERENCE_THRESHOLD,),
++            Err(StrongLongTrainingFailure::LongRepeatNotFound)
++        ));
++
++        let mut no_reference = Synchronizer::default();
++        for index in 0..128 {
++            let _ = no_reference.push(ComplexSample { i: 0.5, q: 0. }, index);
++        }
++        assert!(matches!(
++            no_reference
++                .acquire_long(127, 0., STRONG_REPEAT_THRESHOLD, STRONG_REFERENCE_THRESHOLD,),
++            Err(StrongLongTrainingFailure::LongReferenceNotFound)
++        ));
++
++        let mut no_coordinates = Synchronizer::default();
++        let reference = no_coordinates.reference;
++        for (index, sample) in reference.into_iter().chain(reference).enumerate() {
++            let _ = no_coordinates.push(sample, index as u64);
++        }
++        assert!(matches!(
++            no_coordinates.acquire_long(
++                127,
++                0.,
++                STRONG_REPEAT_THRESHOLD,
++                STRONG_REFERENCE_THRESHOLD,
++            ),
++            Err(StrongLongTrainingFailure::LongCoordinatesUnavailable)
++        ));
++
++        let mut candidate = Candidate {
++            detected: 0,
++            coarse: 0.,
++            furthest_long_failure: None,
++        };
++        candidate.note_long_failure(StrongLongTrainingFailure::LongReferenceNotFound);
++        candidate.note_long_failure(StrongLongTrainingFailure::LongRepeatNotFound);
++        assert_eq!(
++            candidate.terminal_long_failure(),
++            StrongLongTrainingFailure::LongReferenceNotFound
++        );
++        candidate.note_long_failure(StrongLongTrainingFailure::LongCoordinatesUnavailable);
++        assert_eq!(
++            candidate.terminal_long_failure(),
++            StrongLongTrainingFailure::LongCoordinatesUnavailable
++        );
++    }
++    fn lowered_reference_window(sync: &Synchronizer) -> [ComplexSample; 128] {
++        let target_score = 0.22_f32;
++        let reference_energy = 52.0_f32 / 64.0;
++        let dc = (reference_energy * (1. / target_score - 1.) / 64.).sqrt();
++        std::array::from_fn(|n| {
++            let mut sample = sync.reference[n % 64];
++            sample.i += dc;
++            sample
++        })
++    }
++    fn install_reference_window(sync: &mut Synchronizer, window: &[ComplexSample; 128]) {
++        sync.ring.fill(ComplexSample::ZERO);
++        sync.ring[..127].copy_from_slice(&window[..127]);
++        sync.count = 127;
++        sync.next = 127;
++        sync.short_correlation = ComplexSample::ZERO;
++        sync.short_energy = [0.; 2];
++        sync.short_periodic = false;
++        sync.weak_candidate = None;
++        sync.weak_strength = 0.;
++        sync.weak_report = None;
++        sync.long_window = None;
++    }
++    #[test]
++    fn radio_sync_reference_relaxed_match_is_rate_limited_probe() {
++        let mut direct = Synchronizer::default();
++        let window = lowered_reference_window(&direct);
++        direct.ring[..128].copy_from_slice(&window);
++        direct.count = 128;
++        direct.next = 128;
++        assert!(matches!(
++            direct.acquire_long(319, 0., STRONG_REPEAT_THRESHOLD, STRONG_REFERENCE_THRESHOLD,),
++            Err(StrongLongTrainingFailure::LongReferenceNotFound)
++        ));
++        direct.long_window = None;
++        let probe = direct
++            .acquire_long(
++                319,
++                0.,
++                STRONG_REPEAT_THRESHOLD,
++                REFERENCE_RELAXED_THRESHOLD,
++            )
++            .unwrap();
++        assert!(
++            (REFERENCE_RELAXED_THRESHOLD..STRONG_REFERENCE_THRESHOLD).contains(&probe.correlation)
++        );
++        assert_eq!(probe.preamble_start, 0);
++        assert_eq!(probe.signal_start, 320);
++
++        let mut sync = Synchronizer {
++            candidate: Some(Candidate {
++                detected: 100,
++                coarse: 0.,
++                furthest_long_failure: None,
++            }),
++            ..Default::default()
++        };
++        install_reference_window(&mut sync, &window);
++        let first = sync.push(window[127], 319);
++        assert!(matches!(first, Some(SyncEvent::WeakAcquired(_))));
++        assert!(sync.candidate.is_some());
++        assert_eq!(sync.reference_relaxed_report, Some(319));
++        assert_eq!(
++            sync.candidate.unwrap().furthest_long_failure,
++            Some(StrongLongTrainingFailure::LongReferenceNotFound)
++        );
++
++        install_reference_window(&mut sync, &window);
++        assert!(sync.push(window[127], 320).is_none());
++        assert_eq!(sync.reference_relaxed_report, Some(319));
++        install_reference_window(&mut sync, &window);
++        assert!(matches!(
++            sync.push(window[127], 351),
++            Some(SyncEvent::WeakAcquired(_))
++        ));
++        assert_eq!(sync.reference_relaxed_report, Some(351));
++        assert!(sync.clear());
++        assert_eq!(sync.reference_relaxed_report, None);
++
++        let mut early = Synchronizer {
++            candidate: Some(Candidate {
++                detected: 0,
++                coarse: 0.,
++                furthest_long_failure: None,
++            }),
++            ..Default::default()
++        };
++        install_reference_window(&mut early, &window);
++        assert!(early.push(window[127], 200).is_none());
++        assert_eq!(early.reference_relaxed_report, None);
++        assert_eq!(
++            early.candidate.unwrap().furthest_long_failure,
++            Some(StrongLongTrainingFailure::LongReferenceNotFound)
++        );
++
++        let mut later_strong = Synchronizer {
++            candidate: Some(Candidate {
++                detected: 100,
++                coarse: 0.,
++                furthest_long_failure: None,
++            }),
++            ..Default::default()
++        };
++        install_reference_window(&mut later_strong, &window);
++        assert!(matches!(
++            later_strong.push(window[127], 319),
++            Some(SyncEvent::WeakAcquired(_))
++        ));
++        let accepted = std::array::from_fn(|n| later_strong.reference[n % 64]);
++        install_reference_window(&mut later_strong, &accepted);
++        assert!(matches!(
++            later_strong.push(accepted[127], 350),
++            Some(SyncEvent::Acquired(_))
++        ));
++        assert!(later_strong.candidate.is_none());
++        assert_eq!(later_strong.reference_relaxed_report, None);
++
++        let mut expires = Synchronizer {
++            candidate: Some(Candidate {
++                detected: 100,
++                coarse: 0.,
++                furthest_long_failure: None,
++            }),
++            ..Default::default()
++        };
++        install_reference_window(&mut expires, &window);
++        assert!(matches!(
++            expires.push(window[127], 319),
++            Some(SyncEvent::WeakAcquired(_))
++        ));
++        assert!(matches!(
++            expires.push(ComplexSample::ZERO, 421),
++            Some(SyncEvent::Failure(
++                AcquisitionFailure::LongTrainingNotFound(
++                    StrongLongTrainingFailure::LongReferenceNotFound
++                )
++            ))
++        ));
++        assert_eq!(expires.reference_relaxed_report, None);
++
++        // A throttled strong-reference probe must fall through so that the
++        // independent weak-STF lane can still process its own candidate.
++        let mut lanes = Synchronizer {
++            candidate: Some(Candidate {
++                detected: 100,
++                coarse: 0.,
++                furthest_long_failure: None,
++            }),
++            ..Default::default()
++        };
++        install_reference_window(&mut lanes, &window);
++        lanes.reference_relaxed_report = Some(320);
++        lanes.weak_candidate = Some(Candidate {
++            detected: 0,
++            coarse: 0.,
++            furthest_long_failure: None,
++        });
++        assert!(lanes.push(window[127], 321).is_none());
++        assert_eq!(lanes.reference_relaxed_report, Some(320));
++        assert!(lanes.weak_candidate.is_none());
++        assert_eq!(
++            lanes.candidate.unwrap().furthest_long_failure,
++            Some(StrongLongTrainingFailure::LongReferenceNotFound)
++        );
++    }
++    #[test]
++    fn radio_sync_repeat_failure_survives_to_terminal_event() {
++        let mut sync = Synchronizer {
++            candidate: Some(Candidate {
++                detected: 0,
++                coarse: 0.,
++                furthest_long_failure: None,
++            }),
++            ..Default::default()
++        };
++        for index in 0..=320 {
++            assert!(sync.push(ComplexSample::ZERO, index).is_none());
++        }
++        assert_eq!(
++            sync.candidate.unwrap().furthest_long_failure,
++            Some(StrongLongTrainingFailure::LongRepeatNotFound)
++        );
++        assert!(matches!(
++            sync.push(ComplexSample::ZERO, 321),
++            Some(SyncEvent::Failure(
++                AcquisitionFailure::LongTrainingNotFound(
++                    StrongLongTrainingFailure::LongRepeatNotFound
++                )
++            ))
++        ));
++    }
++    #[test]
++    fn radio_sync_coordinate_failure_survives_to_terminal_event() {
++        let bytes = include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean.cs8");
++        // Retain 96 STF samples, the long-training guard, and both LTF symbols,
++        // but move them too close to epoch zero to form the preamble coordinate.
++        let start_sample = 101;
++        let end_sample = 37 + 320;
++        let shifted = &bytes[start_sample * 2..end_sample * 2];
++        let mut sync = Synchronizer::default();
++        for (index, pair) in shifted.chunks_exact(2).enumerate() {
++            let event = sync.push(
++                ComplexSample {
++                    i: pair[0] as i8 as f32 / 128.,
++                    q: pair[1] as i8 as f32 / 128.,
++                },
++                index as u64,
++            );
++            assert!(!matches!(event, Some(SyncEvent::Acquired(_))));
++        }
++        let candidate = sync.candidate.unwrap();
++        assert_eq!(
++            candidate.furthest_long_failure,
++            Some(StrongLongTrainingFailure::LongCoordinatesUnavailable)
++        );
++        // Isolate expiration from any later shifted match while preserving the
++        // real candidate and its recorded furthest gate.
++        sync.ring.fill(ComplexSample::ZERO);
++        sync.short_correlation = ComplexSample::ZERO;
++        sync.short_energy = [0.; 2];
++        sync.short_periodic = false;
++        sync.weak_candidate = None;
++        sync.long_window = None;
++        let mut failure = None;
++        for index in shifted.len() / 2..=candidate.detected as usize + 321 {
++            if let Some(SyncEvent::Failure(AcquisitionFailure::LongTrainingNotFound(reason))) =
++                sync.push(ComplexSample::ZERO, index as u64)
++            {
++                failure = Some(reason);
++            }
++        }
++        assert_eq!(
++            failure,
++            Some(StrongLongTrainingFailure::LongCoordinatesUnavailable)
++        );
++    }
++    #[test]
++    fn radio_sync_success_discards_intermediate_gate_failures() {
++        let bytes = include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean.cs8");
++        let mut sync = Synchronizer::default();
++        let mut failures = Vec::new();
++        let mut acquired_with_prior_failure = false;
++        for (index, pair) in bytes.chunks_exact(2).enumerate() {
++            let prior_failure = sync
++                .candidate
++                .and_then(|candidate| candidate.furthest_long_failure);
++            match sync.push(
++                ComplexSample {
++                    i: pair[0] as i8 as f32 / 128.,
++                    q: pair[1] as i8 as f32 / 128.,
++                },
++                index as u64,
++            ) {
++                Some(SyncEvent::Acquired(_)) => {
++                    acquired_with_prior_failure = prior_failure.is_some();
++                    break;
++                }
++                Some(SyncEvent::Failure(AcquisitionFailure::LongTrainingNotFound(reason))) => {
++                    failures.push(reason);
++                }
++                _ => {}
++            }
++        }
++        assert!(acquired_with_prior_failure);
++        assert!(failures.is_empty());
++        assert!(sync.candidate.is_none());
++    }
++    #[test]
++    fn radio_sync_replacement_resets_progress_without_failure() {
++        let mut sync = Synchronizer::default();
++        for index in 0..100 {
++            let _ = sync.push(ComplexSample { i: 0.5, q: 0. }, index);
++        }
++        let old_detected = sync.candidate.unwrap().detected;
++        sync.candidate
++            .as_mut()
++            .unwrap()
++            .note_long_failure(StrongLongTrainingFailure::LongReferenceNotFound);
++        sync.reference_relaxed_report = Some(99);
++        sync.short_periodic = false;
++        assert!(sync.push(ComplexSample { i: 0.5, q: 0. }, 100).is_none());
++        let replacement = sync.candidate.unwrap();
++        assert_ne!(replacement.detected, old_detected);
++        assert_eq!(replacement.detected, 100);
++        assert_eq!(replacement.furthest_long_failure, None);
++        assert_eq!(sync.reference_relaxed_report, None);
++    }
+     fn run(bytes: &[u8], size: usize) -> Vec<Acquisition> {
+         let mut s = Synchronizer::default();
+         let mut out = Vec::new();
+@@ -655,6 +1095,7 @@ mod tests {
+         let bytes = include_bytes!("../../../../tests/fixtures/iq/ofdm-6-clean-training-ltf.cs8");
+         let mut sync = Synchronizer::default();
+         let mut weak = 0;
++        let mut strong_failures = Vec::new();
+         for (index, pair) in bytes.chunks_exact(2).enumerate() {
+             let previous = sync.candidate.map(|c| c.detected);
+             let event = sync.push(
+@@ -664,14 +1105,24 @@ mod tests {
+                 },
+                 index as u64,
+             );
+-            if matches!(event, Some(SyncEvent::WeakAcquired(_))) {
+-                weak += 1;
+-                assert!(previous.is_some());
+-                assert_eq!(sync.candidate.map(|c| c.detected), previous);
+-                assert_eq!(sync.count, 256);
++            match event {
++                Some(SyncEvent::WeakAcquired(_)) => {
++                    weak += 1;
++                    assert!(previous.is_some());
++                    assert_eq!(sync.candidate.map(|c| c.detected), previous);
++                    assert_eq!(sync.count, 256);
++                }
++                Some(SyncEvent::Failure(AcquisitionFailure::LongTrainingNotFound(reason))) => {
++                    strong_failures.push(reason);
++                }
++                _ => {}
+             }
+         }
+         assert_eq!(weak, 1);
++        assert_eq!(
++            strong_failures,
++            [StrongLongTrainingFailure::LongReferenceNotFound]
++        );
+     }
+     #[test]
+     fn radio_sync_noise_rejection_and_bounded_failure() {
+@@ -684,15 +1135,18 @@ mod tests {
+             .collect();
+         assert!(run(&bytes, 31).is_empty());
+         let mut s = Synchronizer::default();
+-        let mut failed = false;
++        let mut failure = None;
+         for i in 0..1000 {
+-            if let Some(SyncEvent::Failure(AcquisitionFailure::LongTrainingNotFound)) =
++            if let Some(SyncEvent::Failure(AcquisitionFailure::LongTrainingNotFound(reason))) =
+                 s.push(ComplexSample { i: 0.5, q: 0. }, i)
+             {
+-                failed = true;
++                failure = Some(reason);
+             }
+         }
+-        assert!(failed);
++        assert_eq!(
++            failure,
++            Some(StrongLongTrainingFailure::ShortPeriodicityTimeout)
++        );
+         assert!(s.ring.len() <= 384);
+         assert!(s.count <= s.ring.len());
+     }
+diff --git a/crafter/src/radio/wifi/parallel.rs b/crafter/src/radio/wifi/parallel.rs
+index e8bced82..4fc041a1 100644
+--- a/crafter/src/radio/wifi/parallel.rs
++++ b/crafter/src/radio/wifi/parallel.rs
+@@ -1,7 +1,7 @@
+ //! Bounded parallel Wi-Fi PHY dispatch; sources and packet parsing stay unchanged.
+ use super::{
+     dsss::DsssCckDecoder,
+-    ofdm::{DecoderStats, LegacyOfdmDecoder},
++    ofdm::{DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats},
+     same_occurrence,
+ };
+ use crate::radio::{
+@@ -133,6 +133,8 @@ enum Command {
+ struct Reply {
+     result: RadioResult<DecodeOutput>,
+     stats: DecoderStats,
++    rejections: OfdmRejectionStats,
++    strong_long_training: OfdmStrongLongTrainingStats,
+ }
+ struct Worker {
+     commands: Option<mpsc::SyncSender<Command>>,
+@@ -143,6 +145,8 @@ impl Worker {
+     fn new<D: PhyDecoder + Send + 'static>(
+         mut decoder: D,
+         stats: fn(&D) -> DecoderStats,
++        rejections: Option<fn(&D) -> OfdmRejectionStats>,
++        strong_long_training: Option<fn(&D) -> OfdmStrongLongTrainingStats>,
+         family: u8,
+     ) -> RadioResult<Self> {
+         let (commands, receive) = mpsc::sync_channel(1);
+@@ -173,6 +177,12 @@ impl Worker {
+                         .send(Reply {
+                             result,
+                             stats: stats(&decoder),
++                            rejections: rejections
++                                .map_or_else(OfdmRejectionStats::default, |read| read(&decoder)),
++                            strong_long_training: strong_long_training
++                                .map_or_else(OfdmStrongLongTrainingStats::default, |read| {
++                                    read(&decoder)
++                                }),
+                         })
+                         .is_err()
+                     {
+@@ -276,6 +286,8 @@ fn process(
+ pub struct ParallelLegacyWifiDecoder {
+     workers: Vec<Worker>,
+     stats: Vec<DecoderStats>,
++    rejections: Vec<OfdmRejectionStats>,
++    strong_long_training: Vec<OfdmStrongLongTrainingStats>,
+     recent: Vec<RecoveredFrame>,
+     continuity: IqContinuity,
+     sequence: u64,
+@@ -284,22 +296,34 @@ pub struct ParallelLegacyWifiDecoder {
+ }
+ impl ParallelLegacyWifiDecoder {
+     fn configured(ofdm: LegacyOfdmDecoder, split_dsss: bool) -> RadioResult<Self> {
+-        let mut workers = vec![Worker::new(ofdm, LegacyOfdmDecoder::stats, 0)?];
++        let mut workers = vec![Worker::new(
++            ofdm,
++            LegacyOfdmDecoder::stats,
++            Some(LegacyOfdmDecoder::rejection_stats),
++            Some(LegacyOfdmDecoder::strong_long_training_stats),
++            0,
++        )?];
+         if split_dsss {
+             workers.push(Worker::new(
+                 DsssCckDecoder::phase_worker(0),
+                 DsssCckDecoder::stats,
++                None,
++                None,
+                 1,
+             )?);
+             workers.push(Worker::new(
+                 DsssCckDecoder::phase_worker(1),
+                 DsssCckDecoder::stats,
++                None,
++                None,
+                 2,
+             )?);
+         } else {
+             workers.push(Worker::new(
+                 DsssCckDecoder::new(),
+                 DsssCckDecoder::stats,
++                None,
++                None,
+                 1,
+             )?);
+         }
+@@ -307,6 +331,8 @@ impl ParallelLegacyWifiDecoder {
+         Ok(Self {
+             workers,
+             stats: vec![DecoderStats::default(); worker_count],
++            rejections: vec![OfdmRejectionStats::default(); worker_count],
++            strong_long_training: vec![OfdmStrongLongTrainingStats::default(); worker_count],
+             recent: Vec::new(),
+             continuity: IqContinuity::default(),
+             sequence: 0,
+@@ -324,8 +350,38 @@ impl ParallelLegacyWifiDecoder {
+         Self::configured(LegacyOfdmDecoder::new(), true)
+     }
+     pub fn ofdm_stats(&self) -> DecoderStats {
++        debug_assert_eq!(
++            self.rejections[0].checked_total(),
++            Some(self.stats[0].rejected_frames)
++        );
++        debug_assert_eq!(
++            self.strong_long_training[0].checked_total(),
++            Some(self.rejections[0].strong_long_training_not_found)
++        );
+         self.stats[0]
+     }
++    pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
++        debug_assert_eq!(
++            self.rejections[0].checked_total(),
++            Some(self.stats[0].rejected_frames)
++        );
++        debug_assert_eq!(
++            self.strong_long_training[0].checked_total(),
++            Some(self.rejections[0].strong_long_training_not_found)
++        );
++        self.rejections[0]
++    }
++    pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        debug_assert_eq!(
++            self.rejections[0].checked_total(),
++            Some(self.stats[0].rejected_frames)
++        );
++        debug_assert_eq!(
++            self.strong_long_training[0].checked_total(),
++            Some(self.rejections[0].strong_long_training_not_found)
++        );
++        self.strong_long_training[0]
++    }
+     pub fn dsss_stats(&self) -> DecoderStats {
+         self.stats[1..]
+             .iter()
+@@ -346,6 +402,8 @@ impl ParallelLegacyWifiDecoder {
+             match reply {
+                 Ok(reply) => {
+                     self.stats[i] = reply.stats;
++                    self.rejections[i] = reply.rejections;
++                    self.strong_long_training[i] = reply.strong_long_training;
+                     match reply.result {
+                         Ok(decoded) => output.diagnostics.extend(decoded.diagnostics),
+                         Err(e) => {
+@@ -507,6 +565,14 @@ impl ParallelWifiDecoder {
+         self.inner.ofdm_stats()
+     }
+ 
++    pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
++        self.inner.ofdm_rejection_stats()
++    }
++
++    pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        self.inner.ofdm_strong_long_training_stats()
++    }
++
+     pub fn dsss_stats(&self) -> DecoderStats {
+         self.inner.dsss_stats()
+     }
+@@ -606,7 +672,8 @@ mod tests {
+     #[test]
+     fn third_worker_failure_at_eof_is_not_successful_completion() {
+         let mut decoder = ParallelLegacyWifiDecoder::with_parallel_dsss().unwrap();
+-        decoder.workers[2] = Worker::new(FailedReset, |_| DecoderStats::default(), 2).unwrap();
++        decoder.workers[2] =
++            Worker::new(FailedReset, |_| DecoderStats::default(), None, None, 2).unwrap();
+         assert!(matches!(
+             decoder.consume(IqEvent::End(StreamEnd::Eof)),
+             Err(RadioError::Source(_))
+@@ -621,10 +688,12 @@ mod tests {
+     fn worker_failure_at_eof_is_not_successful_completion() {
+         let mut decoder = ParallelLegacyWifiDecoder {
+             workers: vec![
+-                Worker::new(FailedReset, |_| DecoderStats::default(), 0).unwrap(),
+-                Worker::new(DsssCckDecoder::new(), DsssCckDecoder::stats, 1).unwrap(),
++                Worker::new(FailedReset, |_| DecoderStats::default(), None, None, 0).unwrap(),
++                Worker::new(DsssCckDecoder::new(), DsssCckDecoder::stats, None, None, 1).unwrap(),
+             ],
+             stats: vec![DecoderStats::default(); 2],
++            rejections: vec![OfdmRejectionStats::default(); 2],
++            strong_long_training: vec![OfdmStrongLongTrainingStats::default(); 2],
+             recent: Vec::new(),
+             continuity: IqContinuity::default(),
+             sequence: 0,
+diff --git a/crafter/src/radio/wifi/windowed.rs b/crafter/src/radio/wifi/windowed.rs
+index 74e9f66d..c093ba71 100644
+--- a/crafter/src/radio/wifi/windowed.rs
++++ b/crafter/src/radio/wifi/windowed.rs
+@@ -1,7 +1,7 @@
+ //! Coarse-grained parallel Wi-Fi decoding over bounded overlapping time windows.
+ use super::{
+     dsss::DsssCckDecoder,
+-    ofdm::{DecoderStats, LegacyOfdmDecoder},
++    ofdm::{DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats},
+     LegacyWifiDecoder,
+ };
+ use crate::radio::{
+@@ -58,6 +58,18 @@ impl WindowDecoder {
+             Self::Dsss(_) => DecoderStats::default(),
+         }
+     }
++    fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
++        match self {
++            Self::Legacy(decoder) => decoder.ofdm_rejection_stats(),
++            Self::Dsss(_) => OfdmRejectionStats::default(),
++        }
++    }
++    fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        match self {
++            Self::Legacy(decoder) => decoder.ofdm_strong_long_training_stats(),
++            Self::Dsss(_) => OfdmStrongLongTrainingStats::default(),
++        }
++    }
+     fn dsss_stats(&self) -> DecoderStats {
+         match self {
+             Self::Legacy(decoder) => decoder.dsss_stats(),
+@@ -96,6 +108,8 @@ struct Reply {
+     core_end: u64,
+     result: RadioResult<DecodeOutput>,
+     ofdm: DecoderStats,
++    ofdm_rejections: OfdmRejectionStats,
++    ofdm_strong_long_training: OfdmStrongLongTrainingStats,
+     dsss: DecoderStats,
+ }
+ 
+@@ -106,6 +120,8 @@ fn run_worker(
+     replies: mpsc::Sender<Reply>,
+ ) {
+     let mut ofdm = DecoderStats::default();
++    let mut ofdm_rejections = OfdmRejectionStats::default();
++    let mut ofdm_strong_long_training = OfdmStrongLongTrainingStats::default();
+     let mut dsss = DecoderStats::default();
+     loop {
+         let job = match jobs.lock().unwrap_or_else(|e| e.into_inner()).recv() {
+@@ -156,6 +172,12 @@ fn run_worker(
+             }
+         }
+         ofdm = sum_stats(&[ofdm, decoder.ofdm_stats()]);
++        let next_rejections = ofdm_rejections.saturating_add(decoder.ofdm_rejection_stats());
++        ofdm_strong_long_training = ofdm_strong_long_training.saturating_add_to(
++            decoder.ofdm_strong_long_training_stats(),
++            next_rejections.strong_long_training_not_found,
++        );
++        ofdm_rejections = next_rejections;
+         dsss = sum_stats(&[dsss, decoder.dsss_stats()]);
+         let result = failure.map_or(Ok(decoded), Err);
+         if replies
+@@ -166,6 +188,8 @@ fn run_worker(
+                 core_end: job.core_end,
+                 result,
+                 ofdm,
++                ofdm_rejections,
++                ofdm_strong_long_training,
+                 dsss,
+             })
+             .is_err()
+@@ -193,8 +217,12 @@ pub struct WindowedLegacyWifiDecoder {
+     terminal: bool,
+     failed: bool,
+     ofdm: DecoderStats,
++    ofdm_rejections: OfdmRejectionStats,
++    ofdm_strong_long_training: OfdmStrongLongTrainingStats,
+     dsss: DecoderStats,
+     worker_ofdm: Vec<DecoderStats>,
++    worker_ofdm_rejections: Vec<OfdmRejectionStats>,
++    worker_ofdm_strong_long_training: Vec<OfdmStrongLongTrainingStats>,
+     worker_dsss: Vec<DecoderStats>,
+     workers: usize,
+     profile: WindowProfile,
+@@ -246,8 +274,12 @@ impl WindowedLegacyWifiDecoder {
+             terminal: false,
+             failed: false,
+             ofdm: DecoderStats::default(),
++            ofdm_rejections: OfdmRejectionStats::default(),
++            ofdm_strong_long_training: OfdmStrongLongTrainingStats::default(),
+             dsss: DecoderStats::default(),
+             worker_ofdm: vec![DecoderStats::default(); workers],
++            worker_ofdm_rejections: vec![OfdmRejectionStats::default(); workers],
++            worker_ofdm_strong_long_training: vec![OfdmStrongLongTrainingStats::default(); workers],
+             worker_dsss: vec![DecoderStats::default(); workers],
+             workers,
+             profile,
+@@ -255,8 +287,38 @@ impl WindowedLegacyWifiDecoder {
+         })
+     }
+     pub fn ofdm_stats(&self) -> DecoderStats {
++        debug_assert_eq!(
++            self.ofdm_rejections.checked_total(),
++            Some(self.ofdm.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.ofdm_strong_long_training.checked_total(),
++            Some(self.ofdm_rejections.strong_long_training_not_found)
++        );
+         self.ofdm
+     }
++    pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
++        debug_assert_eq!(
++            self.ofdm_rejections.checked_total(),
++            Some(self.ofdm.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.ofdm_strong_long_training.checked_total(),
++            Some(self.ofdm_rejections.strong_long_training_not_found)
++        );
++        self.ofdm_rejections
++    }
++    pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        debug_assert_eq!(
++            self.ofdm_rejections.checked_total(),
++            Some(self.ofdm.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.ofdm_strong_long_training.checked_total(),
++            Some(self.ofdm_rejections.strong_long_training_not_found)
++        );
++        self.ofdm_strong_long_training
++    }
+     pub fn dsss_stats(&self) -> DecoderStats {
+         self.dsss
+     }
+@@ -358,8 +420,17 @@ impl WindowedLegacyWifiDecoder {
+             let unique_ofdm = self.ofdm.valid_frames;
+             let unique_dsss = self.dsss.valid_frames;
+             self.worker_ofdm[reply.worker] = reply.ofdm;
++            self.worker_ofdm_rejections[reply.worker] = reply.ofdm_rejections;
++            self.worker_ofdm_strong_long_training[reply.worker] = reply.ofdm_strong_long_training;
+             self.worker_dsss[reply.worker] = reply.dsss;
+             self.ofdm = sum_stats(&self.worker_ofdm);
++            self.ofdm_rejections =
++                merge_rejections(self.ofdm_rejections, &self.worker_ofdm_rejections);
++            self.ofdm_strong_long_training = merge_strong_long_training(
++                self.ofdm_strong_long_training,
++                &self.worker_ofdm_strong_long_training,
++                self.ofdm_rejections.strong_long_training_not_found,
++            );
+             self.dsss = sum_stats(&self.worker_dsss);
+             // Worker counters include valid frames in the trailing overlap.
+             // Report only the core-owned frames that this decoder emits.
+@@ -433,6 +504,31 @@ fn sum_stats(stats: &[DecoderStats]) -> DecoderStats {
+         })
+ }
+ 
++fn merge_rejections(
++    current: OfdmRejectionStats,
++    stats: &[OfdmRejectionStats],
++) -> OfdmRejectionStats {
++    let observed = stats
++        .iter()
++        .fold(OfdmRejectionStats::default(), |sum, value| {
++            sum.saturating_add_each(*value)
++        });
++    current.saturating_add(observed.saturating_sub(current))
++}
++
++fn merge_strong_long_training(
++    current: OfdmStrongLongTrainingStats,
++    stats: &[OfdmStrongLongTrainingStats],
++    aggregate: u64,
++) -> OfdmStrongLongTrainingStats {
++    let observed = stats
++        .iter()
++        .fold(OfdmStrongLongTrainingStats::default(), |sum, value| {
++            sum.saturating_add_each(*value)
++        });
++    current.saturating_add_to(observed.saturating_sub(current), aggregate)
++}
++
+ impl Drop for WindowedLegacyWifiDecoder {
+     fn drop(&mut self) {
+         self.jobs.take();
+@@ -545,6 +641,12 @@ impl WindowedWifiDecoder {
+     pub fn ofdm_stats(&self) -> DecoderStats {
+         self.ofdm.stats()
+     }
++    pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
++        self.ofdm.rejection_stats()
++    }
++    pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
++        self.ofdm.strong_long_training_stats()
++    }
+     pub fn dsss_stats(&self) -> DecoderStats {
+         self.dsss.dsss_stats()
+     }
+@@ -734,4 +836,86 @@ mod tests {
+         drop(jobs);
+         worker.join().unwrap();
+     }
++
++    #[test]
++    fn rejection_merge_remains_closed_and_monotonic_at_saturation() {
++        let current = OfdmRejectionStats {
++            strong_long_training_not_found: u64::MAX - 1,
++            ..OfdmRejectionStats::default()
++        };
++        let merged = merge_rejections(
++            current,
++            &[
++                OfdmRejectionStats {
++                    signal_or_probe_rejected: 2,
++                    ..OfdmRejectionStats::default()
++                },
++                current,
++            ],
++        );
++        assert_eq!(
++            merged.strong_long_training_not_found,
++            current.strong_long_training_not_found
++        );
++        assert_eq!(merged.signal_or_probe_rejected, 1);
++        assert_eq!(merged.checked_total(), Some(u64::MAX));
++        assert_eq!(merge_rejections(merged, &[current]), merged);
++
++        let current_details = OfdmStrongLongTrainingStats {
++            strong_short_periodicity_timeout: u64::MAX - 1,
++            ..OfdmStrongLongTrainingStats::default()
++        };
++        let merged_details = merge_strong_long_training(
++            current_details,
++            &[
++                OfdmStrongLongTrainingStats {
++                    strong_long_repeat_not_found: 2,
++                    ..OfdmStrongLongTrainingStats::default()
++                },
++                current_details,
++            ],
++            merged.strong_long_training_not_found,
++        );
++        assert_eq!(merged_details, current_details);
++        assert_eq!(
++            merged_details.checked_total(),
++            Some(merged.strong_long_training_not_found)
++        );
++
++        let competing = merge_rejections(
++            OfdmRejectionStats {
++                signal_or_probe_rejected: u64::MAX - 1,
++                ..OfdmRejectionStats::default()
++            },
++            &[
++                OfdmRejectionStats {
++                    signal_or_probe_rejected: u64::MAX,
++                    ..OfdmRejectionStats::default()
++                },
++                OfdmRejectionStats {
++                    strong_long_training_not_found: 1,
++                    ..OfdmRejectionStats::default()
++                },
++            ],
++        );
++        let competing_details = merge_strong_long_training(
++            OfdmStrongLongTrainingStats::default(),
++            &[
++                OfdmStrongLongTrainingStats::default(),
++                OfdmStrongLongTrainingStats {
++                    strong_short_periodicity_timeout: 1,
++                    ..OfdmStrongLongTrainingStats::default()
++                },
++            ],
++            competing.strong_long_training_not_found,
++        );
++        assert_eq!(competing.signal_or_probe_rejected, u64::MAX);
++        assert_eq!(competing.strong_long_training_not_found, 0);
++        assert_eq!(competing.checked_total(), Some(u64::MAX));
++        assert_eq!(competing_details, OfdmStrongLongTrainingStats::default());
++        assert_eq!(
++            competing_details.checked_total(),
++            Some(competing.strong_long_training_not_found)
++        );
++    }
+ }
+diff --git a/crafter/tests/radio_parallel.rs b/crafter/tests/radio_parallel.rs
+index 334f26bc..49d3460e 100644
+--- a/crafter/tests/radio_parallel.rs
++++ b/crafter/tests/radio_parallel.rs
+@@ -58,11 +58,368 @@ fn parallel_matches_serial_on_all_independent_vectors() {
+                     }
+                 }
+                 assert_eq!(parallel.ofdm_stats(), serial.ofdm_stats());
++                assert_eq!(
++                    parallel.ofdm_rejection_stats(),
++                    serial.ofdm_rejection_stats()
++                );
++                assert_eq!(
++                    parallel.ofdm_strong_long_training_stats(),
++                    serial.ofdm_strong_long_training_stats()
++                );
+                 assert_eq!(parallel.dsss_stats(), serial.dsss_stats());
+             }
+         }
+     }
+ }
++
++#[test]
++fn windowed_ofdm_rejection_accounting_matches_one_serial_window() {
++    let bytes = include_bytes!("fixtures/iq/ofdm-6-invalid_service.cs8");
++    let mut c = config(bytes.len() / 2);
++    c.max_buffer_samples = 6_000_000;
++    c.max_capture_samples = bytes.len() as u64 / 2;
++    let event = IqEvent::Chunk(
++        IqChunk::new(
++            c,
++            position(),
++            bytes.iter().map(|value| *value as i8).collect(),
++        )
++        .unwrap(),
++    );
++    let mut serial = LegacyWifiDecoder::new();
++    let mut windowed = WindowedLegacyWifiDecoder::new(1).unwrap();
++    assert!(serial
++        .consume(clone_event(&event))
++        .unwrap()
++        .frames
++        .is_empty());
++    assert!(windowed.consume(event).unwrap().frames.is_empty());
++    assert!(serial
++        .consume(IqEvent::End(StreamEnd::Eof))
++        .unwrap()
++        .frames
++        .is_empty());
++    assert!(windowed
++        .consume(IqEvent::End(StreamEnd::Eof))
++        .unwrap()
++        .frames
++        .is_empty());
++    assert_eq!(windowed.ofdm_stats(), serial.ofdm_stats());
++    assert_eq!(
++        windowed.ofdm_rejection_stats(),
++        serial.ofdm_rejection_stats()
++    );
++    assert_eq!(
++        windowed.ofdm_strong_long_training_stats(),
++        serial.ofdm_strong_long_training_stats()
++    );
++    assert_eq!(
++        windowed.ofdm_rejection_stats().checked_total(),
++        Some(windowed.ofdm_stats().rejected_frames)
++    );
++    assert_eq!(
++        windowed.ofdm_strong_long_training_stats().checked_total(),
++        Some(
++            windowed
++                .ofdm_rejection_stats()
++                .strong_long_training_not_found
++        )
++    );
++}
++
++#[test]
++fn strong_long_training_detail_propagates_through_parallel_and_windowed_decoders() {
++    let bytes = include_bytes!("fixtures/iq/ofdm-6-clean-training-ltf.cs8");
++    let mut c = config(bytes.len() / 2);
++    c.max_buffer_samples = 6_000_000;
++    c.max_capture_samples = bytes.len() as u64 / 2;
++    let event = IqEvent::Chunk(
++        IqChunk::new(
++            c,
++            position(),
++            bytes.iter().map(|value| *value as i8).collect(),
++        )
++        .unwrap(),
++    );
++    let mut serial = LegacyWifiDecoder::new();
++    let mut parallel = ParallelLegacyWifiDecoder::new().unwrap();
++    let mut windowed = WindowedLegacyWifiDecoder::new(1).unwrap();
++    let mut serial_frames = serial.consume(clone_event(&event)).unwrap().frames;
++    let mut parallel_frames = parallel.consume(clone_event(&event)).unwrap().frames;
++    let mut windowed_frames = windowed.consume(event).unwrap().frames;
++    serial_frames.extend(serial.consume(IqEvent::End(StreamEnd::Eof)).unwrap().frames);
++    parallel_frames.extend(
++        parallel
++            .consume(IqEvent::End(StreamEnd::Eof))
++            .unwrap()
++            .frames,
++    );
++    windowed_frames.extend(
++        windowed
++            .consume(IqEvent::End(StreamEnd::Eof))
++            .unwrap()
++            .frames,
++    );
++    assert_eq!(serial_frames.len(), 1);
++    assert_eq!(format!("{parallel_frames:?}"), format!("{serial_frames:?}"));
++    assert_eq!(format!("{windowed_frames:?}"), format!("{serial_frames:?}"));
++    let expected = OfdmStrongLongTrainingStats {
++        strong_long_reference_not_found: 1,
++        ..OfdmStrongLongTrainingStats::default()
++    };
++    assert_eq!(serial.ofdm_strong_long_training_stats(), expected);
++    assert_eq!(parallel.ofdm_strong_long_training_stats(), expected);
++    assert_eq!(windowed.ofdm_strong_long_training_stats(), expected);
++    for (stats, rejections, details) in [
++        (
++            serial.ofdm_stats(),
++            serial.ofdm_rejection_stats(),
++            serial.ofdm_strong_long_training_stats(),
++        ),
++        (
++            parallel.ofdm_stats(),
++            parallel.ofdm_rejection_stats(),
++            parallel.ofdm_strong_long_training_stats(),
++        ),
++        (
++            windowed.ofdm_stats(),
++            windowed.ofdm_rejection_stats(),
++            windowed.ofdm_strong_long_training_stats(),
++        ),
++    ] {
++        assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++        assert_eq!(
++            details.checked_total(),
++            Some(rejections.strong_long_training_not_found)
++        );
++    }
++}
++
++#[test]
++fn reference_relaxed_probe_matches_parallel_and_windowed_decoders() {
++    let clean = include_bytes!("fixtures/iq/ofdm-6-clean.cs8");
++    let mut impaired = include_bytes!("fixtures/iq/ofdm-6-clean-training-ltf_dc.cs8").to_vec();
++    for sample in (37 + 192)..(37 + 192 + 128) {
++        let input = impaired[2 * sample] as i8;
++        impaired[2 * sample] = input
++            .checked_add(12)
++            .expect("the deterministic LTF impairment must not clip")
++            as u8;
++    }
++    let mut bytes = Vec::with_capacity(clean.len() + 384 * 2 + impaired.len());
++    bytes.extend_from_slice(clean);
++    bytes.resize(bytes.len() + 384 * 2, 0);
++    bytes.extend_from_slice(&impaired);
++
++    let mut c = config(127);
++    c.max_buffer_samples = 14_000_000;
++    c.max_pending_frames = 3;
++    c.max_capture_samples = bytes.len() as u64 / 2;
++    let mut source = ReaderIqSource::new(Cursor::new(&bytes), c, position()).unwrap();
++    let mut serial = LegacyWifiDecoder::new();
++    let mut parallel = ParallelLegacyWifiDecoder::new().unwrap();
++    let mut windowed_one = WindowedLegacyWifiDecoder::new(1).unwrap();
++    let mut windowed_four = WindowedLegacyWifiDecoder::new(4).unwrap();
++    let mut serial_frames = Vec::new();
++    let mut parallel_frames = Vec::new();
++    let mut windowed_one_frames = Vec::new();
++    let mut windowed_four_frames = Vec::new();
++    loop {
++        let event = source.next_event().unwrap();
++        let end = matches!(event, IqEvent::End(_));
++        serial_frames.extend(serial.consume(clone_event(&event)).unwrap().frames);
++        parallel_frames.extend(parallel.consume(clone_event(&event)).unwrap().frames);
++        windowed_one_frames.extend(windowed_one.consume(clone_event(&event)).unwrap().frames);
++        windowed_four_frames.extend(windowed_four.consume(event).unwrap().frames);
++        if end {
++            break;
++        }
++    }
++
++    assert_eq!(serial_frames.len(), 2);
++    assert_eq!(
++        serial_frames
++            .iter()
++            .map(|frame| frame.start.sample_index)
++            .collect::<Vec<_>>(),
++        [37, 2_570]
++    );
++    for frames in [
++        &parallel_frames,
++        &windowed_one_frames,
++        &windowed_four_frames,
++    ] {
++        assert_eq!(format!("{frames:?}"), format!("{serial_frames:?}"));
++    }
++    for (stats, rejections, details) in [
++        (
++            serial.ofdm_stats(),
++            serial.ofdm_rejection_stats(),
++            serial.ofdm_strong_long_training_stats(),
++        ),
++        (
++            parallel.ofdm_stats(),
++            parallel.ofdm_rejection_stats(),
++            parallel.ofdm_strong_long_training_stats(),
++        ),
++        (
++            windowed_one.ofdm_stats(),
++            windowed_one.ofdm_rejection_stats(),
++            windowed_one.ofdm_strong_long_training_stats(),
++        ),
++        (
++            windowed_four.ofdm_stats(),
++            windowed_four.ofdm_rejection_stats(),
++            windowed_four.ofdm_strong_long_training_stats(),
++        ),
++    ] {
++        assert_eq!(stats.valid_frames, 2);
++        assert_eq!(stats.invalid_fcs, 0);
++        assert_eq!(stats.truncated_frames, 0);
++        assert_eq!(stats.dropped_frames, 0);
++        assert_eq!(rejections.pending_capacity_rejected, 0);
++        assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++        assert_eq!(
++            details.checked_total(),
++            Some(rejections.strong_long_training_not_found)
++        );
++    }
++
++    const CORE: usize = 2_000_000;
++    let prefix = CORE - 2_300;
++    let mut spanning = vec![0; prefix * 2];
++    spanning.extend_from_slice(&bytes);
++    spanning.resize(spanning.len() + 128, 0);
++    let mut c = config(65_536);
++    c.max_buffer_samples = 14_000_000;
++    c.max_pending_frames = 4;
++    c.max_capture_samples = spanning.len() as u64 / 2;
++    let mut source = ReaderIqSource::new(Cursor::new(&spanning), c, position()).unwrap();
++    let mut serial = LegacyWifiDecoder::new();
++    let mut windowed = WindowedLegacyWifiDecoder::new(4).unwrap();
++    let mut expected = Vec::new();
++    let mut actual = Vec::new();
++    loop {
++        let event = source.next_event().unwrap();
++        let end = matches!(event, IqEvent::End(_));
++        expected.extend(serial.consume(clone_event(&event)).unwrap().frames);
++        actual.extend(windowed.consume(event).unwrap().frames);
++        if end {
++            break;
++        }
++    }
++    assert_eq!(
++        expected
++            .iter()
++            .map(|frame| frame.start.sample_index)
++            .collect::<Vec<_>>(),
++        [prefix as u64 + 37, prefix as u64 + 2_570]
++    );
++    assert_eq!(actual.len(), expected.len());
++    for (actual, expected) in actual.iter().zip(&expected) {
++        assert_eq!(actual.bytes, expected.bytes);
++        assert_eq!(actual.rate_bps, expected.rate_bps);
++        assert_eq!(actual.integrity, expected.integrity);
++        assert_eq!(actual.config, expected.config);
++        assert_eq!(actual.start.epoch, expected.start.epoch);
++        assert_eq!(actual.start.sample_index, expected.start.sample_index);
++        assert_eq!(actual.end_sample_index, expected.end_sample_index);
++        assert_eq!(actual.diagnostics, expected.diagnostics);
++    }
++    let stats = windowed.ofdm_stats();
++    let rejections = windowed.ofdm_rejection_stats();
++    let details = windowed.ofdm_strong_long_training_stats();
++    assert_eq!(stats.valid_frames, 2);
++    assert_eq!(stats.invalid_fcs, 0);
++    assert_eq!(stats.truncated_frames, 0);
++    assert_eq!(stats.dropped_frames, 0);
++    assert_eq!(rejections.pending_capacity_rejected, 0);
++    assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++    assert_eq!(
++        details.checked_total(),
++        Some(rejections.strong_long_training_not_found)
++    );
++}
++
++#[test]
++fn reference_relaxed_ht_probe_matches_parallel_and_windowed_wifi_decoders() {
++    let clean = include_bytes!("fixtures/iq/ht-bcc-0-gi800-len100-clean.cs8");
++    let mut impaired =
++        include_bytes!("fixtures/iq/ht-bcc-0-gi800-len100-clean-training-ltf_dc.cs8").to_vec();
++    for sample in (37 + 192)..(37 + 192 + 128) {
++        let input = impaired[2 * sample] as i8;
++        impaired[2 * sample] = input
++            .checked_add(12)
++            .expect("the deterministic LTF impairment must not clip")
++            as u8;
++    }
++    let mut bytes = Vec::with_capacity(clean.len() + 384 * 2 + impaired.len());
++    bytes.extend_from_slice(clean);
++    bytes.resize(bytes.len() + 384 * 2, 0);
++    bytes.extend_from_slice(&impaired);
++
++    let mut c = config(127);
++    c.max_buffer_samples = 17_000_000;
++    c.max_pending_frames = 6;
++    c.max_capture_samples = bytes.len() as u64 / 2;
++    let mut source = ReaderIqSource::new(Cursor::new(&bytes), c, position()).unwrap();
++    let mut serial = WifiDecoder::new();
++    let mut parallel = ParallelWifiDecoder::new().unwrap();
++    let mut windowed = WindowedWifiDecoder::new(4).unwrap();
++    let mut serial_frames = Vec::new();
++    let mut parallel_frames = Vec::new();
++    let mut windowed_frames = Vec::new();
++    loop {
++        let event = source.next_event().unwrap();
++        let end = matches!(event, IqEvent::End(_));
++        serial_frames.extend(serial.consume(clone_event(&event)).unwrap().frames);
++        parallel_frames.extend(parallel.consume(clone_event(&event)).unwrap().frames);
++        windowed_frames.extend(windowed.consume(event).unwrap().frames);
++        if end {
++            break;
++        }
++    }
++
++    let shift = clean.len() as u64 / 2 + 384;
++    assert_eq!(
++        serial_frames
++            .iter()
++            .map(|frame| frame.start.sample_index)
++            .collect::<Vec<_>>(),
++        [37, 37 + shift]
++    );
++    assert_eq!(format!("{parallel_frames:?}"), format!("{serial_frames:?}"));
++    assert_eq!(format!("{windowed_frames:?}"), format!("{serial_frames:?}"));
++    for (stats, rejections, details) in [
++        (
++            serial.ofdm_stats(),
++            serial.ofdm_rejection_stats(),
++            serial.ofdm_strong_long_training_stats(),
++        ),
++        (
++            parallel.ofdm_stats(),
++            parallel.ofdm_rejection_stats(),
++            parallel.ofdm_strong_long_training_stats(),
++        ),
++        (
++            windowed.ofdm_stats(),
++            windowed.ofdm_rejection_stats(),
++            windowed.ofdm_strong_long_training_stats(),
++        ),
++    ] {
++        assert_eq!(stats.valid_frames, 2);
++        assert_eq!(stats.invalid_fcs, 0);
++        assert_eq!(stats.truncated_frames, 0);
++        assert_eq!(stats.dropped_frames, 0);
++        assert_eq!(rejections.pending_capacity_rejected, 0);
++        assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++        assert_eq!(
++            details.checked_total(),
++            Some(rejections.strong_long_training_not_found)
++        );
++    }
++}
++
+ #[test]
+ fn parallel_preserves_gap_budget_and_terminal_behavior() {
+     let mut serial = LegacyWifiDecoder::new();
+@@ -189,6 +546,16 @@ fn parallel_wifi_preserves_ht_frames_and_metadata() {
+                 format!("{expected:?}"),
+                 "{name}, chunk={size}, split DSSS"
+             );
++            assert_eq!(
++                parallel.ofdm_strong_long_training_stats(),
++                serial.ofdm_strong_long_training_stats(),
++                "{name}, chunk={size}, parallel detail"
++            );
++            assert_eq!(
++                split.ofdm_strong_long_training_stats(),
++                serial.ofdm_strong_long_training_stats(),
++                "{name}, chunk={size}, split detail"
++            );
+         }
+     }
+ }
+@@ -257,6 +624,10 @@ fn windowed_wifi_preserves_ht_and_dsss_frames_and_metadata() {
+     assert_eq!(actual.len(), 2);
+     assert_eq!(windowed.ofdm_stats().valid_frames, 1);
+     assert_eq!(windowed.dsss_stats().valid_frames, 1);
++    assert_eq!(
++        windowed.ofdm_strong_long_training_stats(),
++        serial.ofdm_strong_long_training_stats()
++    );
+     assert_eq!(actual.len(), expected.len());
+     for (actual, expected) in actual.iter().zip(expected) {
+         assert_eq!(actual.bytes, expected.bytes);
+diff --git a/crafter/tests/radio_public_api.rs b/crafter/tests/radio_public_api.rs
+index ae22cdf0..6f2af330 100644
+--- a/crafter/tests/radio_public_api.rs
++++ b/crafter/tests/radio_public_api.rs
+@@ -8,12 +8,12 @@ use crafter::radio::{
+     IqSource, LegacyDsssCckRate, LegacyDsssCckTransmission, LegacyDsssCckTxConfig,
+     LegacyOfdmDecoder, LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig,
+     LegacyWifiDecoder, LegacyWifiPhy, LegacyWifiTransmission, LegacyWifiTxConfig, MemoryIqSink,
+-    MemoryIqSource, OfdmSignalFields, OwnedSamples, PacketEncoder, ParallelLegacyWifiDecoder,
+-    ParallelWifiDecoder, PhyDecoder, PhyDiagnostic, RadioError, RadioPacketSource,
+-    RadioPacketWriter, RadioReceiveMetadata, RadioResult, ReaderIqSource, RecoveredFrame,
+-    ResetReason, RxConfig, SampleCompletion, SampleFormat, SampleLoss, SignalInfo, StreamEnd,
+-    TimeAnchor, WifiDecoder, WifiFcsPolicy, WifiPacketEncoder, WifiTxEncoder,
+-    WindowedLegacyWifiDecoder, WindowedWifiDecoder,
++    MemoryIqSource, OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats,
++    OwnedSamples, PacketEncoder, ParallelLegacyWifiDecoder, ParallelWifiDecoder, PhyDecoder,
++    PhyDiagnostic, RadioError, RadioPacketSource, RadioPacketWriter, RadioReceiveMetadata,
++    RadioResult, ReaderIqSource, RecoveredFrame, ResetReason, RxConfig, SampleCompletion,
++    SampleFormat, SampleLoss, SignalInfo, StreamEnd, TimeAnchor, WifiDecoder, WifiFcsPolicy,
++    WifiPacketEncoder, WifiTxEncoder, WindowedLegacyWifiDecoder, WindowedWifiDecoder,
+ };
+ use crafter::{prelude, PacketWriter};
+ use std::{io::Cursor, time::Duration};
+@@ -75,6 +75,8 @@ fn radio_facade_exports_the_existing_public_surface() {
+     assert_type::<IqContinuity>();
+ 
+     assert_type::<DecoderStats>();
++    assert_type::<OfdmRejectionStats>();
++    assert_type::<OfdmStrongLongTrainingStats>();
+     assert_type::<SignalInfo>();
+     assert_type::<DsssCckDecoder>();
+     assert_type::<LegacyOfdmDecoder>();
+diff --git a/crafter/tests/radio_vectors.rs b/crafter/tests/radio_vectors.rs
+index 34ba7282..3f3c8292 100644
+--- a/crafter/tests/radio_vectors.rs
++++ b/crafter/tests/radio_vectors.rs
+@@ -441,6 +441,16 @@ fn radio_weak_training_exact_frame_recovery() {
+             assert_eq!(frames[0].integrity, FrameIntegrity::ValidFcs);
+             assert_eq!(frames[0].start.epoch, 7);
+             assert_eq!(frames[0].start.sample_index, 1_000_037);
++            let stats = decoder.ofdm_stats();
++            let rejections = decoder.ofdm_rejection_stats();
++            assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++            if c[0] == "ofdm-6-clean-training-ltf" {
++                assert_eq!(
++                    rejections.strong_long_training_not_found, 1,
++                    "{} chunk={chunk}",
++                    c[0]
++                );
++            }
+         }
+     }
+     assert_eq!(matrix.len(), 80);
+diff --git a/docs/radio.md b/docs/radio.md
+index 2bff2028..a84405e9 100644
+--- a/docs/radio.md
++++ b/docs/radio.md
+@@ -332,6 +332,58 @@ SIGNAL length therefore need not hide a later valid frame. Candidates beyond
+ the slot or sample budget are rejected; this bounded search is not an unlimited
+ collision decoder. Gaps and end events discard all incomplete candidates.
+ 
++When a strong short-period candidate passes the repeated-training gate but not
++the unchanged strong known-LTF acceptance gate, the synchronizer may emit a
++rate-limited reference-relaxed hypothesis through the receiver's lower-priority
++pending path. Its squared normalized reference threshold is 0.19, compared
++with 0.25 for normal acquisition, and emissions are limited to one every 32
++input samples. This does not consume or move the original strong candidate; a
++later accepted strong acquisition takes priority. The probe shares the existing
++fixed pending and sample budgets and must still pass coordinate, SIGNAL, DATA,
++and FCS checks. The independent weak-short-period candidate retains the normal
++0.25 reference threshold.
++
++`LegacyOfdmDecoder::rejection_stats()` and the corresponding combined,
++parallel, and windowed decoder accessors partition every terminal OFDM
++`rejected_frames` increment into one branch-aligned counter. The checked sum is
++the historical aggregate, including after counter saturation. These are decoder
++hypothesis events, not unique physical frames: strong and weak acquisition paths
++can describe the same transmission, and window overlap can repeat a hypothesis.
++In particular, `strong_long_training_not_found` records expiration of the
++strong short-period acquisition path; a weak-short-period hypothesis may still
++recover the same waveform successfully. A reference-relaxed probe does not pass
++the unchanged strong gate, so it remains a
++`strong_long_reference_not_found` observation if the original candidate later
++expires. Probe recovery, invalid FCS, a downstream rejection, and that original
++strong timeout can coexist because these counters describe decoder hypotheses,
++not mutually exclusive outcomes for unique RF bursts. The corresponding
++`ofdm_strong_long_training_stats()` accessors return a separate closed
++`OfdmStrongLongTrainingStats` subpartition. Its checked total equals
++`strong_long_training_not_found`, and each candidate is assigned by the
++furthest eligible gate reached before expiration:
++
++- `strong_short_periodicity_timeout`: no long-training window became eligible
++  for evaluation before the deadline. It does not assert that every
++  intervening sample remained periodic.
++- `strong_long_repeat_not_found`: no eligible window passed the repeated
++  long-training gate.
++- `strong_long_reference_not_found`: repetition passed, but no eligible window
++  passed the known long-training reference gate.
++- `strong_long_coordinates_unavailable`: known-reference evidence passed, but
++  source-coordinate arithmetic could not form the packet positions. This is
++  not a generic missing-history category.
++
++Weak-path evaluations do not advance the strong candidate's detail state, and
++an eventual successful strong acquisition produces no terminal timeout. The
++same detail accessors are available on serial combined, persistent parallel,
++and windowed Wi-Fi decoders.
++The `unsupported` branches retain the receiver's existing combined outcome,
++which can reflect either unsupported header fields or configured resource
++bounds. DATA failure similarly combines several recovery stages. Invalid FCS,
++truncation, output drops, and A-MPDU member failures remain outside this
++partition. Bounded, overlapping diagnostics are troubleshooting evidence and
++must not be used to reconstruct these exact counters.
++
+ Each chunk identifies its sample format, stream epoch, sequence, absolute sample
+ position, configuration and any time anchor with uncertainty. A gap of unknown
+ size cannot be represented as a known zero-sized loss. Loss, reconfiguration,
+diff --git a/tools/oracle/specs/features/wifi-candidate-recovery.yaml b/tools/oracle/specs/features/wifi-candidate-recovery.yaml
+index 1ecca21a..9613813e 100644
+--- a/tools/oracle/specs/features/wifi-candidate-recovery.yaml
++++ b/tools/oracle/specs/features/wifi-candidate-recovery.yaml
+@@ -14,6 +14,9 @@ behaviors:
+   - name: weak-training
+     modes: [legacy_ofdm, ht20_single_stream]
+     checks: [independent_noisy_stf, complementary_ltf_errors, low_ltf_repetition, training_dc_interference, preserve_weak_search_deadline, strongest_short_training_frequency, exact_psdu, valid_fcs, chunk_invariance, no_duplicate_occurrence, original_acquisition_priority]
++  - name: reference-relaxed-long-training-probe
++    modes: [legacy_ofdm, ht20_single_stream]
++    checks: [unchanged_strong_thresholds, bounded_probe_cadence, retained_original_search, strong_path_priority, unchanged_integrity_gates, exact_psdu, original_sample_position, valid_fcs, no_duplicate_delivery, chunk_invariance, bounded_pending_capacity, serial_parallel_windowed_parity]
+   - name: bounded-hypotheses
+     max_candidates: 2
+     checks: [shared_sample_reservation_bound, reset_all_candidates, no_unverified_frame]
+@@ -30,4 +33,5 @@ backend_support:
+       - Synthetic periodic bursts precede independent legacy and HT fixtures across all supported single-stream rates.
+       - Rust tests use a deliberately false length and an independent recovered-frame fixture.
+       - Weak training uses a secondary acquisition that cannot reset the original search or displace its DATA reservations.
++      - A rate-limited reference-relaxed long-training probe uses the lower-priority pending path without moving the original strong candidate or relaxing the independent weak-short candidate; coordinates, SIGNAL, DATA and PSDU FCS remain mandatory.
+       - Candidate capacity and aggregate sample reservations are bounded; excess acquisition is rejected.
+diff --git a/tools/oracle/specs/features/wifi-receiver-quality.yaml b/tools/oracle/specs/features/wifi-receiver-quality.yaml
+index 20924a5b..368e5c6b 100644
+--- a/tools/oracle/specs/features/wifi-receiver-quality.yaml
++++ b/tools/oracle/specs/features/wifi-receiver-quality.yaml
+@@ -11,6 +11,10 @@ behaviors:
+     checks: [finite_pilot_phase_residual, signed_sampling_clock_estimate, symbol_count, chunk_invariance]
+   - name: data-rejections
+     checks: [distinct_header_and_data_failures, no_invalid_delivery]
++  - name: rejection-event-accounting
++    checks: [closed_terminal_branch_partition, exact_aggregate_sum, saturating_monotonicity, hypothesis_not_frame_semantics, strong_timeout_can_coexist_with_weak_recovery, independent_of_bounded_diagnostics, chunk_invariance]
++  - name: strong-long-training-detail
++    checks: [closed_four_way_subpartition, exact_strong_timeout_subtotal, furthest_eligible_gate, weak_short_candidate_independence, relaxed_probe_remains_reference_failure, successful_acquisition_suppresses_timeout, source_coordinate_failure_is_explicit, parallel_and_windowed_closure, saturating_monotonicity]
+   - name: signal-recovery
+     checks: [retain_original_valid_header, zero_state_tail_fallback, half_guard_fft_fallback, parity_and_length_checks, independent_signal_vectors, corrupted_tail_observations, require_payload_fcs]
+   - name: bcc-termination
+@@ -53,6 +57,10 @@ backend_support:
+       - Clock estimates require at least two DATA symbols; unavailable estimates remain explicit.
+       - Rust clock-matrix tests verify long-frame estimates within 2 ppm and finite pilot residuals.
+       - Independent malformed SIGNAL, SERVICE and FCS fixtures distinguish rejection stages.
++      - OFDM rejection events retain a closed branch-aligned partition. They count terminal acquisition/decoder hypotheses, not physical frames, and do not infer missing reasons from the bounded overlapping diagnostic stream.
++      - strong_long_training_not_found means the strong short-period path expired without accepted long training; a weak acquisition may still recover the same waveform.
++      - Strong long-training detail is a separate closed four-way subpartition selected by the furthest eligible gate reached. No eligible evaluation does not prove continued periodicity, and coordinates unavailable refers only to source-coordinate formation.
++      - Reference-relaxed probe recovery or downstream rejection may coexist with the original strong candidate's later timeout; the relaxed match remains a strong known-reference failure.
+       - BCC traceback ends at the six zero TAIL bits, before PAD, using the known zero encoder state (IEEE 802.11-2020 17.3.5.3 and 19.3.11.1).
+       - Independent coded legacy fixtures cover every OFDM rate with erased TAIL observations and contradictory PAD observations; HT uses the same BCC recovery path.
+       - Independent HT pilot-tone interference fixtures verify that per-symbol slope noise does not rotate otherwise valid DATA constellations.

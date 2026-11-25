@@ -1,0 +1,74 @@
+diff --git a/examples/zigbee/src/decoder.rs b/examples/zigbee/src/decoder.rs
+index f0174140..4ec06f99 100644
+--- a/examples/zigbee/src/decoder.rs
++++ b/examples/zigbee/src/decoder.rs
+@@ -1,3 +1,4 @@
++use anyhow::anyhow;
+ use futuresdr::runtime::dev::prelude::*;
+ 
+ const CHIP_MAPPING: [u32; 16] = [
+@@ -46,7 +47,7 @@ impl Correlator {
+ }
+ 
+ #[derive(Block)]
+-#[message_outputs(out)]
++#[message_outputs(out, indexed)]
+ pub struct Decoder<I = DefaultCpuReader<f32>>
+ where
+     I: CpuBufferReader<Item = f32>,
+@@ -55,6 +56,7 @@ where
+     input: I,
+     correlator: Correlator,
+     chip_count: u32,
++    total_chips: u64,
+     state: State,
+ }
+ 
+@@ -71,6 +73,7 @@ where
+             },
+             state: State::Search,
+             chip_count: 0,
++            total_chips: 0,
+         }
+     }
+ }
+@@ -89,6 +92,12 @@ where
+         let inbuf_len = inbuf.len();
+ 
+         for v in inbuf.into_iter() {
++            // Saturation would make indexed positions repeat, so fail before
++            // the archive's strict monotonic-position contract is violated.
++            self.total_chips = self
++                .total_chips
++                .checked_add(1)
++                .ok_or_else(|| anyhow!("recovered chip counter overflow"))?;
+             if v > 0.0 {
+                 self.correlator.shift_reg = (self.correlator.shift_reg << 1) | 1;
+             } else {
+@@ -130,7 +139,7 @@ where
+                         {
+                             if let Some(o) = byte {
+                                 let len = (i << 4) | *o;
+-                                if len < 128 {
++                                if len != 0 && len < 128 {
+                                     self.state = State::Decode {
+                                         len: len as usize,
+                                         data: Vec::new(),
+@@ -158,7 +167,16 @@ where
+                                 *byte = None;
+                                 if data.len() == *len {
+                                     // info!("decoded frame");
+-                                    mo.post("out", Pmt::Blob(std::mem::take(data))).await?;
++                                    let frame = std::mem::take(data);
++                                    mo.post("out", Pmt::Blob(frame.clone())).await?;
++                                    mo.post(
++                                        "indexed",
++                                        Pmt::VecPmt(vec![
++                                            Pmt::U64(self.total_chips),
++                                            Pmt::Blob(frame),
++                                        ]),
++                                    )
++                                    .await?;
+                                     self.state = State::Search;
+                                 }
+                             } else {

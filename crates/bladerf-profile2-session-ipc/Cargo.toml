@@ -1,0 +1,18 @@
+[package]
+name = "bladerf-profile2-session-ipc"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Bounded complete-session protocol for the bladeRF RF-observatory profile-2 adapter"
+
+[dependencies]
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+nix = { default-features = false, features = ["process", "signal"], version = "0.31" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,233 @@
+diff --git a/crates/app/src/main.rs b/crates/app/src/main.rs
+--- a/crates/app/src/main.rs
++++ b/crates/app/src/main.rs
+@@ -157,6 +157,16 @@
+     /// Without this flag, coded decoding still runs on squelch-triggered bursts.
+     #[arg(long)]
+     coded_scan: bool,
++
++    /// Continuously scan one interior BLE data-channel bin in a saved IQ file.
++    #[arg(
++        long,
++        value_name = "MHz",
++        requires = "file",
++        conflicts_with_all = ["coded_scan", "burst_file", "live", "list", "install",
++                              "extcap_interfaces", "extcap_dlts", "extcap_config"]
++    )]
++    coded_scan_frequency_mhz: Option<u32>,
+ 
+     /// Disable GPU acceleration (use CPU-only PFB+FFT)
+     #[arg(long)]
+@@ -588,6 +598,11 @@
+             channels
+         };
+ 
++        let coded_scan = match cli.coded_scan_frequency_mhz {
++            Some(frequency) => pipeline::FileCodedScan::Secondary(frequency),
++            None if cli.coded_scan => pipeline::FileCodedScan::Primary,
++            None => pipeline::FileCodedScan::Disabled,
++        };
+         if let Err(e) = pipeline::run_file(
+             file,
+             format,
+@@ -597,7 +612,7 @@
+             cli.write_bursts.as_deref(),
+             cli.burst_limit_mb.saturating_mul(1024 * 1024),
+             cli.check_crc,
+-            cli.coded_scan,
++            coded_scan,
+             cli.squelch,
+             cli.stats,
+             &classic_uaps,
+@@ -706,4 +721,22 @@
+         assert!(cli.file.is_some());
+         assert!(cli.coded_scan);
+     }
++
++    #[test]
++    fn secondary_coded_scan_requires_file_mode() {
++        let args = ["blue-dragon", "--coded-scan-frequency-mhz", "2444"];
++        assert!(Cli::try_parse_from(args).is_err());
++        let file_args = [&args[..], &["--file", "capture.sc16q11"]].concat();
++        let cli = Cli::try_parse_from(&file_args).unwrap();
++        assert_eq!(cli.coded_scan_frequency_mhz, Some(2444));
++
++        for conflicts in [
++            &["--coded-scan"][..],
++            &["--live"][..],
++            &["--list"][..],
++            &["--burst-file", "capture.bdb"][..],
++        ] {
++            assert!(Cli::try_parse_from([&file_args, conflicts].concat()).is_err());
++        }
++    }
+ }
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -45,22 +45,47 @@
+     matches!(freq_mhz, 2402 | 2426 | 2480)
+ }
+ 
+-fn uses_coded_scan_catcher(freq_mhz: u32, coded_scan: bool) -> bool {
+-    coded_scan && is_primary_advertising_frequency(freq_mhz)
+-}
+-
+-fn validate_coded_scan_grid(channel_freqs: &[u32], coded_scan: bool) -> Result<(), String> {
+-    if coded_scan
+-        && !channel_freqs
+-            .iter()
+-            .any(|&freq| is_primary_advertising_frequency(freq))
+-    {
+-        return Err(
+-            "--coded-scan requires an exact FFT bin at 2402, 2426, or 2480 MHz; adjust --center-freq or --channels"
+-                .to_string(),
+-        );
+-    }
+-    Ok(())
++#[derive(Clone, Copy)]
++pub(crate) enum FileCodedScan {
++    Disabled,
++    Primary,
++    Secondary(u32),
++}
++
++impl FileCodedScan {
++    fn selects(self, freq_mhz: u32) -> bool {
++        match self {
++            Self::Disabled => false,
++            Self::Primary => is_primary_advertising_frequency(freq_mhz),
++            Self::Secondary(selected) => freq_mhz == selected,
++        }
++    }
++
++    fn deduplicates(self, freq_mhz: u32) -> bool {
++        matches!(self, Self::Primary) || self.selects(freq_mhz)
++    }
++
++    fn validate(self, center_mhz: u32, channel_freqs: &[u32]) -> Result<(), String> {
++        match self {
++            Self::Primary if !channel_freqs.iter().any(|&freq| self.selects(freq)) => Err(
++                "--coded-scan requires an exact FFT bin at 2402, 2426, or 2480 MHz; adjust --center-freq or --channels"
++                    .to_string(),
++            ),
++            Self::Secondary(freq)
++                if !(2404..=2478).contains(&freq) || freq % 2 != 0
++                    || is_primary_advertising_frequency(freq) =>
++            {
++                Err("--coded-scan-frequency-mhz requires an even BLE data-channel center".to_string())
++            }
++            Self::Secondary(freq)
++                if freq.abs_diff(center_mhz) as usize >= channel_freqs.len() / 2
++                    || !channel_freqs.contains(&freq) =>
++            {
++                Err("--coded-scan-frequency-mhz requires an interior FFT bin".to_string())
++            }
++            _ => Ok(()),
++        }
++    }
+ }
+ 
+ fn open_burst_writer(
+@@ -109,7 +134,7 @@
+     burst_path: Option<&Path>,
+     burst_limit_bytes: u64,
+     check_crc: bool,
+-    coded_scan: bool,
++    coded_scan: FileCodedScan,
+     squelch_db: f32,
+     print_stats: bool,
+     classic_uaps: &[(u32, u8)],
+@@ -119,7 +144,7 @@
+ 
+     let (channel_freqs, live_ch, first_live, last_live) =
+         build_channel_map(center_freq_mhz, num_channels)?;
+-    validate_coded_scan_grid(&channel_freqs, coded_scan)?;
++    coded_scan.validate(center_freq_mhz, &channel_freqs)?;
+ 
+     let active_channels = (first_live..=last_live)
+         .filter(|&ch| live_ch[ch] >= 0)
+@@ -157,13 +182,12 @@
+     let sps = 2usize; // 2 samples per symbol (type 2 PFB output rate)
+ 
+     // One catcher per in-band Classic channel (every MHz, 2402-2480).
+-    // With --coded-scan, exact primary-advertising bins also continuously
+-    // accumulate overlapping windows for coded-PHY search.
++    // Selected bins also accumulate overlapping windows for coded-PHY search.
+     let mut burst_catchers: Vec<Option<BurstCatcher>> = channel_freqs
+         .iter()
+         .map(|&freq| {
+             if (2402..=2480).contains(&freq) {
+-                if uses_coded_scan_catcher(freq, coded_scan) {
++                if coded_scan.selects(freq) {
+                     Some(BurstCatcher::new_scan(freq, squelch_db))
+                 } else {
+                     Some(BurstCatcher::new(freq, squelch_db))
+@@ -512,7 +536,7 @@
+                                 // When continuous scan is active, suppress a
+                                 // coded packet already emitted from an
+                                 // overlapping scan or ordinary burst.
+-                                if coded_scan && conn_table.is_coded_copy(&p) {
++                                if coded_scan.deduplicates(p.freq) && conn_table.is_coded_copy(&p) {
+                                     continue;
+                                 }
+ 
+@@ -617,8 +641,8 @@
+ #[cfg(test)]
+ mod file_mode_tests {
+     use super::{
+-        CodedScanResult, aligned_file_block_size, build_channel_map, classify_coded_scan_packet,
+-        uses_coded_scan_catcher, validate_coded_scan_grid,
++        CodedScanResult, FileCodedScan, aligned_file_block_size, build_channel_map,
++        classify_coded_scan_packet,
+     };
+     use bd_protocol::Timespec;
+     use bd_protocol::ble::{BLE_ADV_AA, BlePacket, BlePhy};
+@@ -663,7 +687,7 @@
+     fn coded_scan_requires_a_primary_advertising_bin() {
+         let (eligible, _, _, _) = build_channel_map(2435, 20).unwrap();
+         assert!(eligible.contains(&2426));
+-        assert!(validate_coded_scan_grid(&eligible, true).is_ok());
++        assert!(FileCodedScan::Primary.validate(2435, &eligible).is_ok());
+ 
+         let (ineligible, _, _, _) = build_channel_map(2437, 20).unwrap();
+         assert!(
+@@ -671,18 +695,33 @@
+                 .iter()
+                 .any(|freq| matches!(freq, 2402 | 2426 | 2480))
+         );
+-        assert!(validate_coded_scan_grid(&ineligible, true).is_err());
+-        assert!(validate_coded_scan_grid(&ineligible, false).is_ok());
++        assert!(FileCodedScan::Primary.validate(2437, &ineligible).is_err());
++        assert!(FileCodedScan::Disabled.validate(2437, &ineligible).is_ok());
+     }
+ 
+     #[test]
+     fn coded_scan_catchers_are_limited_to_requested_primary_bins() {
+         for freq in [2402, 2426, 2480] {
+-            assert!(uses_coded_scan_catcher(freq, true));
+-            assert!(!uses_coded_scan_catcher(freq, false));
++            assert!(FileCodedScan::Primary.selects(freq));
++            assert!(!FileCodedScan::Disabled.selects(freq));
+         }
+         for freq in [2404, 2425, 2478] {
+-            assert!(!uses_coded_scan_catcher(freq, true));
++            assert!(!FileCodedScan::Primary.selects(freq));
++            assert!(FileCodedScan::Primary.deduplicates(freq));
++        }
++    }
++
++    #[test]
++    fn secondary_coded_scan_selects_one_interior_data_bin() {
++        let (grid, _, _, _) = build_channel_map(2438, 20).unwrap();
++        let scan = FileCodedScan::Secondary(2444);
++        assert!(scan.validate(2438, &grid).is_ok());
++        assert_eq!(grid.iter().filter(|&&freq| scan.selects(freq)).count(), 1);
++        assert!(scan.selects(2444));
++        assert!(scan.deduplicates(2444));
++        assert!(!scan.deduplicates(2446));
++        for freq in [2402, 2426, 2428, 2439, 2448, 2450, 2480] {
++            assert!(FileCodedScan::Secondary(freq).validate(2438, &grid).is_err());
+         }
+     }
+ 

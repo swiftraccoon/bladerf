@@ -1,0 +1,19 @@
+[package]
+name = "bladerf-profile2-recovery-ipc"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Bounded fresh-recovery protocol for the bladeRF RF-observatory profile-2 adapter"
+
+[dependencies]
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { default-features = false, features = ["process", "signal"], version = "0.31" }
+
+[dev-dependencies]
+bladerf-profile2-loader-ipc = { path = "../bladerf-profile2-loader-ipc" }
+bladerf-profile2-session-ipc = { path = "../bladerf-profile2-session-ipc" }
+tempfile = "3"

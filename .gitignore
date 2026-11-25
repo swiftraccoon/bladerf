@@ -2,6 +2,7 @@
 /target/
 /downloads/
 /captures/
+/config/profile2-approved-manifest.sha256
 /artifacts/
 /dev-docs/
 /.venv/

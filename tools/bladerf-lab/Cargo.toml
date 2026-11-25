@@ -9,14 +9,17 @@ description = "Receive-only bladeRF micro xA9 capture, analysis, and workspace t
 [features]
 analysis = ["dep:rustfft", "dep:plotters"]
 default = ["analysis", "radio"]
-radio = ["dep:ctrlc", "dep:soapysdr"]
+radio = ["dep:ctrlc", "dep:data-encoding", "dep:nix", "dep:ring", "dep:soapysdr"]
 
 [dependencies]
 anyhow = "1"
 chrono = { default-features = false, features = ["clock", "std"], version = "0.4" }
 clap = { features = ["derive"], version = "4.5" }
 ctrlc = { features = ["termination"], optional = true, version = "3.4" }
+data-encoding = { optional = true, version = "2" }
+nix = { features = ["fs"], default-features = false, optional = true, version = "0.31" }
 num-complex = "0.4"
+ring = { version = "0.17", default-features = false, optional = true }
 rustfft = { optional = true, version = "6" }
 serde = { features = ["derive"], version = "1" }
 serde_json = "1"

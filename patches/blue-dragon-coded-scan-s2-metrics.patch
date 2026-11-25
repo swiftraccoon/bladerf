@@ -1,0 +1,155 @@
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -1307,20 +1307,25 @@
+     crc24(body, crc_init) == u32::from_le_bytes([crc[0], crc[1], crc[2], 0])
+ }
+ 
++fn coded_block2_retry_extent(payload_length: usize) -> Option<(usize, usize)> {
++    if payload_length > CODED_MAX_PDU_BYTES {
++        return None;
++    }
++    let packet_bytes = 2 + payload_length + 3;
++    // The header bounds the trellis to PDU, CRC and three TERM2 bits.
++    let coded_metric_count = 2 * (packet_bytes * 8 + 3);
++    Some((packet_bytes, coded_metric_count))
++}
++
+ fn retry_terminated_coded_block2(
+     soft_coded: &[f32],
+     channel: u32,
+     payload_length: usize,
+     crc_init: u32,
+ ) -> Option<Vec<u8>> {
+-    if payload_length > CODED_MAX_PDU_BYTES {
+-        return None;
+-    }
+-    let packet_bytes = 2 + payload_length + 3;
+-    // The header bounds the trellis to PDU, CRC and three TERM2 bits.
+-    let terminated_bits = packet_bytes * 8 + 3;
++    let (packet_bytes, coded_metric_count) = coded_block2_retry_extent(payload_length)?;
+     let (decoded, _, termination_metric) =
+-        crate::fec::viterbi_decode_terminated(soft_coded.get(..2 * terminated_bits)?);
++        crate::fec::viterbi_decode_terminated(soft_coded.get(..coded_metric_count)?);
+     if !termination_metric.is_finite() {
+         return None;
+     }
+@@ -1334,6 +1339,33 @@
+     Some(bytes)
+ }
+ 
++fn retry_clipped_s2_coded_block2(
++    soft_coded: &mut [f32],
++    channel: u32,
++    payload_length: usize,
++    crc_init: u32,
++) -> Option<Vec<u8>> {
++    // S=2 passes each averaged FM symbol directly to the trellis, with
++    // polarity inverted. Limit the influence of phase outliers in those units.
++    const METRIC_LIMIT: f32 = 0.35;
++    let (_, coded_metric_count) = coded_block2_retry_extent(payload_length)?;
++    let metrics = soft_coded.get_mut(..coded_metric_count)?;
++    let mut clipped = false;
++    for metric in metrics.iter_mut() {
++        if !metric.is_finite() {
++            return None;
++        }
++        if metric.abs() > METRIC_LIMIT {
++            *metric = METRIC_LIMIT.copysign(*metric);
++            clipped = true;
++        }
++    }
++    if !clipped {
++        return None;
++    }
++    retry_terminated_coded_block2(metrics, channel, payload_length, crc_init)
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn decode_coded_block2(
+     demod: &[f32],
+@@ -1490,13 +1522,23 @@
+     // terminated trellis. Samples after the packet can corrupt the long decode.
+     if let Some((init, confirmed)) = crc_init_val {
+         if best_result.as_ref().is_none_or(|result| !result.3) {
+-            for (coding_s, payload_length, soft_coded) in retry_candidates.into_iter().flatten() {
+-                if let Some(bytes) =
+-                    retry_terminated_coded_block2(&soft_coded, channel, payload_length, init)
+-                {
+-                    best_result = Some((bytes, payload_length, true, true, confirmed, coding_s));
+-                    break;
+-                }
++            let recovered = retry_candidates
++                .iter()
++                .flatten()
++                .find_map(|(coding_s, payload_length, soft_coded)| {
++                    retry_terminated_coded_block2(soft_coded, channel, *payload_length, init)
++                        .map(|bytes| (bytes, *payload_length, *coding_s))
++                })
++                .or_else(|| {
++                    let (_, payload_length, soft_coded) = retry_candidates
++                        .iter_mut()
++                        .flatten()
++                        .find(|candidate| candidate.0 == 2)?;
++                    retry_clipped_s2_coded_block2(soft_coded, channel, *payload_length, init)
++                        .map(|bytes| (bytes, *payload_length, 2))
++                });
++            if let Some((bytes, payload_length, coding_s)) = recovered {
++                best_result = Some((bytes, payload_length, true, true, confirmed, coding_s));
+             }
+         }
+     }
+@@ -1624,6 +1666,53 @@
+     }
+ 
+     #[test]
++    fn strict_coded_scan_clips_s2_outliers_after_raw_retries() {
++        let init = 0x555555;
++        let channel = 19;
++        let packet = [0x07, 0x03, 0x61, 0x62, 0x63, 0x46, 0xed, 0x0c];
++        assert!(coded_pdu_crc_matches(&packet, init));
++        let mut soft = coded_packet_metrics(&packet, channel);
++        for metric in &mut soft {
++            *metric *= 0.12;
++        }
++        // One large wrong-sign metric outweighs several reliable weak symbols.
++        soft[80] *= -8.0;
++        let ordinary = dewhiten_coded_bytes(&crate::fec::viterbi_decode(&soft), channel);
++        assert_eq!(ordinary[1], 3);
++        assert!(!coded_pdu_crc_matches(&ordinary, init));
++        assert!(retry_terminated_coded_block2(&soft, channel, 3, init).is_none());
++
++        let block1_start = CODED_PREAMBLE_SYMBOLS * BLE_SPS;
++        let block2_start = block1_start + CODED_BLOCK1_SYMBOLS * BLE_SPS;
++        let mut demod = vec![0.0; block2_start];
++        for metric in soft {
++            demod.extend_from_slice(&[-metric; BLE_SPS]);
++        }
++        let block1 = CodedBlock1 {
++            access_address: BLE_ADV_AA,
++            coding_indicator: 1,
++            start_sample: block1_start,
++            inverted: false,
++            terminated: true,
++        };
++        let (recovered, end) = decode_coded_block2(
++            &demod,
++            2444,
++            &Timespec { tv_sec: 0, tv_nsec: 0 },
++            BLE_SPS,
++            true,
++            Some((init, false)),
++            0,
++            true,
++            block1,
++        )
++        .expect("valid CRC after the clipped S2 retry");
++        assert!(recovered.crc_checked && recovered.crc_valid);
++        assert_eq!(&recovered.data[5..], &packet);
++        assert_eq!(end, demod.len());
++    }
++
++    #[test]
+     fn terminated_coded_retry_checks_extent_header_and_crc() {
+         let channel = 19;
+         let init = 0x555555;

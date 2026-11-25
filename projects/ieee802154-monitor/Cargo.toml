@@ -1,0 +1,20 @@
+[package]
+name = "ieee802154-monitor"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Offline IEEE 802.15.4 channel preparation and candidate inspection"
+
+[dependencies]
+anyhow = "1"
+clap = { features = ["derive"], version = "4.5" }
+data-encoding = "2"
+ring = { version = "0.17", default-features = false }
+rustix = { version = "1.1", features = ["fs"] }
+serde = { features = ["derive"], version = "1" }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

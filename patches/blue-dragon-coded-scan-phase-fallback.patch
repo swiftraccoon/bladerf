@@ -1,0 +1,276 @@
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+index bc36c87..7cc979c 100644
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -1701,15 +1701,22 @@ fn decode_coded_scan_burst<'a>(
+                     connections,
+                 )
+             };
+-            let packets = decode(&raw_demod);
++            let mut packets = decode(&raw_demod);
+             if packets.is_empty() {
+                 // The full-band result takes precedence. A centered retry
+                 // preserves the timestamp and uses the same CRC context.
+                 let narrow = bd_dsp::fsk::narrow_coded_iq(&burst.samples);
+-                decode(&fsk.fm_discriminate_raw(&narrow))
+-            } else {
+-                packets
++                packets = decode(&fsk.fm_discriminate_raw(&narrow));
++            }
++            if packets.is_empty() {
++                packets = ble::ble_coded_replay_packets_with_phase_retry(
++                    &raw_demod,
++                    burst.freq,
++                    burst.timestamp.clone(),
++                    connections,
++                );
+             }
++            packets
+         }
+         None => ble::ble_coded_scan_packets(
+             &raw_demod,
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+index 3589851..3ccab98 100644
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -1019,9 +1019,38 @@ pub fn ble_coded_replay_packets(
+     )
+ }
+ 
++/// Search raw preamble candidates with tapered S=2 advertising payload metrics.
++/// Call this after ordinary file replay finds no packet in the window.
++pub fn ble_coded_replay_packets_with_phase_retry(
++    demod: &[f32],
++    freq: u32,
++    timestamp: Timespec,
++    connections: &mut CodedScanConnections,
++) -> Vec<BlePacket> {
++    scan_coded_packets(
++        demod,
++        freq,
++        timestamp,
++        &mut CodedScanContext::PhaseReplay(connections),
++    )
++}
++
+ enum CodedScanContext<'a> {
+     Lookup(&'a mut dyn FnMut(u32) -> Option<(u32, bool)>),
+     Replay(&'a mut CodedScanConnections),
++    PhaseReplay(&'a mut CodedScanConnections),
++}
++
++impl CodedScanContext<'_> {
++    fn observe_request(&mut self, packet: &BlePacket, timestamp: &Timespec, end: usize) {
++        if packet.is_data {
++            return;
++        }
++        if let Self::Replay(connections) | Self::PhaseReplay(connections) = self {
++            let completed = timestamp_with_sample_offset(timestamp, end, BLE_SPS);
++            connections.observe_request(packet, &completed);
++        }
++    }
+ }
+ 
+ fn scan_coded_packets(
+@@ -1053,6 +1082,13 @@ fn scan_coded_packets(
+     let mut strongest_accounted = false;
+     let mut positions = Vec::with_capacity(CODED_PREAMBLE_SYMBOLS * BLE_SPS);
+     let mut packets = Vec::new();
++    let tapered = matches!(context, CodedScanContext::PhaseReplay(_)).then(|| {
++        demod
++            .iter()
++            // Keep smaller FM excursions intact and taper larger excursions.
++            .map(|point| point * (2.0 - 3.0 * point.abs()).clamp(0.0, 1.0))
++            .collect::<Vec<_>>()
++    });
+     let mut cursor = 0;
+     let mut attempts = 0;
+     while cursor < limit && attempts < chronological_limit {
+@@ -1072,9 +1108,14 @@ fn scan_coded_packets(
+             }
+             attempts += 1;
+             strongest_accounted |= position == strongest;
+-            let Some((packet, end)) =
+-                decode_coded_scan_at(demod, freq, &timestamp, context, position)
+-            else {
++            let Some((packet, end)) = decode_coded_scan_at(
++                demod,
++                freq,
++                &timestamp,
++                context,
++                position,
++                tapered.as_deref(),
++            ) else {
+                 continue;
+             };
+             packets.push(packet);
+@@ -1084,8 +1125,14 @@ fn scan_coded_packets(
+         }
+     }
+     if attempts == chronological_limit && !strongest_accounted {
+-        if let Some((packet, _)) = decode_coded_scan_at(demod, freq, &timestamp, context, strongest)
+-        {
++        if let Some((packet, _)) = decode_coded_scan_at(
++            demod,
++            freq,
++            &timestamp,
++            context,
++            strongest,
++            tapered.as_deref(),
++        ) {
+             packets.push(packet);
+             packets.sort_by_key(|packet| (packet.timestamp.tv_sec, packet.timestamp.tv_nsec));
+         }
+@@ -1093,36 +1140,59 @@ fn scan_coded_packets(
+     packets
+ }
+ 
+-fn decode_coded_scan_at(
++fn retry_coded_s2_payload(
+     demod: &[f32],
+-    frequency: u32,
++    metrics: &[f32],
++    freq: u32,
+     timestamp: &Timespec,
+-    context: &mut CodedScanContext<'_>,
+-    preamble_start: usize,
++    start: usize,
+ ) -> Option<(BlePacket, usize)> {
+-    let (packet, end) = decode_coded_at(
++    decode_coded_with_payload_metrics(
+         demod,
+-        frequency,
++        metrics,
++        freq,
+         timestamp.clone(),
+         BLE_SPS,
+         true,
+-        &mut |aa, preamble| match context {
+-            CodedScanContext::Lookup(lookup) => lookup(aa),
+-            CodedScanContext::Replay(connections) => {
+-                let started = timestamp_with_sample_offset(timestamp, preamble, BLE_SPS);
+-                connections.crc_init_at(aa, &started)
+-            }
+-        },
+-        preamble_start,
++        &mut |_, _| None,
++        start,
+         true,
+     )
+-    .filter(|(packet, end)| packet.crc_checked && packet.crc_valid && *end <= demod.len())?;
+-    if let CodedScanContext::Replay(connections) = context {
+-        if !packet.is_data {
+-            let completed = timestamp_with_sample_offset(timestamp, end, BLE_SPS);
+-            connections.observe_request(&packet, &completed);
++    .filter(|(packet, _)| packet.data.get(4) == Some(&1))
++}
++
++fn decode_coded_scan_at(
++    demod: &[f32],
++    frequency: u32,
++    timestamp: &Timespec,
++    context: &mut CodedScanContext<'_>,
++    preamble_start: usize,
++    payload_metrics: Option<&[f32]>,
++) -> Option<(BlePacket, usize)> {
++    let (packet, end) = match payload_metrics {
++        Some(metrics) => {
++            retry_coded_s2_payload(demod, metrics, frequency, timestamp, preamble_start)
+         }
++        None => decode_coded_at(
++            demod,
++            frequency,
++            timestamp.clone(),
++            BLE_SPS,
++            true,
++            &mut |aa, preamble| match context {
++                CodedScanContext::Lookup(lookup) => lookup(aa),
++                CodedScanContext::Replay(connections)
++                | CodedScanContext::PhaseReplay(connections) => {
++                    let started = timestamp_with_sample_offset(timestamp, preamble, BLE_SPS);
++                    connections.crc_init_at(aa, &started)
++                }
++            },
++            preamble_start,
++            true,
++        ),
+     }
++    .filter(|(packet, end)| packet.crc_checked && packet.crc_valid && *end <= demod.len())?;
++    context.observe_request(&packet, timestamp, end);
+     Some((packet, end))
+ }
+ 
+@@ -1209,6 +1279,31 @@ fn decode_coded_at(
+     crc_init_fn: &mut dyn FnMut(u32, usize) -> Option<(u32, bool)>,
+     preamble_start: usize,
+     exact_pdu_length: bool,
++) -> Option<(BlePacket, usize)> {
++    decode_coded_with_payload_metrics(
++        demod,
++        demod,
++        freq,
++        timestamp,
++        sps,
++        check_crc,
++        crc_init_fn,
++        preamble_start,
++        exact_pdu_length,
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++fn decode_coded_with_payload_metrics(
++    demod: &[f32],
++    payload_metrics: &[f32],
++    freq: u32,
++    timestamp: Timespec,
++    sps: usize,
++    check_crc: bool,
++    crc_init_fn: &mut dyn FnMut(u32, usize) -> Option<(u32, bool)>,
++    preamble_start: usize,
++    exact_pdu_length: bool,
+ ) -> Option<(BlePacket, usize)> {
+     use crate::fec;
+ 
+@@ -1300,7 +1395,7 @@ fn decode_coded_at(
+     let advertising = if best_hd <= BLE_MAX_HD {
+         // A best final state of zero already gives the terminated path CI.
+         decode_coded_block2(
+-            demod,
++            payload_metrics,
+             freq,
+             &timestamp,
+             sps,
+@@ -2269,6 +2364,32 @@ mod tests {
+             .collect()
+     }
+ 
++    #[test]
++    fn phase_retry_requires_valid_s2_crc_and_complete_term2() {
++        let pdu = [0x02, 0x06, 1, 2, 3, 4, 5, 6];
++        for (valid_crc, missing_term2) in [(true, false), (false, false), (true, true)] {
++            let mut demod = vec![0.0; 512];
++            demod.extend(
++                coded_scan_fixture(&pdu, 1, valid_crc)
++                    .into_iter()
++                    .map(|sample| sample * 0.2),
++            );
++            if missing_term2 {
++                demod.truncate(demod.len() - 3 * 2 * BLE_SPS);
++            }
++            let packets = ble_coded_replay_packets_with_phase_retry(
++                &demod,
++                2402,
++                Timespec { tv_sec: 0, tv_nsec: 0 },
++                &mut CodedScanConnections::default(),
++            );
++            assert_eq!(packets.len(), usize::from(valid_crc && !missing_term2));
++            if let Some(packet) = packets.first() {
++                assert_eq!(&packet.data[5..5 + pdu.len()], &pdu);
++            }
++        }
++    }
++
+     #[test]
+     fn continuous_coded_scan_accepts_the_maximum_payload_through_term2() {
+         let mut pdu = vec![0x07, CODED_MAX_PDU_BYTES as u8, 0x00];

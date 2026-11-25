@@ -4,7 +4,7 @@
 //! [`Summary`] contains aggregate counts only. CRC validity is not authentication,
 //! decryption, receiver calibration, or evidence of complete channel coverage.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 const MAX_PACKET_BYTES: usize = 65_536;
 const MAX_CONNECTIONS: usize = 1024;
+const MAX_DISTINCT_VALIDATED_FRAME_BODIES: usize = 4096;
 const DLT_PPI: u32 = 192;
 const DLT_BLE: u32 = 251;
 const DLT_CLASSIC: u32 = 255;
@@ -26,6 +27,9 @@ const POWER_VALID: u16 = 0x0006;
 const CHANNEL_ALIASED: u16 = 0x0040;
 const CRC_CHECKED_VALID: u16 = 0x0c00;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Independent Core 6.2 Vol 6 Part C 4.2.1/4.3.1 sample data.
+#[cfg(test)]
+const SPEC_ADVERTISING_PDU: &[u8] = &[0x42, 0x09, 0xa6, 0xa5, 0xa4, 0xa3, 0xa2, 0xc1, 1, 2, 3];
 
 /// Aggregate capture information without device addresses, names or payloads.
 #[derive(Debug, Default, Serialize)]
@@ -47,6 +51,147 @@ pub(crate) struct Summary {
     pub(crate) packets_by_logical_channel: BTreeMap<String, u64>,
     pub(crate) packets_by_pdu_type: BTreeMap<String, u64>,
     pub(crate) advertising_data_types: BTreeMap<String, u64>,
+    pub(crate) validated_packets_by_phy: ValidatedPhySummary,
+    pub(crate) duplicate_accounting: DuplicateAccountingSummary,
+}
+
+/// Closed partition of independently validated BLE packets by PHY.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct ValidatedPhySummary {
+    pub(crate) unknown: u64,
+    pub(crate) le_1m: u64,
+    pub(crate) le_2m: u64,
+    pub(crate) le_coded_s8: u64,
+    pub(crate) le_coded_s2: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidatedPhy {
+    Unknown,
+    Le1M,
+    Le2M,
+    LeCodedS8,
+    LeCodedS2,
+}
+
+impl ValidatedPhySummary {
+    fn observe(&mut self, phy: ValidatedPhy) {
+        let count = match phy {
+            ValidatedPhy::Unknown => &mut self.unknown,
+            ValidatedPhy::Le1M => &mut self.le_1m,
+            ValidatedPhy::Le2M => &mut self.le_2m,
+            ValidatedPhy::LeCodedS8 => &mut self.le_coded_s8,
+            ValidatedPhy::LeCodedS2 => &mut self.le_coded_s2,
+        };
+        *count += 1;
+    }
+
+    fn total(&self) -> Option<u64> {
+        self.unknown
+            .checked_add(self.le_1m)
+            .and_then(|count| count.checked_add(self.le_2m))
+            .and_then(|count| count.checked_add(self.le_coded_s8))
+            .and_then(|count| count.checked_add(self.le_coded_s2))
+    }
+}
+
+/// Aggregate-only accounting for repeated, independently CRC-valid BLE frames.
+#[derive(Debug, Serialize)]
+pub(crate) struct DuplicateAccountingSummary {
+    /// Maximum normalized frame bodies retained in memory during one inspection.
+    pub(crate) normalized_frame_body_capacity: u64,
+    /// Exact distinct count while `exact` is true; otherwise a lower bound.
+    pub(crate) distinct_validated_frame_bodies: u64,
+    /// Packets matching a retained normalized body; exact for those bodies.
+    pub(crate) repeated_validated_packets: u64,
+    /// Validated packets whose body could not be retained after capacity filled.
+    pub(crate) unresolved_validated_packets: u64,
+    /// The retained-body set reached its fixed capacity during inspection.
+    pub(crate) capacity_reached: bool,
+    /// No validated packet was left unresolved by the fixed-capacity set.
+    pub(crate) exact: bool,
+}
+
+impl Default for DuplicateAccountingSummary {
+    fn default() -> Self {
+        Self {
+            normalized_frame_body_capacity: MAX_DISTINCT_VALIDATED_FRAME_BODIES as u64,
+            distinct_validated_frame_bodies: 0,
+            repeated_validated_packets: 0,
+            unresolved_validated_packets: 0,
+            capacity_reached: false,
+            exact: true,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DuplicateTracker {
+    normalized_frame_bodies: BTreeSet<Vec<u8>>,
+}
+
+impl DuplicateTracker {
+    fn observe(&mut self, normalized_frame_body: &[u8], summary: &mut Summary) {
+        let accounting = &mut summary.duplicate_accounting;
+        if self.normalized_frame_bodies.contains(normalized_frame_body) {
+            accounting.repeated_validated_packets += 1;
+            return;
+        }
+        if self.normalized_frame_bodies.len() < MAX_DISTINCT_VALIDATED_FRAME_BODIES {
+            self.normalized_frame_bodies
+                .insert(normalized_frame_body.to_vec());
+            accounting.distinct_validated_frame_bodies += 1;
+            accounting.capacity_reached =
+                self.normalized_frame_bodies.len() == MAX_DISTINCT_VALIDATED_FRAME_BODIES;
+            return;
+        }
+        accounting.unresolved_validated_packets += 1;
+        accounting.exact = false;
+    }
+}
+
+fn validate_duplicate_accounting(summary: &Summary) -> Result<()> {
+    let accounting = &summary.duplicate_accounting;
+    let validated_packets = summary
+        .validated_advertising_packets
+        .checked_add(summary.validated_data_packets)
+        .context("validated BLE packet count overflow")?;
+    let accounted_packets = accounting
+        .distinct_validated_frame_bodies
+        .checked_add(accounting.repeated_validated_packets)
+        .and_then(|count| count.checked_add(accounting.unresolved_validated_packets))
+        .context("duplicate-accounting packet count overflow")?;
+    ensure!(
+        accounting.normalized_frame_body_capacity == MAX_DISTINCT_VALIDATED_FRAME_BODIES as u64
+            && accounting.distinct_validated_frame_bodies
+                <= accounting.normalized_frame_body_capacity
+            && accounting.capacity_reached
+                == (accounting.distinct_validated_frame_bodies
+                    == accounting.normalized_frame_body_capacity)
+            && accounting.exact == (accounting.unresolved_validated_packets == 0)
+            && (accounting.repeated_validated_packets == 0
+                || accounting.distinct_validated_frame_bodies > 0)
+            && (accounting.unresolved_validated_packets == 0 || accounting.capacity_reached)
+            && accounted_packets == validated_packets,
+        "validated BLE duplicate accounting is inconsistent"
+    );
+    Ok(())
+}
+
+fn validate_phy_accounting(summary: &Summary) -> Result<()> {
+    let validated_packets = summary
+        .validated_advertising_packets
+        .checked_add(summary.validated_data_packets)
+        .context("validated BLE packet count overflow")?;
+    let packets_by_phy = summary
+        .validated_packets_by_phy
+        .total()
+        .context("validated BLE PHY count overflow")?;
+    ensure!(
+        packets_by_phy == validated_packets,
+        "validated BLE PHY accounting is inconsistent"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +358,8 @@ struct PacketRecord {
     logical_channel: Option<u8>,
     frequency_mhz: Option<u16>,
     upstream_phy_bits: Option<u8>,
+    upstream_coding_indicator: Option<u8>,
+    coding_scheme: Option<&'static str>,
     signal_relative_estimate: Option<i8>,
     noise_relative_estimate: Option<i8>,
     access_address: Option<String>,
@@ -240,6 +387,8 @@ impl PacketRecord {
             logical_channel: None,
             frequency_mhz: None,
             upstream_phy_bits: None,
+            upstream_coding_indicator: None,
+            coding_scheme: None,
             signal_relative_estimate: None,
             noise_relative_estimate: None,
             access_address: None,
@@ -251,29 +400,49 @@ impl PacketRecord {
             warnings: Vec::new(),
         }
     }
+
+    fn timestamp(&self) -> (u32, u32) {
+        // One PCAP header fixes the fractional unit for the whole input.
+        (self.timestamp_seconds, self.timestamp_fraction)
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionContext {
+    access_address: u32,
+    crc_init: u32,
+    requested_at: (u32, u32),
 }
 
 #[derive(Debug, Default)]
-struct Connections(VecDeque<(u32, u32)>);
+struct Connections(VecDeque<ConnectionContext>);
 
 impl Connections {
-    fn get(&self, address: u32) -> Option<u32> {
-        self.0
-            .iter()
-            .find_map(|&(aa, init)| (aa == address).then_some(init))
+    fn get(&self, access_address: u32, timestamp: (u32, u32)) -> Option<u32> {
+        self.0.iter().find_map(|context| {
+            (context.access_address == access_address && context.requested_at <= timestamp)
+                .then_some(context.crc_init)
+        })
     }
 
-    fn learn(&mut self, address: u32, init: u32, summary: &mut Summary) {
-        if address == ADVERTISING_AA {
+    fn learn(&mut self, context: ConnectionContext, summary: &mut Summary) {
+        if context.access_address == ADVERTISING_AA {
             return;
         }
-        if let Some(position) = self.0.iter().position(|&(aa, _)| aa == address) {
+        if let Some(position) = self
+            .0
+            .iter()
+            .position(|entry| entry.access_address == context.access_address)
+        {
+            if self.0[position].requested_at > context.requested_at {
+                return;
+            }
             self.0.remove(position);
         } else if self.0.len() == MAX_CONNECTIONS {
             self.0.pop_front();
             summary.connection_context_evictions += 1;
         }
-        self.0.push_back((address, init));
+        self.0.push_back(context);
         summary.connections_learned += 1;
     }
 }
@@ -548,7 +717,14 @@ fn decode_advertising(
         5 if payload.len() == 34 => {
             let aa = le32(&payload[12..]);
             let init = le24(&payload[16..]);
-            connections.learn(aa, init, summary);
+            connections.learn(
+                ConnectionContext {
+                    access_address: aa,
+                    crc_init: init,
+                    requested_at: record.timestamp(),
+                },
+                summary,
+            );
             Some(
                 json!({"initiator": address(&payload[..6],tx_random), "advertiser": address(&payload[6..12],rx_random), "connection_access_address": format!("0x{aa:08x}"), "crc_init": format!("0x{init:06x}"), "window_size_1_25ms_units": payload[19], "window_offset_1_25ms_units": le16(&payload[20..]), "interval_1_25ms_units": le16(&payload[22..]), "latency_events": le16(&payload[24..]), "supervision_timeout_10ms_units": le16(&payload[26..]), "channel_map_hex": hex(&payload[28..33]), "hop_increment": payload[33] & 0x1f, "sleep_clock_accuracy_bits": payload[33] >> 5}),
             )
@@ -587,6 +763,7 @@ fn analyze(
     record: &mut PacketRecord,
     summary: &mut Summary,
     connections: &mut Connections,
+    duplicates: &mut DuplicateTracker,
 ) -> Option<Vec<u8>> {
     let (linktype, bytes) = match unwrap_record(bytes, source_linktype) {
         Ok(value) => value,
@@ -627,12 +804,15 @@ fn analyze(
             return None;
         }
     };
-    if bytes.len() < offset + 9 {
+    if bytes.len() < offset + 4 {
         summary.malformed_packets += 1;
         record.warnings.push("short_ble_packet");
         return None;
     }
     let mut packet = bytes.to_vec();
+    let mut pdu_offset = 4;
+    let mut validated_phy = ValidatedPhy::Unknown;
+    let mut needs_dewhitening = false;
     if offset != 0 {
         let flags = le16(&packet[8..]);
         record.physical_channel = Some(packet[0]);
@@ -640,31 +820,74 @@ fn analyze(
         record.frequency_mhz = record
             .logical_channel
             .map(|_| 2402 + u16::from(packet[0]) * 2);
-        record.upstream_phy_bits = Some((flags >> 14) as u8);
+        let phy_bits = (flags >> 14) as u8;
+        record.upstream_phy_bits = Some(phy_bits);
+        match phy_bits {
+            0 => validated_phy = ValidatedPhy::Le1M,
+            1 => validated_phy = ValidatedPhy::Le2M,
+            2 => pdu_offset = 5,
+            _ => {
+                record.validation = "unsupported_phy";
+                record.warnings.push("reserved_ble_phy");
+                summary.unsupported_records += 1;
+                return None;
+            }
+        }
         record.signal_relative_estimate = (flags & 2 != 0).then_some(packet[1] as i8);
         record.noise_relative_estimate = (flags & 4 != 0).then_some(packet[2] as i8);
         if flags & CHANNEL_ALIASED != 0 {
             record.warnings.push("rf_channel_marked_aliased");
         }
-        if flags & DEWHITENED == 0 {
-            if let Some(channel) = record.logical_channel {
-                dewhiten(&mut packet[offset + 4..], channel);
-            } else {
-                record.validation = "unknown_whitening_channel";
+        needs_dewhitening = flags & DEWHITENED == 0;
+    }
+    if pdu_offset == 5 {
+        if packet.len() == offset + 4 {
+            summary.malformed_packets += 1;
+            record.warnings.push("missing_coded_coding_indicator");
+            return None;
+        }
+        let raw_coding_indicator = packet[offset + 4];
+        let coding_indicator = raw_coding_indicator & 0x03;
+        record.upstream_coding_indicator = Some(coding_indicator);
+        if raw_coding_indicator & !0x03 != 0 {
+            record.warnings.push("coding_indicator_upper_bits_nonzero");
+        }
+        let (coding_scheme, phy) = match coding_indicator {
+            0 => ("s8", ValidatedPhy::LeCodedS8),
+            1 => ("s2", ValidatedPhy::LeCodedS2),
+            _ => {
+                record.validation = "unsupported_coding_indicator";
+                record.warnings.push("reserved_coding_indicator");
                 summary.unsupported_records += 1;
                 return None;
             }
+        };
+        record.coding_scheme = Some(coding_scheme);
+        validated_phy = phy;
+    }
+    if packet.len() < offset + pdu_offset + 5 {
+        summary.malformed_packets += 1;
+        record.warnings.push("short_ble_packet");
+        return None;
+    }
+    if needs_dewhitening {
+        if let Some(channel) = record.logical_channel {
+            dewhiten(&mut packet[offset + pdu_offset..], channel);
+        } else {
+            record.validation = "unknown_whitening_channel";
+            summary.unsupported_records += 1;
+            return None;
         }
     }
     let data = &packet[offset..];
     let aa = le32(data);
     record.access_address = Some(format!("0x{aa:08x}"));
-    let pdu_header_length = if aa != ADVERTISING_AA && data[4] & 0x20 != 0 {
+    let pdu_header_length = if aa != ADVERTISING_AA && data[pdu_offset] & 0x20 != 0 {
         3
     } else {
         2
     };
-    let expected = 4 + pdu_header_length + usize::from(data[5]) + 3;
+    let expected = pdu_offset + pdu_header_length + usize::from(data[pdu_offset + 1]) + 3;
     if data.len() != expected {
         summary.malformed_packets += 1;
         record.warnings.push("ble_length_does_not_match_record");
@@ -673,20 +896,28 @@ fn analyze(
     let init = if aa == ADVERTISING_AA {
         Some(0x555555)
     } else {
-        connections.get(aa)
+        connections.get(aa, record.timestamp())
     };
     let Some(init) = init else {
         record.validation = "crc_unknown_connection_context";
         summary.unknown_crc_packets += 1;
         return None;
     };
-    let pdu = &data[4..data.len() - 3];
+    let pdu = &data[pdu_offset..data.len() - 3];
     if crc24(pdu, init) != data[data.len() - 3..] {
         record.validation = "crc_invalid";
         summary.invalid_crc_packets += 1;
         return None;
     }
+    // The access address plus dewhitened PDU is stable across RF channels and
+    // coding schemes. It excludes CI, pseudoheader metadata and redundant CRC;
+    // normalized bodies remain in bounded process memory and are not serialized.
+    let mut normalized_body = Vec::with_capacity(4 + pdu.len());
+    normalized_body.extend_from_slice(&data[..4]);
+    normalized_body.extend_from_slice(pdu);
+    duplicates.observe(&normalized_body, summary);
     record.ble_dewhitened_hex = Some(hex(data));
+    summary.validated_packets_by_phy.observe(validated_phy);
     if let Some(channel) = record.logical_channel {
         *summary
             .packets_by_logical_channel
@@ -727,6 +958,25 @@ fn output_identity(path: &Path) -> Result<PathBuf> {
     Ok(parent.canonicalize()?.join(name))
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct SelectedCodedPackets {
+    frequency_mhz: u32,
+    le_coded_s2: u64,
+    le_coded_s8: u64,
+}
+
+impl SelectedCodedPackets {
+    fn observe(&mut self, record: &PacketRecord) {
+        if record.frequency_mhz.map(u32::from) == Some(self.frequency_mhz) {
+            match record.coding_scheme {
+                Some("s2") => self.le_coded_s2 += 1,
+                Some("s8") => self.le_coded_s8 += 1,
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Inspect classic PCAP streams without opening a radio or fetching any source.
 ///
 /// Outputs are published only after the entire input parses. Existing paths are
@@ -738,6 +988,18 @@ pub(crate) fn inspect(
     validated_output: Option<&Path>,
     jsonl_output: Option<&Path>,
 ) -> Result<Summary> {
+    inspect_with_selected_coded(input, validated_output, jsonl_output, None)
+        .map(|(summary, _)| summary)
+}
+
+/// Optionally count validated LE Coded packets whose reported frequency matches
+/// the selected bin, using the same validated records as the capture summary.
+pub(crate) fn inspect_with_selected_coded(
+    input: &Path,
+    validated_output: Option<&Path>,
+    jsonl_output: Option<&Path>,
+    selected_frequency: Option<u32>,
+) -> Result<(Summary, Option<SelectedCodedPackets>)> {
     if let (Some(pcap), Some(jsonl)) = (validated_output, jsonl_output) {
         ensure!(
             output_identity(pcap)? != output_identity(jsonl)?,
@@ -762,6 +1024,12 @@ pub(crate) fn inspect(
         ..Summary::default()
     };
     let mut connections = Connections::default();
+    let mut duplicates = DuplicateTracker::default();
+    let mut selected_coded = selected_frequency.map(|frequency_mhz| SelectedCodedPackets {
+        frequency_mhz,
+        le_coded_s2: 0,
+        le_coded_s8: 0,
+    });
     loop {
         let mut raw = [0; 16];
         if reader
@@ -816,21 +1084,29 @@ pub(crate) fn inspect(
                 &mut record,
                 &mut summary,
                 &mut connections,
+                &mut duplicates,
             )
         };
-        if let (Some(output), Some(packet)) = (&mut trusted, valid) {
-            output.writer.write_all(&seconds.to_le_bytes())?;
-            output.writer.write_all(&fraction.to_le_bytes())?;
-            let length = u32::try_from(packet.len())?;
-            output.writer.write_all(&length.to_le_bytes())?;
-            output.writer.write_all(&length.to_le_bytes())?;
-            output.writer.write_all(&packet)?;
+        if let Some(packet) = valid {
+            if let Some(counts) = &mut selected_coded {
+                counts.observe(&record);
+            }
+            if let Some(output) = &mut trusted {
+                output.writer.write_all(&seconds.to_le_bytes())?;
+                output.writer.write_all(&fraction.to_le_bytes())?;
+                let length = u32::try_from(packet.len())?;
+                output.writer.write_all(&length.to_le_bytes())?;
+                output.writer.write_all(&length.to_le_bytes())?;
+                output.writer.write_all(&packet)?;
+            }
         }
         if let Some(output) = &mut jsonl {
             serde_json::to_writer(&mut output.writer, &record)?;
             output.writer.write_all(b"\n")?;
         }
     }
+    validate_duplicate_accounting(&summary)?;
+    validate_phy_accounting(&summary)?;
     if let Some(output) = &mut trusted {
         output.prepare()?;
     }
@@ -843,7 +1119,7 @@ pub(crate) fn inspect(
     if let Some(output) = &jsonl {
         output.publish()?;
     }
-    Ok(summary)
+    Ok((summary, selected_coded))
 }
 
 #[cfg(test)]
@@ -911,10 +1187,6 @@ mod tests {
         bytes
     }
 
-    // Independent Core 6.2 Vol 6 Part C 4.2.1/4.3.1 sample data. These are
-    // specification examples, not captured devices or generated CRC fixtures.
-    const SPEC_ADVERTISING_PDU: &[u8] = &[0x42, 0x09, 0xa6, 0xa5, 0xa4, 0xa3, 0xa2, 0xc1, 1, 2, 3];
-
     #[test]
     fn official_crc_and_whitening_vectors() {
         assert_eq!(crc24(SPEC_ADVERTISING_PDU, 0x555555), [0xad, 0xb4, 0xeb]);
@@ -958,12 +1230,14 @@ mod tests {
         let mut record = packet_record();
         let mut summary = Summary::default();
         let mut connections = Connections::default();
+        let mut duplicates = DuplicateTracker::default();
         let output = analyze(
             &packet,
             DLT_BLE_PHDR,
             &mut record,
             &mut summary,
             &mut connections,
+            &mut duplicates,
         )
         .unwrap();
         assert_eq!(summary.validated_advertising_packets, 1);
@@ -977,18 +1251,167 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_accounting_collapses_repeated_normalized_frame_bodies() {
+        let dir = TestDirectory::new();
+        let input = dir.0.join("repeated.pcap");
+        let packet = ble_record(SPEC_ADVERTISING_PDU, 0x555555, ADVERTISING_AA);
+        let mut other_channel = packet.clone();
+        other_channel[0] = 0;
+        fs::write(
+            &input,
+            pcap(
+                ByteOrder::Little,
+                false,
+                DLT_BLE_PHDR,
+                &[packet, other_channel],
+            ),
+        )
+        .unwrap();
+
+        let summary = inspect(&input, None, None).unwrap();
+        let accounting = &summary.duplicate_accounting;
+        assert_eq!(summary.validated_advertising_packets, 2);
+        assert_eq!(accounting.distinct_validated_frame_bodies, 1);
+        assert_eq!(accounting.repeated_validated_packets, 1);
+        assert_eq!(accounting.unresolved_validated_packets, 0);
+        assert!(!accounting.capacity_reached);
+        assert!(accounting.exact);
+
+        let value = serde_json::to_value(accounting).unwrap();
+        let keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "capacity_reached",
+                "distinct_validated_frame_bodies",
+                "exact",
+                "normalized_frame_body_capacity",
+                "repeated_validated_packets",
+                "unresolved_validated_packets",
+            ]
+        );
+        assert!(
+            value
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| value.is_boolean() || value.is_number())
+        );
+    }
+
+    #[test]
+    fn duplicate_accounting_distinguishes_different_validated_bodies() {
+        let dir = TestDirectory::new();
+        let input = dir.0.join("distinct.pcap");
+        let first = ble_record(SPEC_ADVERTISING_PDU, 0x555555, ADVERTISING_AA);
+        let mut changed_pdu = SPEC_ADVERTISING_PDU.to_vec();
+        changed_pdu[8] ^= 1;
+        let second = ble_record(&changed_pdu, 0x555555, ADVERTISING_AA);
+        fs::write(
+            &input,
+            pcap(ByteOrder::Little, false, DLT_BLE_PHDR, &[first, second]),
+        )
+        .unwrap();
+
+        let accounting = inspect(&input, None, None).unwrap().duplicate_accounting;
+        assert_eq!(accounting.distinct_validated_frame_bodies, 2);
+        assert_eq!(accounting.repeated_validated_packets, 0);
+        assert_eq!(accounting.unresolved_validated_packets, 0);
+        assert!(accounting.exact);
+    }
+
+    #[test]
+    fn duplicate_accounting_keeps_access_addresses_in_normalized_identity() {
+        let mut summary = Summary::default();
+        let mut duplicates = DuplicateTracker::default();
+        let pdu = [0x16, 5, 1, 2, 3, 4, 5];
+        let mut first = ADVERTISING_AA.to_le_bytes().to_vec();
+        first.extend_from_slice(&pdu);
+        let mut second = 0xaa08_192b_u32.to_le_bytes().to_vec();
+        second.extend_from_slice(&pdu);
+
+        duplicates.observe(&first, &mut summary);
+        duplicates.observe(&second, &mut summary);
+        duplicates.observe(&first, &mut summary);
+        summary.validated_advertising_packets = 3;
+
+        validate_duplicate_accounting(&summary).unwrap();
+        assert_eq!(
+            summary.duplicate_accounting.distinct_validated_frame_bodies,
+            2
+        );
+        assert_eq!(summary.duplicate_accounting.repeated_validated_packets, 1);
+    }
+
+    #[test]
+    fn duplicate_accounting_reports_capacity_and_unresolved_packets() {
+        let mut summary = Summary::default();
+        let mut duplicates = DuplicateTracker::default();
+        for value in 0..MAX_DISTINCT_VALIDATED_FRAME_BODIES {
+            duplicates.observe(&(value as u32).to_le_bytes(), &mut summary);
+        }
+        let accounting = &summary.duplicate_accounting;
+        assert_eq!(
+            accounting.distinct_validated_frame_bodies,
+            MAX_DISTINCT_VALIDATED_FRAME_BODIES as u64
+        );
+        assert!(accounting.capacity_reached);
+        assert!(accounting.exact);
+        summary.validated_advertising_packets = MAX_DISTINCT_VALIDATED_FRAME_BODIES as u64;
+        validate_duplicate_accounting(&summary).unwrap();
+
+        duplicates.observe(&0_u32.to_le_bytes(), &mut summary);
+        duplicates.observe(&u32::MAX.to_le_bytes(), &mut summary);
+        summary.validated_advertising_packets = MAX_DISTINCT_VALIDATED_FRAME_BODIES as u64 + 2;
+        validate_duplicate_accounting(&summary).unwrap();
+        let accounting = &summary.duplicate_accounting;
+        assert_eq!(accounting.repeated_validated_packets, 1);
+        assert_eq!(accounting.unresolved_validated_packets, 1);
+        assert!(!accounting.exact);
+    }
+
+    #[test]
+    fn duplicate_accounting_rejects_impossible_repeat_and_unresolved_states() {
+        let mut repeated_without_distinct = Summary {
+            validated_advertising_packets: 1,
+            ..Summary::default()
+        };
+        repeated_without_distinct
+            .duplicate_accounting
+            .repeated_validated_packets = 1;
+        assert!(validate_duplicate_accounting(&repeated_without_distinct).is_err());
+
+        let mut unresolved_before_capacity = Summary {
+            validated_advertising_packets: 1,
+            ..Summary::default()
+        };
+        unresolved_before_capacity
+            .duplicate_accounting
+            .unresolved_validated_packets = 1;
+        unresolved_before_capacity.duplicate_accounting.exact = false;
+        assert!(validate_duplicate_accounting(&unresolved_before_capacity).is_err());
+    }
+
+    #[test]
     fn rejects_crc_noise_and_unknown_connection_context() {
         let mut packet = ble_record(SPEC_ADVERTISING_PDU, 0x555555, ADVERTISING_AA);
         packet[16] ^= 1;
         let mut summary = Summary::default();
         let mut connections = Connections::default();
+        let mut duplicates = DuplicateTracker::default();
         assert!(
             analyze(
                 &packet,
                 DLT_BLE_PHDR,
                 &mut packet_record(),
                 &mut summary,
-                &mut connections
+                &mut connections,
+                &mut duplicates,
             )
             .is_none()
         );
@@ -1000,11 +1423,19 @@ mod tests {
                 DLT_BLE_PHDR,
                 &mut packet_record(),
                 &mut summary,
-                &mut connections
+                &mut connections,
+                &mut duplicates,
             )
             .is_none()
         );
         assert_eq!(summary.unknown_crc_packets, 1);
+        assert_eq!(
+            summary.duplicate_accounting.distinct_validated_frame_bodies,
+            0
+        );
+        assert_eq!(summary.duplicate_accounting.repeated_validated_packets, 0);
+        assert_eq!(summary.duplicate_accounting.unresolved_validated_packets, 0);
+        assert!(summary.duplicate_accounting.exact);
     }
 
     #[test]
@@ -1017,13 +1448,15 @@ mod tests {
         let packet = ble_record(&pdu, 0x555555, ADVERTISING_AA);
         let mut summary = Summary::default();
         let mut connections = Connections::default();
+        let mut duplicates = DuplicateTracker::default();
         assert!(
             analyze(
                 &packet,
                 DLT_BLE_PHDR,
                 &mut packet_record(),
                 &mut summary,
-                &mut connections
+                &mut connections,
+                &mut duplicates,
             )
             .is_some()
         );
@@ -1034,7 +1467,8 @@ mod tests {
                 DLT_BLE_PHDR,
                 &mut packet_record(),
                 &mut summary,
-                &mut connections
+                &mut connections,
+                &mut duplicates,
             )
             .is_some()
         );
@@ -1048,7 +1482,8 @@ mod tests {
                 DLT_BLE_PHDR,
                 &mut packet_record(),
                 &mut summary,
-                &mut untouched
+                &mut untouched,
+                &mut duplicates,
             )
             .is_none()
         );
@@ -1148,13 +1583,15 @@ mod tests {
         ppi.extend_from_slice(&ble_record(SPEC_ADVERTISING_PDU, 0x555555, ADVERTISING_AA));
         let mut summary = Summary::default();
         let mut connections = Connections::default();
+        let mut duplicates = DuplicateTracker::default();
         assert!(
             analyze(
                 &ppi,
                 DLT_PPI,
                 &mut packet_record(),
                 &mut summary,
-                &mut connections
+                &mut connections,
+                &mut duplicates,
             )
             .is_some()
         );
@@ -1165,7 +1602,8 @@ mod tests {
                 DLT_PPI,
                 &mut packet_record(),
                 &mut summary,
-                &mut connections
+                &mut connections,
+                &mut duplicates,
             )
             .is_none()
         );
@@ -1177,10 +1615,14 @@ mod tests {
                 DLT_BLE_PHDR,
                 &mut record,
                 &mut summary,
-                &mut connections
+                &mut connections,
+                &mut duplicates,
             )
             .is_some()
         );
         assert!(record.warnings.contains(&"extended_field_exceeds_header"));
     }
 }
+
+#[cfg(test)]
+mod coded_tests;

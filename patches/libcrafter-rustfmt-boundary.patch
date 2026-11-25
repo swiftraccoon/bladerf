@@ -1,0 +1,7 @@
+diff --git a/rustfmt.toml b/rustfmt.toml
+new file mode 100644
+--- /dev/null
++++ b/rustfmt.toml
+@@ -0,0 +1,2 @@
++edition = "2021"
++style_edition = "2021"

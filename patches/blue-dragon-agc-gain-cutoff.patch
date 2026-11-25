@@ -1,0 +1,143 @@
+diff --git a/crates/dsp/src/agc.rs b/crates/dsp/src/agc.rs
+--- a/crates/dsp/src/agc.rs
++++ b/crates/dsp/src/agc.rs
+@@ -1,6 +1,9 @@
+ // Copyright 2025-2026 CEMAXECUTER LLC
+
+ use num_complex::Complex32;
++
++const MIN_GAIN: f32 = 1e-6;
++const MAX_GAIN: f32 = 1e6;
+
+ /// AGC (Automatic Gain Control) replacing liquid-dsp's agc_crcf.
+ ///
+@@ -14,8 +17,8 @@
+     gain: f32,
+     bandwidth: f32,
+     signal_level: f32,
+-    /// Squelch threshold in dB
+-    squelch_threshold: f32,
++    /// Exclusive gain limit corresponding to the squelch threshold.
++    squelch_gain_cutoff: f32,
+     /// Squelch timeout in samples
+     squelch_timeout: u32,
+     /// Current squelch state
+@@ -42,7 +45,7 @@
+             gain: 1000.0, // start with high gain (low signal assumption)
+             bandwidth,
+             signal_level: 1e-3,
+-            squelch_threshold: squelch_threshold_db,
++            squelch_gain_cutoff: gain_cutoff(squelch_threshold_db),
+             squelch_timeout,
+             state: SquelchState::SignalLo,
+             timer: 0,
+@@ -51,7 +54,7 @@
+
+     /// Get current RSSI estimate in dB
+     pub fn rssi_db(&self) -> f32 {
+-        -20.0 * self.gain.log10()
++        rssi_db_for_gain(self.gain)
+     }
+
+     /// Process one sample through AGC
+@@ -69,12 +72,11 @@
+         // Smoothly decreases gain when output > 1, increases when < 1.
+         if self.signal_level > 1e-6 {
+             self.gain *= (-0.5 * alpha * self.signal_level.ln()).exp();
+-            self.gain = self.gain.clamp(1e-6, 1e6);
++            self.gain = self.gain.clamp(MIN_GAIN, MAX_GAIN);
+         }
+
+         // Squelch state machine
+-        let rssi = self.rssi_db();
+-        let above_threshold = rssi > self.squelch_threshold;
++        let above_threshold = self.gain < self.squelch_gain_cutoff;
+
+         let prev_state = self.state;
+         self.state = match prev_state {
+@@ -121,8 +123,28 @@
+
+     /// Set squelch threshold
+     pub fn set_squelch_threshold(&mut self, threshold_db: f32) {
+-        self.squelch_threshold = threshold_db;
+-    }
++        self.squelch_gain_cutoff = gain_cutoff(threshold_db);
++    }
++}
++
++fn rssi_db_for_gain(gain: f32) -> f32 {
++    -20.0 * gain.log10()
++}
++
++fn gain_cutoff(threshold_db: f32) -> f32 {
++    // Positive f32 bit patterns sort by gain. Find the first gain that fails
++    // the rounded RSSI comparison, using the value past MAX_GAIN if all pass.
++    let mut lower = MIN_GAIN.to_bits();
++    let mut upper = MAX_GAIN.to_bits() + 1;
++    while lower < upper {
++        let middle = lower + (upper - lower) / 2;
++        if rssi_db_for_gain(f32::from_bits(middle)) > threshold_db {
++            lower = middle + 1;
++        } else {
++            upper = middle;
++        }
++    }
++    f32::from_bits(lower)
+ }
+
+ #[cfg(test)]
+@@ -189,4 +211,53 @@
+             );
+         }
+     }
+-}
++
++    #[test]
++    fn gain_cutoff_preserves_rounded_rssi_comparisons() {
++        let gain_bits = [MIN_GAIN.to_bits(), 1.0f32.to_bits(), MAX_GAIN.to_bits()];
++        let gain_range = MAX_GAIN.to_bits() - MIN_GAIN.to_bits();
++        let mut seed = 1u32;
++        for bits in gain_bits.into_iter().chain((0..4096).map(|_| {
++            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
++            MIN_GAIN.to_bits() + seed % gain_range
++        })) {
++            let rssi = rssi_db_for_gain(f32::from_bits(bits));
++            for threshold_db in [rssi.next_down(), rssi, rssi.next_up()] {
++                let cutoff = gain_cutoff(threshold_db);
++                let first = bits.saturating_sub(16).max(MIN_GAIN.to_bits());
++                let last = (bits + 16).min(MAX_GAIN.to_bits());
++                for neighbor in first..=last {
++                    let gain = f32::from_bits(neighbor);
++                    assert_eq!(
++                        gain < cutoff,
++                        rssi_db_for_gain(gain) > threshold_db,
++                        "gain={gain:?}, threshold={threshold_db:?}",
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn updating_squelch_threshold_preserves_rise_and_timeout() {
++        let silence = Complex32::new(0.0, 0.0);
++        let mut agc = Agc::new(0.0, f32::NAN, 1);
++        assert_eq!(agc.execute(silence).1, SquelchState::SignalLo);
++
++        let initial_rssi = agc.rssi_db();
++        agc.set_squelch_threshold(initial_rssi);
++        assert_eq!(agc.execute(silence).1, SquelchState::SignalLo);
++        agc.set_squelch_threshold(initial_rssi.next_down());
++        assert_eq!(agc.execute(silence).1, SquelchState::Rise);
++        assert_eq!(agc.execute(silence).1, SquelchState::SignalHi);
++
++        agc.set_squelch_threshold(f32::INFINITY);
++        assert_eq!(agc.execute(silence).1, SquelchState::Timeout);
++        agc.set_squelch_threshold(f32::NEG_INFINITY);
++        assert_eq!(agc.execute(silence).1, SquelchState::Rise);
++
++        agc.gain = f32::NAN;
++        assert!(agc.rssi_db().is_nan());
++        assert_eq!(agc.execute(silence).1, SquelchState::SignalLo);
++    }
++}

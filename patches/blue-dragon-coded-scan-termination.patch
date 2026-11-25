@@ -1,0 +1,232 @@
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -1284,6 +1284,56 @@
+     connected.or(advertising)
+ }
+ 
++fn dewhiten_coded_bytes(bits: &[u8], channel: u32) -> Vec<u8> {
++    let (whole_bytes, _) = bits.as_chunks::<8>();
++    whole_bytes
++        .iter()
++        .enumerate()
++        .map(|(byte_index, bits)| {
++            let mut value = 0;
++            for (bit_index, &bit) in bits.iter().enumerate() {
++                let position = (byte_index * 8 + bit_index) as u32;
++                value |= (bit ^ whitening_bit(channel, position)) << bit_index;
++            }
++            value
++        })
++        .collect()
++}
++
++fn coded_pdu_crc_matches(bytes: &[u8], crc_init: u32) -> bool {
++    let Some((body, crc)) = bytes.split_last_chunk::<3>() else {
++        return false;
++    };
++    crc24(body, crc_init) == u32::from_le_bytes([crc[0], crc[1], crc[2], 0])
++}
++
++fn retry_terminated_coded_block2(
++    soft_coded: &[f32],
++    channel: u32,
++    payload_length: usize,
++    crc_init: u32,
++) -> Option<Vec<u8>> {
++    if payload_length > CODED_MAX_PDU_BYTES {
++        return None;
++    }
++    let packet_bytes = 2 + payload_length + 3;
++    // The header bounds the trellis to PDU, CRC and three TERM2 bits.
++    let terminated_bits = packet_bytes * 8 + 3;
++    let (decoded, _, termination_metric) =
++        crate::fec::viterbi_decode_terminated(soft_coded.get(..2 * terminated_bits)?);
++    if !termination_metric.is_finite() {
++        return None;
++    }
++    let bytes = dewhiten_coded_bytes(&decoded, channel);
++    if bytes.len() != packet_bytes
++        || usize::from(bytes[1]) != payload_length
++        || !coded_pdu_crc_matches(&bytes, crc_init)
++    {
++        return None;
++    }
++    Some(bytes)
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn decode_coded_block2(
+     demod: &[f32],
+@@ -1337,7 +1387,8 @@
+ 
+     let mut best_result: Option<(Vec<u8>, usize, bool, bool, bool, usize)> = None; // (dewhitened, pdu_len, crc_checked, crc_valid, conn_valid, coding_s)
+ 
+-    for &coding_s in &try_order {
++    let mut retry_candidates = [None, None];
++    for (scheme_index, &coding_s) in try_order.iter().enumerate() {
+         if remaining_symbols < coding_s * 20 {
+             continue;
+         }
+@@ -1369,17 +1420,7 @@
+         }
+ 
+         // Dewhiten all decoded bytes
+-        let dewhitened_bytes: Vec<u8> = (0..max_bytes)
+-            .map(|byte_idx| {
+-                let mut byte_val: u8 = 0;
+-                for bit_idx in 0..8u32 {
+-                    let data_bit = decoded_block2[byte_idx * 8 + bit_idx as usize];
+-                    let wb = whitening_bit(channel, byte_idx as u32 * 8 + bit_idx);
+-                    byte_val |= (data_bit ^ wb) << bit_idx;
+-                }
+-                byte_val
+-            })
+-            .collect();
++        let dewhitened_bytes = dewhiten_coded_bytes(&decoded_block2, channel);
+ 
+         // CRC check
+         let mut pdu_length = dewhitened_bytes[1] as usize;
+@@ -1402,12 +1443,7 @@
+                     if crc_offset + 3 > max_bytes {
+                         continue;
+                     }
+-                    let crc_data = &dewhitened_bytes[..crc_offset];
+-                    let received_crc = dewhitened_bytes[crc_offset] as u32
+-                        | ((dewhitened_bytes[crc_offset + 1] as u32) << 8)
+-                        | ((dewhitened_bytes[crc_offset + 2] as u32) << 16);
+-                    let computed = crc24(crc_data, init);
+-                    if computed == received_crc {
++                    if coded_pdu_crc_matches(&dewhitened_bytes[..crc_offset + 3], init) {
+                         pdu_length = candidate_len;
+                         crc_checked = true;
+                         crc_valid = true;
+@@ -1440,9 +1476,28 @@
+             break;
+         }
+ 
++        if exact_pdu_length && check_crc && crc_init_val.is_some() {
++            retry_candidates[scheme_index] = Some((coding_s, hdr_pdu_length, soft_coded_block2));
++        }
++
+         // Otherwise, save the first (CI-indicated) attempt as fallback
+         if best_result.is_none() {
+             best_result = Some((dewhitened_bytes, pdu_length, crc_checked, crc_valid, conn_valid, coding_s));
++        }
++    }
++
++    // Keep either scheme's original CRC success before retrying a bounded
++    // terminated trellis. Samples after the packet can corrupt the long decode.
++    if let Some((init, confirmed)) = crc_init_val {
++        if best_result.as_ref().is_none_or(|result| !result.3) {
++            for (coding_s, payload_length, soft_coded) in retry_candidates.into_iter().flatten() {
++                if let Some(bytes) =
++                    retry_terminated_coded_block2(&soft_coded, channel, payload_length, init)
++                {
++                    best_result = Some((bytes, payload_length, true, true, confirmed, coding_s));
++                    break;
++                }
++            }
+         }
+     }
+ 
+@@ -1504,6 +1559,99 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    fn coded_packet_metrics(bytes: &[u8], channel: u32) -> Vec<f32> {
++        let mut bits = Vec::new();
++        for (byte_index, &octet) in bytes.iter().enumerate() {
++            for bit_index in 0..8 {
++                let position = (byte_index * 8 + bit_index) as u32;
++                bits.push(((octet >> bit_index) & 1) ^ whitening_bit(channel, position));
++            }
++        }
++        crate::fec::conv_encode(&bits)
++            .into_iter()
++            .map(|bit| if bit == 0 { 1.0 } else { -1.0 })
++            .collect()
++    }
++
++    #[test]
++    fn strict_coded_scan_retries_at_term2_after_following_interference() {
++        let init = 0x555555;
++        let channel = 19;
++        let packet = [0x07, 0x03, 0x61, 0x62, 0x63, 0x46, 0xed, 0x0c];
++        assert!(coded_pdu_crc_matches(&packet, init));
++        let mut soft = coded_packet_metrics(&packet, channel);
++        let extent = soft.len();
++        // Ambiguous metrics near TERM2 plus a competing continuation.
++        soft[extent - 18..].copy_from_slice(&[
++            -1.0, 2.0, -2.0, 1.0, 1.0, 2.0, -1.0, -1.0, -1.0, 2.0, 2.0, -2.0, -2.0,
++            -1.0, 1.0, 0.0, 2.0, 2.0,
++        ]);
++        soft.extend_from_slice(&[0.0, 0.0, 1.0, -1.0, 0.0, 1.0, -2.0, -1.0, -2.0, 2.0]);
++
++        let long_decode = dewhiten_coded_bytes(&crate::fec::viterbi_decode(&soft), channel);
++        assert_eq!(long_decode[1], 3);
++        assert!(!coded_pdu_crc_matches(&long_decode[..packet.len()], init));
++
++        let block1_start = CODED_PREAMBLE_SYMBOLS * BLE_SPS;
++        let block2_start = block1_start + CODED_BLOCK1_SYMBOLS * BLE_SPS;
++        let mut demod = vec![0.0; block2_start];
++        for sample in soft {
++            demod.extend_from_slice(&[-sample; BLE_SPS]);
++        }
++        let block1 = CodedBlock1 {
++            access_address: BLE_ADV_AA,
++            coding_indicator: 1,
++            start_sample: block1_start,
++            inverted: false,
++            terminated: true,
++        };
++        let (recovered, end) = decode_coded_block2(
++            &demod,
++            2444,
++            &Timespec { tv_sec: 0, tv_nsec: 0 },
++            BLE_SPS,
++            true,
++            Some((init, false)),
++            0,
++            true,
++            block1,
++        )
++        .expect("valid CRC after the terminated retry");
++        assert!(recovered.crc_checked && recovered.crc_valid);
++        assert_eq!(&recovered.data[5..], &packet);
++        assert_eq!(end, block2_start + extent * BLE_SPS);
++    }
++
++    #[test]
++    fn terminated_coded_retry_checks_extent_header_and_crc() {
++        let channel = 19;
++        let init = 0x555555;
++        let valid = [0x07, 0x03, 0x61, 0x62, 0x63, 0x46, 0xed, 0x0c];
++        let metrics = coded_packet_metrics(&valid, channel);
++        assert_eq!(
++            retry_terminated_coded_block2(&metrics, channel, 3, init).as_deref(),
++            Some(valid.as_slice())
++        );
++        assert!(
++            retry_terminated_coded_block2(&metrics[..metrics.len() - 1], channel, 3, init)
++                .is_none()
++        );
++        assert!(
++            retry_terminated_coded_block2(&metrics, channel, CODED_MAX_PDU_BYTES + 1, init)
++                .is_none()
++        );
++        assert!(retry_terminated_coded_block2(&metrics, channel, 3, init ^ 1).is_none());
++
++        // Its CRC validates over three body bytes, while the header declares two.
++        let mut inconsistent = valid;
++        inconsistent[1] = 2;
++        let crc = crc24(&inconsistent[..5], init).to_le_bytes();
++        inconsistent[5..].copy_from_slice(&crc[..3]);
++        let metrics = coded_packet_metrics(&inconsistent, channel);
++        assert!(coded_pdu_crc_matches(&inconsistent, init));
++        assert!(retry_terminated_coded_block2(&metrics, channel, 3, init).is_none());
++    }
+ 
+     #[test]
+     fn test_crc24_known_value() {

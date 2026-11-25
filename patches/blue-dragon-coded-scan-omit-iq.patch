@@ -1,0 +1,316 @@
+diff --git a/crates/app/src/main.rs b/crates/app/src/main.rs
+--- a/crates/app/src/main.rs
++++ b/crates/app/src/main.rs
+@@ -167,6 +167,10 @@
+                               "extcap_interfaces", "extcap_dlts", "extcap_config"]
+     )]
+     coded_scan_frequency_mhz: Option<u32>,
++
++    /// Keep selected scan coverage and omit its IQ from the burst archive.
++    #[arg(long, requires_all = ["file", "coded_scan_frequency_mhz", "write_bursts"])]
++    omit_scan_iq: bool,
+ 
+     /// Disable GPU acceleration (use CPU-only PFB+FFT)
+     #[arg(long)]
+@@ -588,6 +592,10 @@
+                 eprintln!("--sample-rate too low: {} (minimum 1 MHz)", sr);
+                 std::process::exit(1);
+             }
++            if cli.omit_scan_iq && (ch as u64).checked_mul(1_000_000) != Some(rate_hz) {
++                eprintln!("--omit-scan-iq requires an exact 1 MHz of input rate per channel");
++                std::process::exit(1);
++            }
+             if rate_hz % 1_000_000 != 0 {
+                 eprintln!("WARNING: sample rate {} Hz is not an exact multiple of 1 MHz; using {} channels ({}M of {:.3}M)",
+                     rate_hz, ch, ch, rate_hz as f64 / 1_000_000.0);
+@@ -613,6 +621,7 @@
+             cli.burst_limit_mb.saturating_mul(1024 * 1024),
+             cli.check_crc,
+             coded_scan,
++            cli.omit_scan_iq,
+             cli.squelch,
+             cli.stats,
+             &classic_uaps,
+@@ -739,4 +748,25 @@
+             assert!(Cli::try_parse_from([&file_args, conflicts].concat()).is_err());
+         }
+     }
++
++    #[test]
++    fn omit_scan_iq_requires_selected_file_scan_and_burst_archive() {
++        let args = [
++            "--file", "capture.sc16q11",
++            "--coded-scan-frequency-mhz", "2444",
++            "--write-bursts", "capture.bdb",
++        ];
++        let base = ["blue-dragon", "--omit-scan-iq"];
++        let complete = [&base[..], &args].concat();
++        assert!(Cli::try_parse_from(complete).unwrap().omit_scan_iq);
++        for missing in 0..3 {
++            let remaining: Vec<_> = args
++                .chunks_exact(2)
++                .enumerate()
++                .filter(|(index, _)| *index != missing)
++                .flat_map(|(_, pair)| pair.iter().copied())
++                .collect();
++            assert!(Cli::try_parse_from([&base[..], &remaining].concat()).is_err());
++        }
++    }
+ }
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -12,7 +12,7 @@
+ use crossbeam::channel;
+ use num_complex::Complex32;
+ 
+-use bd_dsp::burst::BurstCatcher;
++use bd_dsp::burst::{BurstCatcher, CHANNEL_SAMPLE_PERIOD_NS, SCAN_STEP, SCAN_WINDOW};
+ use bd_dsp::fft::BatchFft;
+ use bd_dsp::fsk::{self, FskDemod, FskResult};
+ use bd_dsp::pfb::PfbChannelizer;
+@@ -124,6 +124,72 @@
+     }
+ }
+ 
++#[derive(Default)]
++struct CodedScanCoverage {
++    selected_frequency_mhz: u32,
++    windows: u64,
++    first_samples: usize,
++    last_start: u64,
++    last_samples: usize,
++}
++
++impl CodedScanCoverage {
++    fn observe(
++        &mut self,
++        frequency_mhz: u32,
++        timestamp: &Timespec,
++        samples: usize,
++    ) -> Result<(), String> {
++        let start = timestamp.tv_sec
++            .checked_mul(1_000_000_000 / CHANNEL_SAMPLE_PERIOD_NS)
++            .and_then(|seconds| seconds.checked_add(timestamp.tv_nsec / CHANNEL_SAMPLE_PERIOD_NS))
++            .ok_or("coded scan timestamp exceeds channel sample range")?;
++        let (expected_start, expected_samples) = if self.windows == 0 {
++            (0, SCAN_STEP)
++        } else {
++            let offset = self.windows
++                .checked_mul(SCAN_STEP as u64)
++                .ok_or("coded scan window count exceeds channel sample range")?;
++            (offset - (SCAN_WINDOW - SCAN_STEP) as u64, SCAN_WINDOW)
++        };
++        if frequency_mhz != self.selected_frequency_mhz
++            || timestamp.tv_nsec >= 1_000_000_000
++            || timestamp.tv_nsec % CHANNEL_SAMPLE_PERIOD_NS != 0
++            || start != expected_start
++            || samples != expected_samples
++        {
++            return Err(format!(
++                "unexpected coded scan window {}: {} MHz at sample {} with {} samples",
++                self.windows, frequency_mhz, start, samples,
++            ));
++        }
++        if self.windows == 0 {
++            self.first_samples = samples;
++        }
++        self.windows += 1;
++        self.last_start = start;
++        self.last_samples = samples;
++        Ok(())
++    }
++
++    fn finish(self, channel_samples: u64) -> Result<(), String> {
++        let expected_windows = channel_samples / SCAN_STEP as u64;
++        if self.windows != expected_windows {
++            return Err(format!(
++                "completed {} coded scan windows, expected {}",
++                self.windows, expected_windows,
++            ));
++        }
++        // The first complete window starts at zero on the file's time origin.
++        eprintln!(
++            "coded scan coverage v1: {} {} 0 {} {} {}",
++            self.selected_frequency_mhz, self.windows, self.first_samples,
++            self.last_start, self.last_samples,
++        );
++        Ok(())
++    }
++}
++
+ /// Run the full pipeline from IQ file to PCAP output.
+ pub fn run_file(
+     file_path: &Path,
+@@ -135,16 +201,28 @@
+     burst_limit_bytes: u64,
+     check_crc: bool,
+     coded_scan: FileCodedScan,
++    omit_scan_iq: bool,
+     squelch_db: f32,
+     print_stats: bool,
+     classic_uaps: &[(u32, u8)],
+ ) -> Result<(), String> {
+-    let sample_rate = num_channels as u32 * 1_000_000; // 1 MHz per channel
++    // An even channel count at 1 MHz per channel yields a 2 Msps bin stream.
++    let sample_rate = u32::try_from(num_channels)
++        .ok()
++        .and_then(|channels| channels.checked_mul(1_000_000))
++        .ok_or("file input channel count exceeds the sample rate range")?;
+     let center_freq_hz = center_freq_mhz as u64 * 1_000_000;
+ 
+     let (channel_freqs, live_ch, first_live, last_live) =
+         build_channel_map(center_freq_mhz, num_channels)?;
+     coded_scan.validate(center_freq_mhz, &channel_freqs)?;
++    let mut coverage = match (omit_scan_iq, coded_scan, burst_path) {
++        (true, FileCodedScan::Secondary(selected_frequency_mhz), Some(_)) => Some(
++            CodedScanCoverage { selected_frequency_mhz, ..CodedScanCoverage::default() }
++        ),
++        (true, _, _) => return Err("--omit-scan-iq requires a selected file scan and burst archive".to_string()),
++        (false, _, _) => None,
++    };
+ 
+     let active_channels = (first_live..=last_live)
+         .filter(|&ch| live_ch[ch] >= 0)
+@@ -236,9 +314,11 @@
+     let (tx, rx) = channel::bounded(64);
+ 
+     let reader_thread = std::thread::spawn(move || {
+-        if let Err(e) = source.start(tx) {
++        let result = source.start(tx);
++        if let Err(e) = &result {
+             log::error!("file reader error: {}", e);
+         }
++        result
+     });
+ 
+     // Timestamp counter
+@@ -269,7 +349,8 @@
+     let mut raw_ring_start: u64 = 0; // raw complex index of raw_ring[0]
+ 
+     // Main processing loop
+-    for buf in rx.iter() {
++    let mut coverage_error = None;
++    'buffers: for buf in rx.iter() {
+         // Type 2 PFB: each call takes M int16 values (M/2 complex samples)
+         let step = num_channels; // M int16 values per PFB call
+         let num_blocks = buf.data.len() / step;
+@@ -311,7 +392,9 @@
+                 let sample = fft_buf[fft_bin];
+                 let ordinary_burst = catcher.execute(sample, &ts);
+                 if let Some(scan_burst) = catcher.take_scan_burst() {
+-                    record_burst(&mut burst_writer, &scan_burst);
++                    if coverage.is_none() {
++                        record_burst(&mut burst_writer, &scan_burst);
++                    }
+                     for result in decode_coded_scan_burst(
+                         &scan_burst,
+                         &mut fsk,
+@@ -331,6 +414,16 @@
+                                 }
+                                 pcap_errors += 1;
+                             }
++                        }
++                    }
++                    if let Some(coverage) = &mut coverage {
++                        if let Err(error) = coverage.observe(
++                            scan_burst.freq,
++                            &scan_burst.timestamp,
++                            scan_burst.samples.len(),
++                        ) {
++                            coverage_error = Some(error);
++                            break 'buffers;
+                         }
+                     }
+                 }
+@@ -634,6 +727,13 @@
+         }
+     }
+ 
++    // Disconnect first so an early coverage failure unblocks a pending send.
++    drop(rx);
++    let reader_result = reader_thread.join();
++    if let Some(error) = coverage_error {
++        return Err(error);
++    }
++
+     // Final stats
+     if print_stats {
+         let elapsed = stats_start.elapsed().as_secs_f64();
+@@ -648,7 +748,10 @@
+         );
+     }
+ 
+-    let _ = reader_thread.join();
++    if let Some(coverage) = coverage {
++        reader_result.map_err(|_| "coded scan file reader panicked".to_string())??;
++        coverage.finish(sample_count / (num_channels / 2) as u64)?;
++    }
+ 
+     Ok(())
+ }
+@@ -656,7 +759,7 @@
+ #[cfg(test)]
+ mod file_mode_tests {
+     use super::{
+-        CodedScanResult, FileCodedScan, aligned_file_block_size, build_channel_map,
++        CodedScanCoverage, CodedScanResult, FileCodedScan, aligned_file_block_size, build_channel_map,
+         classify_coded_scan_packet,
+     };
+     use bd_protocol::Timespec;
+@@ -696,6 +799,26 @@
+         assert_eq!(processed, total_samples);
+         assert!(aligned_file_block_size(1).is_err());
+         assert!(aligned_file_block_size(21).is_err());
++    }
++
++    #[test]
++    fn file_scan_coverage_checks_every_completed_window() {
++        let mut coverage = CodedScanCoverage {
++            selected_frequency_mhz: 2444,
++            ..CodedScanCoverage::default()
++        };
++        let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
++        let overlap = Timespec { tv_sec: 0, tv_nsec: 8_192_000 };
++        assert!(coverage.observe(2446, &zero, 32768).is_err());
++        coverage.observe(2444, &zero, 32768).unwrap();
++        assert!(coverage.observe(2444, &zero, 49152).is_err());
++        assert!(coverage.observe(2444, &overlap, 32768).is_err());
++        coverage.observe(2444, &overlap, 49152).unwrap();
++        assert_eq!(coverage.windows, 2);
++        assert_eq!(coverage.first_samples, 32768);
++        assert_eq!(coverage.last_start, 16384);
++        assert_eq!(coverage.last_samples, 49152);
++        assert!(coverage.finish(98304).is_err());
+     }
+ 
+     #[test]
+diff --git a/crates/dsp/src/burst.rs b/crates/dsp/src/burst.rs
+--- a/crates/dsp/src/burst.rs
++++ b/crates/dsp/src/burst.rs
+@@ -27,7 +27,8 @@
+ const EDR_TRUNC_MAX: usize = 1500;
+ const EDR_SYNC_MAX_SCORE: f32 = 0.15;     // strict; downstream CRC is authority
+ const EDR_PRE_ROLL: usize = 512;          // 256 us at 2 Msps
+-const CHANNEL_SAMPLE_PERIOD_NS: u64 = 500; // 2 Msps channelizer output
++/// Sample period of the 2 Msps channelizer output.
++pub const CHANNEL_SAMPLE_PERIOD_NS: u64 = 500;
+ 
+ fn timestamp_with_sample_offset(start: &Timespec, sample_offset: usize) -> Timespec {
+     let offset_ns = sample_offset as u64 * CHANNEL_SAMPLE_PERIOD_NS;
+@@ -51,13 +52,13 @@
+ /// Scan window size for advertising channel continuous capture.
+ /// Must fit at least one coded S=8 burst (~6560 samples for DRI-sized PDU)
+ /// plus the step size overlap.  At SPS=2, 49152 samples = 24.6 ms.
+-const SCAN_WINDOW: usize = 49152;
++pub const SCAN_WINDOW: usize = 49152;
+ /// New samples between scan burst emissions.  32768 samples = 16.4 ms at
+ /// 2 Msps.  With 3 advertising channels, this produces ~183 scan bursts/s
+ /// (vs 732/s at 8192), keeping decode thread load under 10%.
+ /// Overlap = SCAN_WINDOW - SCAN_STEP = 16384 samples (8 ms), enough for
+ /// any coded packet to fit entirely within at least one window.
+-const SCAN_STEP: usize = 32768;
++pub const SCAN_STEP: usize = 32768;
+ 
+ /// A detected burst of IQ samples
+ #[derive(Debug)]

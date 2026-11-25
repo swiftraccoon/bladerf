@@ -1,0 +1,449 @@
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -310,9 +310,10 @@
+                 let ordinary_burst = catcher.execute(sample, &ts);
+                 if let Some(scan_burst) = catcher.take_scan_burst() {
+                     record_burst(&mut burst_writer, &scan_burst);
+-                    if let CodedScanResult::Packet(p) =
+-                        decode_coded_scan_burst(&scan_burst, &mut fsk, &mut conn_table)
+-                    {
++                    for result in decode_coded_scan_burst(&scan_burst, &mut fsk, &mut conn_table) {
++                        let CodedScanResult::Packet(p) = result else {
++                            continue;
++                        };
+                         total_ble += 1;
+                         total_crc += 1;
+                         valid_crc += 1;
+@@ -1445,7 +1446,6 @@
+ }
+ 
+ enum CodedScanResult {
+-    NoPacket,
+     Rejected,
+     Duplicate,
+     Packet(ble::BlePacket),
+@@ -1470,30 +1470,22 @@
+ 
+ /// Decode a continuous scan window as coded PHY only. Scan output is stricter
+ /// than ordinary burst decoding: only CRC-checked, CRC-valid packets survive.
+-fn decode_coded_scan_burst(
++fn decode_coded_scan_burst<'a>(
+     burst: &bd_dsp::burst::Burst,
+     fsk: &mut FskDemod,
+-    conn_table: &mut ConnectionTable,
+-) -> CodedScanResult {
++    conn_table: &'a mut ConnectionTable,
++) -> impl Iterator<Item = CodedScanResult> + 'a {
+     let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+-    let packet = ble::ble_coded_burst_search(
++    let packets = ble::ble_coded_scan_packets(
+         &raw_demod,
+         burst.freq,
+         burst.timestamp.clone(),
+-        2,
+-        true,
+         &mut |aa| conn_table.crc_init_for_aa(aa, burst.timestamp.tv_sec),
+-        raw_demod.len(),
+     );
+-    match packet {
+-        Some(packet) => classify_coded_scan_packet(
+-            packet,
+-            burst.rssi_db as i32,
+-            burst.noise_db as i32,
+-            conn_table,
+-        ),
+-        None => CodedScanResult::NoPacket,
+-    }
++    let (rssi_db, noise_db) = (burst.rssi_db as i32, burst.noise_db as i32);
++    packets
++        .into_iter()
++        .map(move |packet| classify_coded_scan_packet(packet, rssi_db, noise_db, conn_table))
+ }
+ 
+ /// Process a burst: FSK demod -> BLE/BT detect -> PCAP write + ZMQ publish.
+@@ -1520,17 +1512,19 @@
+     // Scan bursts: coded PHY search only (no BT/BLE 1M/2M)
+     if burst.scan {
+         stats.coded_attempts += 1;
+-        match decode_coded_scan_burst(burst, fsk, conn_table) {
+-            CodedScanResult::Packet(packet) => emit_ble(
+-                &packet,
+-                pcap_writer,
+-                #[cfg(feature = "zmq")]
+-                zmq_pub,
+-                gps_fix,
+-                stats,
+-            ),
+-            CodedScanResult::Duplicate => stats.coded_copies += 1,
+-            CodedScanResult::NoPacket | CodedScanResult::Rejected => {}
++        for result in decode_coded_scan_burst(burst, fsk, conn_table) {
++            match result {
++                CodedScanResult::Packet(packet) => emit_ble(
++                    &packet,
++                    pcap_writer,
++                    #[cfg(feature = "zmq")]
++                    zmq_pub,
++                    gps_fix,
++                    stats,
++                ),
++                CodedScanResult::Duplicate => stats.coded_copies += 1,
++                CodedScanResult::Rejected => {}
++            }
+         }
+         return;
+     }
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -804,14 +804,7 @@
+     };
+     let search_end = max_search.min(demod.len());
+ 
+-    // Compute local DC offset (median-based CFO correction)
+-    // Take median of first 200 samples to estimate DC offset from carrier offset
+-    let dc_offset = {
+-        let n = 200.min(demod.len());
+-        let mut sorted: Vec<f32> = demod[..n].to_vec();
+-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+-        sorted[n / 2]
+-    };
++    let dc_offset = coded_preamble_dc_offset(demod);
+ 
+     // Pattern: 00111100 at SPS=2 -> --++++-- (each symbol = 2 samples)
+     // We check symbols by averaging SPS samples centered on each symbol position.
+@@ -890,6 +883,138 @@
+     }
+ 
+     best_pos
++}
++
++fn coded_preamble_dc_offset(demod: &[f32]) -> f32 {
++    let n = 200.min(demod.len());
++    let mut sorted = demod[..n].to_vec();
++    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
++    sorted[n / 2]
++}
++
++const CODED_SCAN_LOCAL_ATTEMPTS: usize = 8;
++const CODED_SCAN_WINDOW_ATTEMPTS: usize = 128;
++const CODED_MAX_PDU_BYTES: usize = 251;
++
++fn coded_scan_preamble_scores(demod: &[f32]) -> Vec<u8> {
++    let dc = coded_preamble_dc_offset(demod);
++    let pattern = CODED_PREAMBLE_PATTERN
++        .into_iter()
++        .fold(0u8, |word, bit| (word << 1) | bit);
++    let mut scores = vec![0; demod.len()];
++    let pattern_samples = CODED_PREAMBLE_PATTERN.len() * BLE_SPS;
++    for phase in 0..BLE_SPS {
++        let mut word = 0u8;
++        for (symbol, samples) in demod[phase..].chunks_exact(BLE_SPS).enumerate() {
++            let bit = samples.iter().sum::<f32>() / BLE_SPS as f32 - dc > 0.0;
++            word = (word << 1) | u8::from(bit);
++            if symbol + 1 >= CODED_PREAMBLE_PATTERN.len() {
++                let errors = (word ^ pattern).count_ones();
++                let start = phase + (symbol + 1) * BLE_SPS - pattern_samples;
++                scores[start] = u8::from(errors <= 1 || errors >= 7);
++            }
++        }
++    }
++    // Count consecutive matches one pattern apart, as in the burst finder.
++    for start in (0..scores.len().saturating_sub(pattern_samples)).rev() {
++        if scores[start] != 0 {
++            scores[start] = (1 + scores[start + pattern_samples]).min(CODED_PREAMBLE_REPS as u8);
++        }
++    }
++    scores
++}
++
++/// Decode CRC-valid LE Coded packets in a 2 MSps scan window.
++/// Try both sample phases, with up to eight alignments per preamble-sized
++/// region and 128 per window. Timestamps use the original window time base.
++pub fn ble_coded_scan_packets(
++    demod: &[f32],
++    freq: u32,
++    timestamp: Timespec,
++    crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
++) -> Vec<BlePacket> {
++    let minimum = (CODED_PREAMBLE_SYMBOLS + CODED_BLOCK1_SYMBOLS) * BLE_SPS;
++    if demod.len() < minimum {
++        return Vec::new();
++    }
++
++    let scores = coded_scan_preamble_scores(demod);
++    let limit = demod.len() - minimum + 1;
++    let strongest = (0..limit)
++        .filter(|&position| scores[position] >= 5)
++        .max_by_key(|&position| {
++            use std::cmp::Reverse;
++
++            (scores[position], Reverse(position % BLE_SPS), Reverse(position))
++        });
++    let Some(strongest) = strongest else {
++        return Vec::new();
++    };
++    // Reserve one attempt at the single-burst finder's strongest position
++    // if earlier preamble-like interference consumes the chronological budget.
++    let chronological_limit = CODED_SCAN_WINDOW_ATTEMPTS - 1;
++    let mut strongest_accounted = false;
++    let mut positions = Vec::with_capacity(CODED_PREAMBLE_SYMBOLS * BLE_SPS);
++    let mut packets = Vec::new();
++    let mut cursor = 0;
++    let mut attempts = 0;
++    while cursor < limit && attempts < chronological_limit {
++        let Some(distance) = scores[cursor..limit].iter().position(|&score| score >= 5) else {
++            break;
++        };
++        let start = cursor + distance;
++        let region_end = (start + CODED_PREAMBLE_SYMBOLS * BLE_SPS).min(limit);
++        positions.clear();
++        positions.extend((start..region_end).filter(|&i| scores[i] >= 5));
++        positions.sort_unstable_by_key(|&i| (std::cmp::Reverse(scores[i]), i));
++
++        cursor = region_end;
++        for &position in positions.iter().take(CODED_SCAN_LOCAL_ATTEMPTS) {
++            if attempts == chronological_limit {
++                break;
++            }
++            attempts += 1;
++            strongest_accounted |= position == strongest;
++            let Some((packet, end)) =
++                decode_coded_scan_at(demod, freq, &timestamp, crc_init_fn, position)
++            else {
++                continue;
++            };
++            packets.push(packet);
++            strongest_accounted |= (start..end).contains(&strongest);
++            cursor = cursor.max(end);
++            break;
++        }
++    }
++    if attempts == chronological_limit && !strongest_accounted {
++        if let Some((packet, _)) =
++            decode_coded_scan_at(demod, freq, &timestamp, crc_init_fn, strongest)
++        {
++            packets.push(packet);
++            packets.sort_by_key(|packet| (packet.timestamp.tv_sec, packet.timestamp.tv_nsec));
++        }
++    }
++    packets
++}
++
++fn decode_coded_scan_at(
++    demod: &[f32],
++    frequency: u32,
++    timestamp: &Timespec,
++    crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
++    preamble_start: usize,
++) -> Option<(BlePacket, usize)> {
++    decode_coded_at(
++        demod,
++        frequency,
++        timestamp.clone(),
++        BLE_SPS,
++        true,
++        crc_init_fn,
++        preamble_start,
++        true,
++    )
++    .filter(|(packet, _)| packet.crc_checked && packet.crc_valid)
+ }
+ 
+ /// LE Coded PHY burst decoder.
+@@ -943,17 +1068,26 @@
+     crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
+     max_search: usize,
+ ) -> Option<BlePacket> {
++    let preamble_start = find_coded_preamble_freq(demod, sps, max_search, freq)?;
++    decode_coded_at(
++        demod, freq, timestamp, sps, check_crc, crc_init_fn, preamble_start, false,
++    )
++    .map(|(packet, _)| packet)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn decode_coded_at(
++    demod: &[f32],
++    freq: u32,
++    timestamp: Timespec,
++    sps: usize,
++    check_crc: bool,
++    crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
++    preamble_start: usize,
++    exact_pdu_length: bool,
++) -> Option<(BlePacket, usize)> {
+     use crate::fec;
+ 
+-    if sps == 0 {
+-        return None;
+-    }
+-
+-    // Find coded preamble (80 symbols of 00111100 pattern)
+-    let preamble_start = match find_coded_preamble_freq(demod, sps, max_search, freq) {
+-        Some(idx) => idx,
+-        None => return None,
+-    };
+     let preamble_samples = CODED_PREAMBLE_SYMBOLS * sps;
+ 
+     // FEC Block 1: 37 data bits -> 74 coded bits -> 296 symbols at S=8.
+@@ -1048,7 +1182,11 @@
+     };
+ 
+     // Extract soft symbols for Block 2 using the same sample rate and polarity.
+-    let remaining_symbols = remaining_samples / sps;
++    let max_block2_bits = (2 + CODED_MAX_PDU_BYTES + 3) * 8 + 3;
++    let mut remaining_symbols = remaining_samples / sps;
++    if exact_pdu_length {
++        remaining_symbols = remaining_symbols.min(max_block2_bits * 8);
++    }
+     let mut block2_soft = coded_soft_symbols(demod, block2_start, remaining_symbols, sps)?;
+     if best_invert {
+         for value in &mut block2_soft {
+@@ -1077,10 +1215,15 @@
+             continue;
+         }
+ 
++        let symbols = if exact_pdu_length {
++            &block2_soft[..remaining_symbols.min(max_block2_bits * coding_s)]
++        } else {
++            &block2_soft
++        };
+         let soft_coded_block2 = if coding_s == 8 {
+-            fec::pattern_demap_s8(&block2_soft)
++            fec::pattern_demap_s8(symbols)
+         } else {
+-            fec::pattern_demap_s2(&block2_soft)
++            fec::pattern_demap_s2(symbols)
+         };
+ 
+         if soft_coded_block2.is_empty() {
+@@ -1120,9 +1263,13 @@
+ 
+         if check_crc {
+             if let Some((init, conn_v)) = crc_init_val {
+-                let max_pdu_len = (max_bytes.saturating_sub(5)).min(251);
+-                let candidates = std::iter::once(hdr_pdu_length.min(max_pdu_len))
+-                    .chain((0..=max_pdu_len).filter(|&l| l != hdr_pdu_length.min(max_pdu_len)));
++                let max_pdu_len = (max_bytes.saturating_sub(5)).min(CODED_MAX_PDU_BYTES);
++                if exact_pdu_length && hdr_pdu_length > max_pdu_len {
++                    continue;
++                }
++                let first_length = hdr_pdu_length.min(max_pdu_len);
++                let candidates = std::iter::once(first_length)
++                    .chain((0..=max_pdu_len).filter(|&l| !exact_pdu_length && l != first_length));
+                 for candidate_len in candidates {
+                     let crc_offset = 2 + candidate_len;
+                     if crc_offset + 3 > max_bytes {
+@@ -1207,7 +1354,7 @@
+         None
+     };
+ 
+-    Some(BlePacket {
++    let packet = BlePacket {
+         aa,
+         freq,
+         len: pkt_len,
+@@ -1221,7 +1368,10 @@
+         conn_valid,
+         phy: BlePhy::PhyCoded,
+         ext_header,
+-    })
++    };
++    // Count accepted on-air coding and TERM2 from the refined Block 2 start.
++    let end = block2_start + ((2 + pdu_length + 3) * 8 + 3) * coding_s * sps;
++    Some((packet, end))
+ }
+ 
+ #[cfg(test)]
+@@ -1648,6 +1798,90 @@
+             find_coded_preamble(&demod[..truncated_len], 1, 0),
+             None
+         );
++    }
++
++    fn coded_scan_fixture(pdu: &[u8], ci: u8, valid_crc: bool) -> Vec<f32> {
++        use crate::fec;
++
++        let bits = |byte: u8| (0..8).map(move |bit| (byte >> bit) & 1);
++        let mut block1: Vec<_> = BLE_ADV_AA.to_le_bytes().into_iter().flat_map(bits).collect();
++        block1.extend_from_slice(&[ci, 0]);
++        let crc = crc24(pdu, 0x555555) ^ u32::from(!valid_crc);
++        let pdu_crc = pdu.iter().copied().chain(crc.to_le_bytes().into_iter().take(3));
++        let block2: Vec<_> = pdu_crc
++            .flat_map(bits)
++            .enumerate()
++            .map(|(index, bit)| bit ^ whitening_bit(37, index as u32))
++            .collect();
++        let encoded = fec::conv_encode(&block2);
++        let block2 = if ci == 0 {
++            fec::pattern_map_s8(&encoded)
++        } else {
++            fec::pattern_map_s2(&encoded)
++        };
++        CODED_PREAMBLE_PATTERN
++            .into_iter()
++            .cycle()
++            .take(CODED_PREAMBLE_SYMBOLS)
++            .chain(fec::pattern_map_s8(&fec::conv_encode(&block1)))
++            .chain(block2)
++            .flat_map(|bit| std::iter::repeat_n(if bit == 1 { 1.0 } else { -1.0 }, BLE_SPS))
++            .collect()
++    }
++
++    #[test]
++    fn continuous_coded_scan_recovers_both_phases_after_a_bad_crc() {
++        let pdu = [0x02, 0x06, 1, 2, 3, 4, 5, 6];
++        for indicators in [[0, 1], [1, 0]] {
++            let mut demod = vec![0.0; 512];
++            demod.extend(coded_scan_fixture(&pdu, 0, false));
++            let mut starts = Vec::new();
++            for (index, ci) in indicators.into_iter().enumerate() {
++                demod.extend(std::iter::repeat_n(0.0, 513));
++                assert_eq!(demod.len() % 2, 1 - index);
++                starts.push(demod.len());
++                demod.extend(coded_scan_fixture(&pdu, ci, true));
++            }
++            let timestamp = Timespec {
++                tv_sec: 10,
++                tv_nsec: 999_900_000,
++            };
++            let packets = ble_coded_scan_packets(&demod, 2402, timestamp.clone(), &mut |_| None);
++            assert_eq!(packets.len(), 2);
++            for ((packet, start), ci) in packets.iter().zip(starts).zip(indicators) {
++                assert!(packet.crc_checked && packet.crc_valid);
++                assert_eq!(packet.data[4], ci);
++                assert_eq!(&packet.data[5..13], &pdu);
++                let expected = timestamp_with_sample_offset(&timestamp, start, BLE_SPS);
++                assert_eq!(packet.timestamp.tv_sec, expected.tv_sec);
++                assert!(packet.timestamp.tv_nsec.abs_diff(expected.tv_nsec) <= 500);
++            }
++        }
++    }
++
++    #[test]
++    fn continuous_coded_scan_reserves_the_strongest_after_interference() {
++        let pdu = [0x02, 0x06, 1, 2, 3, 4, 5, 6];
++        let mut demod = vec![0.0; 512];
++        for _ in 0..96 {
++            demod.extend(
++                CODED_PREAMBLE_PATTERN
++                    .into_iter()
++                    .cycle()
++                    .take(8 * CODED_PREAMBLE_PATTERN.len())
++                    .flat_map(|bit| {
++                        std::iter::repeat_n(if bit == 1 { 1.0 } else { -1.0 }, BLE_SPS)
++                    }),
++            );
++            demod.extend(std::iter::repeat_n(0.0, 192));
++        }
++        let expected = demod.len();
++        demod.extend(coded_scan_fixture(&pdu, 1, true));
++        let timestamp = Timespec { tv_sec: 0, tv_nsec: 0 };
++        let packets = ble_coded_scan_packets(&demod, 2402, timestamp, &mut |_| None);
++        assert_eq!(packets.len(), 1);
++        assert_eq!(packets[0].timestamp.tv_nsec, expected as u64 * 500);
++        assert_eq!(&packets[0].data[5..13], &pdu);
+     }
+ 
+     /// Test both LE Coded schemes end-to-end at both supported sample rates.

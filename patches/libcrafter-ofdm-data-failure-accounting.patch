@@ -1,0 +1,1211 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c5bc38bd..78de884d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,8 @@
+ - Subpartition that strong-path timeout by the furthest eligible acquisition
+   gate reached: no long-training evaluation, repeat, known-reference, or source
+   coordinates.
++- Subpartition terminal OFDM DATA recovery failures by the selected legacy,
++  HT-BCC, or HT-LDPC decoder path.
+ - Probe repeated OFDM long-training windows whose reference score falls just
+   below the unchanged strong acceptance gate as bounded, lower-priority
+   hypotheses while retaining the original strong search and all SIGNAL, DATA,
+diff --git a/crafter/src/radio/mod.rs b/crafter/src/radio/mod.rs
+index 6178afa4..c8021faf 100644
+--- a/crafter/src/radio/mod.rs
++++ b/crafter/src/radio/mod.rs
+@@ -34,9 +34,9 @@ pub use wifi::{
+     HtTxConfig, LegacyDsssCckRate, LegacyDsssCckTransmission, LegacyDsssCckTxConfig,
+     LegacyOfdmDecoder, LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig,
+     LegacyWifiDecoder, LegacyWifiPhy, LegacyWifiTransmission, LegacyWifiTxConfig,
+-    OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats, ParallelLegacyWifiDecoder,
+-    ParallelWifiDecoder, SignalInfo, WifiDecoder, WifiFcsPolicy, WifiPacketEncoder, WifiTxEncoder,
+-    WindowedLegacyWifiDecoder, WindowedWifiDecoder,
++    OfdmDataFailureStats, OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats,
++    ParallelLegacyWifiDecoder, ParallelWifiDecoder, SignalInfo, WifiDecoder, WifiFcsPolicy,
++    WifiPacketEncoder, WifiTxEncoder, WindowedLegacyWifiDecoder, WindowedWifiDecoder,
+ };
+ 
+ /// Compatibility facade for the deterministic in-memory sample sink.
+diff --git a/crafter/src/radio/wifi/decoder.rs b/crafter/src/radio/wifi/decoder.rs
+index 8f59948f..138be443 100644
+--- a/crafter/src/radio/wifi/decoder.rs
++++ b/crafter/src/radio/wifi/decoder.rs
+@@ -6,7 +6,8 @@ use super::super::{
+ };
+ use super::dsss::DsssCckDecoder;
+ use super::ofdm::{
+-    DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats,
++    DecoderStats, LegacyOfdmDecoder, OfdmDataFailureStats, OfdmRejectionStats,
++    OfdmStrongLongTrainingStats,
+ };
+ 
+ /// Combined legacy and HT20 one-stream BCC/LDPC receiver.
+@@ -42,6 +43,9 @@ impl WifiDecoder {
+     pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
+         self.inner.ofdm_rejection_stats()
+     }
++    pub fn ofdm_data_failure_stats(&self) -> OfdmDataFailureStats {
++        self.inner.ofdm_data_failure_stats()
++    }
+     pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         self.inner.ofdm_strong_long_training_stats()
+     }
+@@ -88,6 +92,9 @@ impl LegacyWifiDecoder {
+     pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
+         self.ofdm.rejection_stats()
+     }
++    pub fn ofdm_data_failure_stats(&self) -> OfdmDataFailureStats {
++        self.ofdm.data_failure_stats()
++    }
+     pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         self.ofdm.strong_long_training_stats()
+     }
+diff --git a/crafter/src/radio/wifi/ht/rx.rs b/crafter/src/radio/wifi/ht/rx.rs
+index a5f8bcdf..d81ad438 100644
+--- a/crafter/src/radio/wifi/ht/rx.rs
++++ b/crafter/src/radio/wifi/ht/rx.rs
+@@ -283,6 +283,10 @@ impl Candidate {
+         self.fields.aggregation
+     }
+ 
++    pub(in crate::radio) const fn uses_ldpc(&self) -> bool {
++        self.fields.ldpc
++    }
++
+     pub(in crate::radio) fn decode(
+         self,
+         samples: &[ComplexSample],
+diff --git a/crafter/src/radio/wifi/mod.rs b/crafter/src/radio/wifi/mod.rs
+index eb693f44..b9fb52f7 100644
+--- a/crafter/src/radio/wifi/mod.rs
++++ b/crafter/src/radio/wifi/mod.rs
+@@ -21,7 +21,8 @@ pub use ht::{
+ };
+ pub use ofdm::{
+     DecoderStats, LegacyOfdmDecoder, LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig,
+-    OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats, SignalInfo,
++    OfdmDataFailureStats, OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats,
++    SignalInfo,
+ };
+ pub use parallel::{ParallelLegacyWifiDecoder, ParallelWifiDecoder};
+ pub use tx::{
+diff --git a/crafter/src/radio/wifi/ofdm/mod.rs b/crafter/src/radio/wifi/ofdm/mod.rs
+index 7dabbaaa..29a601ad 100644
+--- a/crafter/src/radio/wifi/ofdm/mod.rs
++++ b/crafter/src/radio/wifi/ofdm/mod.rs
+@@ -7,6 +7,9 @@ pub(in crate::radio) mod sync;
+ mod tx;
+ pub(in crate::radio) mod waveform;
+ 
+-pub use rx::{DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats};
++pub use rx::{
++    DecoderStats, LegacyOfdmDecoder, OfdmDataFailureStats, OfdmRejectionStats,
++    OfdmStrongLongTrainingStats,
++};
+ pub use signal::SignalInfo;
+ pub use tx::{LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig, OfdmSignalFields};
+diff --git a/crafter/src/radio/wifi/ofdm/rx.rs b/crafter/src/radio/wifi/ofdm/rx.rs
+index f97e52cb..2fa5c2b5 100644
+--- a/crafter/src/radio/wifi/ofdm/rx.rs
++++ b/crafter/src/radio/wifi/ofdm/rx.rs
+@@ -65,6 +65,74 @@ pub struct OfdmRejectionStats {
+     pub strong_long_training_not_found: u64,
+ }
+ 
++/// Closed subpartition of terminal OFDM DATA recovery failures.
++///
++/// Each event is also counted once by
++/// [`OfdmRejectionStats::data_decode_failed`]. These fields classify the
++/// decoder path selected by a supported header. They do not prove a physical
++/// frame, transmitter, or over-the-air PHY identity.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub struct OfdmDataFailureStats {
++    /// Legacy OFDM with BCC coding.
++    pub legacy: u64,
++    /// HT20 whose integrity-checked HT-SIG selected BCC coding.
++    pub ht_bcc: u64,
++    /// HT20 whose integrity-checked HT-SIG selected LDPC coding.
++    pub ht_ldpc: u64,
++}
++
++impl OfdmDataFailureStats {
++    fn counts(self) -> [u64; 3] {
++        [self.legacy, self.ht_bcc, self.ht_ldpc]
++    }
++
++    fn from_counts(counts: [u64; 3]) -> Self {
++        let [legacy, ht_bcc, ht_ldpc] = counts;
++        Self {
++            legacy,
++            ht_bcc,
++            ht_ldpc,
++        }
++    }
++
++    /// Returns the exact sum when the public counters have not been externally
++    /// constructed with an overflowing total.
++    pub fn checked_total(self) -> Option<u64> {
++        self.counts().into_iter().try_fold(0u64, u64::checked_add)
++    }
++
++    pub(in crate::radio) fn saturating_add_to(self, other: Self, limit: u64) -> Self {
++        let Some(total) = self.checked_total() else {
++            return self;
++        };
++        debug_assert!(total <= limit);
++        let mut result = self.counts();
++        let mut remaining = limit.saturating_sub(total);
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            let increment = value.min(remaining);
++            *count += increment;
++            remaining -= increment;
++        }
++        Self::from_counts(result)
++    }
++
++    pub(in crate::radio) fn saturating_add_each(self, other: Self) -> Self {
++        let mut result = self.counts();
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            *count = count.saturating_add(value);
++        }
++        Self::from_counts(result)
++    }
++
++    pub(in crate::radio) fn saturating_sub(self, other: Self) -> Self {
++        let mut result = self.counts();
++        for (count, value) in result.iter_mut().zip(other.counts()) {
++            *count = count.saturating_sub(value);
++        }
++        Self::from_counts(result)
++    }
++}
++
+ /// Closed subpartition of strong-path long-training timeouts.
+ ///
+ /// Each event is also counted once by
+@@ -217,10 +285,16 @@ enum OfdmRejection {
+     GreenfieldProbeUnrecognized,
+     MixedHeaderUnsupported,
+     LegacyFallbackUnreservable,
+-    DataDecodeFailed,
+     PendingCapacity,
+ }
+ 
++#[derive(Clone, Copy)]
++enum OfdmDataFailure {
++    Legacy,
++    HtBcc,
++    HtLdpc,
++}
++
+ fn record_rejection(
+     stats: &mut DecoderStats,
+     rejections: &mut OfdmRejectionStats,
+@@ -236,13 +310,38 @@ fn record_rejection(
+         OfdmRejection::GreenfieldProbeUnrecognized => &mut rejections.greenfield_probe_unrecognized,
+         OfdmRejection::MixedHeaderUnsupported => &mut rejections.mixed_header_unsupported,
+         OfdmRejection::LegacyFallbackUnreservable => &mut rejections.legacy_fallback_unreservable,
+-        OfdmRejection::DataDecodeFailed => &mut rejections.data_decode_failed,
+         OfdmRejection::PendingCapacity => &mut rejections.pending_capacity_rejected,
+     };
+     debug_assert_ne!(*count, u64::MAX);
+     *count += 1;
+ }
+ 
++fn record_data_failure(
++    stats: &mut DecoderStats,
++    rejections: &mut OfdmRejectionStats,
++    data_failures: &mut OfdmDataFailureStats,
++    path: OfdmDataFailure,
++) {
++    debug_assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++    debug_assert_eq!(
++        data_failures.checked_total(),
++        Some(rejections.data_decode_failed)
++    );
++    if stats.rejected_frames == u64::MAX {
++        return;
++    }
++    debug_assert_ne!(rejections.data_decode_failed, u64::MAX);
++    stats.rejected_frames += 1;
++    rejections.data_decode_failed += 1;
++    let count = match path {
++        OfdmDataFailure::Legacy => &mut data_failures.legacy,
++        OfdmDataFailure::HtBcc => &mut data_failures.ht_bcc,
++        OfdmDataFailure::HtLdpc => &mut data_failures.ht_ldpc,
++    };
++    debug_assert_ne!(*count, u64::MAX);
++    *count += 1;
++}
++
+ fn record_strong_long_training_failure(
+     stats: &mut DecoderStats,
+     rejections: &mut OfdmRejectionStats,
+@@ -297,6 +396,7 @@ pub struct LegacyOfdmDecoder {
+     terminal: bool,
+     stats: DecoderStats,
+     rejections: OfdmRejectionStats,
++    data_failures: OfdmDataFailureStats,
+     strong_long_training: OfdmStrongLongTrainingStats,
+     ht: ht::rx::Receiver,
+     // Dispatcher output budget is not a capture reconfiguration. Changing
+@@ -312,6 +412,10 @@ impl LegacyOfdmDecoder {
+             self.rejections.checked_total(),
+             Some(self.stats.rejected_frames)
+         );
++        debug_assert_eq!(
++            self.data_failures.checked_total(),
++            Some(self.rejections.data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.strong_long_training.checked_total(),
+             Some(self.rejections.strong_long_training_not_found)
+@@ -323,17 +427,40 @@ impl LegacyOfdmDecoder {
+             self.rejections.checked_total(),
+             Some(self.stats.rejected_frames)
+         );
++        debug_assert_eq!(
++            self.data_failures.checked_total(),
++            Some(self.rejections.data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.strong_long_training.checked_total(),
+             Some(self.rejections.strong_long_training_not_found)
+         );
+         self.rejections
+     }
++    pub fn data_failure_stats(&self) -> OfdmDataFailureStats {
++        debug_assert_eq!(
++            self.rejections.checked_total(),
++            Some(self.stats.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.data_failures.checked_total(),
++            Some(self.rejections.data_decode_failed)
++        );
++        debug_assert_eq!(
++            self.strong_long_training.checked_total(),
++            Some(self.rejections.strong_long_training_not_found)
++        );
++        self.data_failures
++    }
+     pub fn strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         debug_assert_eq!(
+             self.rejections.checked_total(),
+             Some(self.stats.rejected_frames)
+         );
++        debug_assert_eq!(
++            self.data_failures.checked_total(),
++            Some(self.rejections.data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.strong_long_training.checked_total(),
+             Some(self.rejections.strong_long_training_not_found)
+@@ -579,6 +706,13 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                 {
+                     let p = self.pending[slot].take().unwrap();
+                     let info = p.info.unwrap();
++                    let failure_path = p.ht.map_or(OfdmDataFailure::Legacy, |candidate| {
++                        if candidate.uses_ldpc() {
++                            OfdmDataFailure::HtLdpc
++                        } else {
++                            OfdmDataFailure::HtBcc
++                        }
++                    });
+                     let (decoded, frame_diagnostics, failure_diagnostics, aggregate, members) =
+                         if let Some(candidate) = p.ht {
+                             let aggregate = candidate.aggregate();
+@@ -632,10 +766,11 @@ impl PhyDecoder for LegacyOfdmDecoder {
+                             }
+                         }
+                         Err(()) => {
+-                            record_rejection(
++                            record_data_failure(
+                                 &mut self.stats,
+                                 &mut self.rejections,
+-                                OfdmRejection::DataDecodeFailed,
++                                &mut self.data_failures,
++                                failure_path,
+                             );
+                             out.diagnostics.push(PhyDiagnostic::InvalidData);
+                             out.diagnostics.extend(failure_diagnostics);
+@@ -930,6 +1065,7 @@ mod tests {
+     fn radio_ofdm_rejection_events_form_a_closed_branch_partition() {
+         let mut stats = DecoderStats::default();
+         let mut rejections = OfdmRejectionStats::default();
++        let mut data_failures = OfdmDataFailureStats::default();
+         let mut strong_long_training = OfdmStrongLongTrainingStats::default();
+         for reason in [
+             OfdmRejection::SignalOrProbe,
+@@ -937,19 +1073,25 @@ mod tests {
+             OfdmRejection::GreenfieldProbeUnrecognized,
+             OfdmRejection::MixedHeaderUnsupported,
+             OfdmRejection::LegacyFallbackUnreservable,
+-            OfdmRejection::DataDecodeFailed,
+             OfdmRejection::PendingCapacity,
+         ] {
+             record_rejection(&mut stats, &mut rejections, reason);
+         }
++        for path in [
++            OfdmDataFailure::Legacy,
++            OfdmDataFailure::HtBcc,
++            OfdmDataFailure::HtLdpc,
++        ] {
++            record_data_failure(&mut stats, &mut rejections, &mut data_failures, path);
++        }
+         record_strong_long_training_failure(
+             &mut stats,
+             &mut rejections,
+             &mut strong_long_training,
+             StrongLongTrainingFailure::ShortPeriodicityTimeout,
+         );
+-        assert_eq!(stats.rejected_frames, 8);
+-        assert_eq!(rejections.checked_total(), Some(8));
++        assert_eq!(stats.rejected_frames, 10);
++        assert_eq!(rejections.checked_total(), Some(10));
+         assert_eq!(
+             rejections,
+             OfdmRejectionStats {
+@@ -958,11 +1100,23 @@ mod tests {
+                 greenfield_probe_unrecognized: 1,
+                 mixed_header_unsupported: 1,
+                 legacy_fallback_unreservable: 1,
+-                data_decode_failed: 1,
++                data_decode_failed: 3,
+                 pending_capacity_rejected: 1,
+                 strong_long_training_not_found: 1,
+             }
+         );
++        assert_eq!(
++            data_failures,
++            OfdmDataFailureStats {
++                legacy: 1,
++                ht_bcc: 1,
++                ht_ldpc: 1,
++            }
++        );
++        assert_eq!(
++            data_failures.checked_total(),
++            Some(rejections.data_decode_failed)
++        );
+         assert_eq!(
+             strong_long_training,
+             OfdmStrongLongTrainingStats {
+@@ -1012,6 +1166,15 @@ mod tests {
+             .checked_total(),
+             None
+         );
++        assert_eq!(
++            OfdmDataFailureStats {
++                legacy: u64::MAX,
++                ht_bcc: 1,
++                ..OfdmDataFailureStats::default()
++            }
++            .checked_total(),
++            None
++        );
+ 
+         let mut saturated_stats = DecoderStats {
+             rejected_frames: u64::MAX - 1,
+@@ -1021,10 +1184,12 @@ mod tests {
+             signal_or_probe_rejected: u64::MAX - 1,
+             ..OfdmRejectionStats::default()
+         };
+-        record_rejection(
++        let mut saturated_data_failures = OfdmDataFailureStats::default();
++        record_data_failure(
+             &mut saturated_stats,
+             &mut saturated_rejections,
+-            OfdmRejection::DataDecodeFailed,
++            &mut saturated_data_failures,
++            OfdmDataFailure::Legacy,
+         );
+         let mut saturated_details = OfdmStrongLongTrainingStats::default();
+         record_strong_long_training_failure(
+@@ -1035,6 +1200,11 @@ mod tests {
+         );
+         assert_eq!(saturated_stats.rejected_frames, u64::MAX);
+         assert_eq!(saturated_rejections.data_decode_failed, 1);
++        assert_eq!(saturated_data_failures.legacy, 1);
++        assert_eq!(
++            saturated_data_failures.checked_total(),
++            Some(saturated_rejections.data_decode_failed)
++        );
+         assert_eq!(saturated_rejections.strong_long_training_not_found, 0);
+         assert_eq!(saturated_details, OfdmStrongLongTrainingStats::default());
+         assert_eq!(saturated_rejections.checked_total(), Some(u64::MAX));
+@@ -1113,19 +1283,30 @@ mod tests {
+             assert!(output.frames.is_empty());
+             let stats = decoder.ofdm_stats();
+             let rejections = decoder.ofdm_rejection_stats();
++            let data_failures = decoder.ofdm_data_failure_stats();
+             let strong_long_training = decoder.ofdm_strong_long_training_stats();
+             assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++            assert_eq!(
++                data_failures.checked_total(),
++                Some(rejections.data_decode_failed)
++            );
+             assert_eq!(
+                 strong_long_training.checked_total(),
+                 Some(rejections.strong_long_training_not_found)
+             );
+             assert!(rejections.data_decode_failed > 0);
+-            if let Some((expected_stats, expected_rejections, expected_strong)) = baseline {
++            assert_eq!(data_failures.legacy, rejections.data_decode_failed);
++            assert_eq!(data_failures.ht_bcc, 0);
++            assert_eq!(data_failures.ht_ldpc, 0);
++            if let Some((expected_stats, expected_rejections, expected_data, expected_strong)) =
++                baseline
++            {
+                 assert_eq!(stats, expected_stats);
+                 assert_eq!(rejections, expected_rejections);
++                assert_eq!(data_failures, expected_data);
+                 assert_eq!(strong_long_training, expected_strong);
+             } else {
+-                baseline = Some((stats, rejections, strong_long_training));
++                baseline = Some((stats, rejections, data_failures, strong_long_training));
+             }
+         }
+ 
+@@ -1138,6 +1319,10 @@ mod tests {
+         assert!(output.frames.is_empty());
+         assert!(decoder.ofdm_stats().invalid_fcs > 0);
+         assert_eq!(decoder.ofdm_rejection_stats().data_decode_failed, 0);
++        assert_eq!(
++            decoder.ofdm_data_failure_stats(),
++            OfdmDataFailureStats::default()
++        );
+         assert_eq!(
+             decoder.ofdm_rejection_stats().checked_total(),
+             Some(decoder.ofdm_stats().rejected_frames)
+@@ -2031,9 +2216,17 @@ mod tests {
+         }
+         let mut zero_data = bytes.to_vec();
+         zero_data[757 * 2..end * 2].fill(0);
+-        let out = feed(&mut WifiDecoder::new(), &zero_data, 79);
++        let mut decoder = WifiDecoder::new();
++        let out = feed(&mut decoder, &zero_data, 79);
+         assert!(out.frames.is_empty());
+         assert!(out.diagnostics.contains(&PhyDiagnostic::InvalidData));
++        assert_eq!(
++            decoder.ofdm_data_failure_stats(),
++            OfdmDataFailureStats {
++                ht_bcc: decoder.ofdm_rejection_stats().data_decode_failed,
++                ..OfdmDataFailureStats::default()
++            }
++        );
+     }
+     #[test]
+     fn radio_ht_bcc_streaming_independent_iq() {
+@@ -2065,7 +2258,8 @@ mod tests {
+             .unwrap();
+             assert_eq!(format!("{:x}", Sha256::digest(&bytes)), c[2]);
+             for size in [1, 4096] {
+-                let out = feed(&mut WifiDecoder::new(), &bytes, size);
++                let mut decoder = WifiDecoder::new();
++                let out = feed(&mut decoder, &bytes, size);
+                 assert!(out.frames.is_empty(), "{}", c[0]);
+                 assert!(out
+                     .diagnostics
+@@ -2086,6 +2280,18 @@ mod tests {
+                     out.diagnostics
+                 );
+                 assert_eq!(out.diagnostics.iter().any(|d|matches!(d,PhyDiagnostic::LdpcNonconvergence{iterations:64,failed_checks,..} if *failed_checks>0)),c[1]=="nonconvergence","{}: {:?}",c[0],out.diagnostics);
++                let data_failures = decoder.ofdm_data_failure_stats();
++                if c[1] == "invalid_fcs" {
++                    assert_eq!(data_failures, OfdmDataFailureStats::default());
++                } else {
++                    assert_eq!(
++                        data_failures,
++                        OfdmDataFailureStats {
++                            ht_ldpc: decoder.ofdm_rejection_stats().data_decode_failed,
++                            ..OfdmDataFailureStats::default()
++                        }
++                    );
++                }
+             }
+         }
+     }
+diff --git a/crafter/src/radio/wifi/parallel.rs b/crafter/src/radio/wifi/parallel.rs
+index 4fc041a1..91bbbae4 100644
+--- a/crafter/src/radio/wifi/parallel.rs
++++ b/crafter/src/radio/wifi/parallel.rs
+@@ -1,7 +1,10 @@
+ //! Bounded parallel Wi-Fi PHY dispatch; sources and packet parsing stay unchanged.
+ use super::{
+     dsss::DsssCckDecoder,
+-    ofdm::{DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats},
++    ofdm::{
++        DecoderStats, LegacyOfdmDecoder, OfdmDataFailureStats, OfdmRejectionStats,
++        OfdmStrongLongTrainingStats,
++    },
+     same_occurrence,
+ };
+ use crate::radio::{
+@@ -134,6 +137,7 @@ struct Reply {
+     result: RadioResult<DecodeOutput>,
+     stats: DecoderStats,
+     rejections: OfdmRejectionStats,
++    data_failures: OfdmDataFailureStats,
+     strong_long_training: OfdmStrongLongTrainingStats,
+ }
+ struct Worker {
+@@ -146,6 +150,7 @@ impl Worker {
+         mut decoder: D,
+         stats: fn(&D) -> DecoderStats,
+         rejections: Option<fn(&D) -> OfdmRejectionStats>,
++        data_failures: Option<fn(&D) -> OfdmDataFailureStats>,
+         strong_long_training: Option<fn(&D) -> OfdmStrongLongTrainingStats>,
+         family: u8,
+     ) -> RadioResult<Self> {
+@@ -179,6 +184,8 @@ impl Worker {
+                             stats: stats(&decoder),
+                             rejections: rejections
+                                 .map_or_else(OfdmRejectionStats::default, |read| read(&decoder)),
++                            data_failures: data_failures
++                                .map_or_else(OfdmDataFailureStats::default, |read| read(&decoder)),
+                             strong_long_training: strong_long_training
+                                 .map_or_else(OfdmStrongLongTrainingStats::default, |read| {
+                                     read(&decoder)
+@@ -287,6 +294,7 @@ pub struct ParallelLegacyWifiDecoder {
+     workers: Vec<Worker>,
+     stats: Vec<DecoderStats>,
+     rejections: Vec<OfdmRejectionStats>,
++    data_failures: Vec<OfdmDataFailureStats>,
+     strong_long_training: Vec<OfdmStrongLongTrainingStats>,
+     recent: Vec<RecoveredFrame>,
+     continuity: IqContinuity,
+@@ -300,6 +308,7 @@ impl ParallelLegacyWifiDecoder {
+             ofdm,
+             LegacyOfdmDecoder::stats,
+             Some(LegacyOfdmDecoder::rejection_stats),
++            Some(LegacyOfdmDecoder::data_failure_stats),
+             Some(LegacyOfdmDecoder::strong_long_training_stats),
+             0,
+         )?];
+@@ -309,6 +318,7 @@ impl ParallelLegacyWifiDecoder {
+                 DsssCckDecoder::stats,
+                 None,
+                 None,
++                None,
+                 1,
+             )?);
+             workers.push(Worker::new(
+@@ -316,6 +326,7 @@ impl ParallelLegacyWifiDecoder {
+                 DsssCckDecoder::stats,
+                 None,
+                 None,
++                None,
+                 2,
+             )?);
+         } else {
+@@ -324,6 +335,7 @@ impl ParallelLegacyWifiDecoder {
+                 DsssCckDecoder::stats,
+                 None,
+                 None,
++                None,
+                 1,
+             )?);
+         }
+@@ -332,6 +344,7 @@ impl ParallelLegacyWifiDecoder {
+             workers,
+             stats: vec![DecoderStats::default(); worker_count],
+             rejections: vec![OfdmRejectionStats::default(); worker_count],
++            data_failures: vec![OfdmDataFailureStats::default(); worker_count],
+             strong_long_training: vec![OfdmStrongLongTrainingStats::default(); worker_count],
+             recent: Vec::new(),
+             continuity: IqContinuity::default(),
+@@ -354,6 +367,10 @@ impl ParallelLegacyWifiDecoder {
+             self.rejections[0].checked_total(),
+             Some(self.stats[0].rejected_frames)
+         );
++        debug_assert_eq!(
++            self.data_failures[0].checked_total(),
++            Some(self.rejections[0].data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.strong_long_training[0].checked_total(),
+             Some(self.rejections[0].strong_long_training_not_found)
+@@ -365,17 +382,40 @@ impl ParallelLegacyWifiDecoder {
+             self.rejections[0].checked_total(),
+             Some(self.stats[0].rejected_frames)
+         );
++        debug_assert_eq!(
++            self.data_failures[0].checked_total(),
++            Some(self.rejections[0].data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.strong_long_training[0].checked_total(),
+             Some(self.rejections[0].strong_long_training_not_found)
+         );
+         self.rejections[0]
+     }
++    pub fn ofdm_data_failure_stats(&self) -> OfdmDataFailureStats {
++        debug_assert_eq!(
++            self.rejections[0].checked_total(),
++            Some(self.stats[0].rejected_frames)
++        );
++        debug_assert_eq!(
++            self.data_failures[0].checked_total(),
++            Some(self.rejections[0].data_decode_failed)
++        );
++        debug_assert_eq!(
++            self.strong_long_training[0].checked_total(),
++            Some(self.rejections[0].strong_long_training_not_found)
++        );
++        self.data_failures[0]
++    }
+     pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         debug_assert_eq!(
+             self.rejections[0].checked_total(),
+             Some(self.stats[0].rejected_frames)
+         );
++        debug_assert_eq!(
++            self.data_failures[0].checked_total(),
++            Some(self.rejections[0].data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.strong_long_training[0].checked_total(),
+             Some(self.rejections[0].strong_long_training_not_found)
+@@ -403,6 +443,7 @@ impl ParallelLegacyWifiDecoder {
+                 Ok(reply) => {
+                     self.stats[i] = reply.stats;
+                     self.rejections[i] = reply.rejections;
++                    self.data_failures[i] = reply.data_failures;
+                     self.strong_long_training[i] = reply.strong_long_training;
+                     match reply.result {
+                         Ok(decoded) => output.diagnostics.extend(decoded.diagnostics),
+@@ -569,6 +610,10 @@ impl ParallelWifiDecoder {
+         self.inner.ofdm_rejection_stats()
+     }
+ 
++    pub fn ofdm_data_failure_stats(&self) -> OfdmDataFailureStats {
++        self.inner.ofdm_data_failure_stats()
++    }
++
+     pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         self.inner.ofdm_strong_long_training_stats()
+     }
+@@ -672,8 +717,15 @@ mod tests {
+     #[test]
+     fn third_worker_failure_at_eof_is_not_successful_completion() {
+         let mut decoder = ParallelLegacyWifiDecoder::with_parallel_dsss().unwrap();
+-        decoder.workers[2] =
+-            Worker::new(FailedReset, |_| DecoderStats::default(), None, None, 2).unwrap();
++        decoder.workers[2] = Worker::new(
++            FailedReset,
++            |_| DecoderStats::default(),
++            None,
++            None,
++            None,
++            2,
++        )
++        .unwrap();
+         assert!(matches!(
+             decoder.consume(IqEvent::End(StreamEnd::Eof)),
+             Err(RadioError::Source(_))
+@@ -688,11 +740,28 @@ mod tests {
+     fn worker_failure_at_eof_is_not_successful_completion() {
+         let mut decoder = ParallelLegacyWifiDecoder {
+             workers: vec![
+-                Worker::new(FailedReset, |_| DecoderStats::default(), None, None, 0).unwrap(),
+-                Worker::new(DsssCckDecoder::new(), DsssCckDecoder::stats, None, None, 1).unwrap(),
++                Worker::new(
++                    FailedReset,
++                    |_| DecoderStats::default(),
++                    None,
++                    None,
++                    None,
++                    0,
++                )
++                .unwrap(),
++                Worker::new(
++                    DsssCckDecoder::new(),
++                    DsssCckDecoder::stats,
++                    None,
++                    None,
++                    None,
++                    1,
++                )
++                .unwrap(),
+             ],
+             stats: vec![DecoderStats::default(); 2],
+             rejections: vec![OfdmRejectionStats::default(); 2],
++            data_failures: vec![OfdmDataFailureStats::default(); 2],
+             strong_long_training: vec![OfdmStrongLongTrainingStats::default(); 2],
+             recent: Vec::new(),
+             continuity: IqContinuity::default(),
+diff --git a/crafter/src/radio/wifi/windowed.rs b/crafter/src/radio/wifi/windowed.rs
+index c093ba71..7db06635 100644
+--- a/crafter/src/radio/wifi/windowed.rs
++++ b/crafter/src/radio/wifi/windowed.rs
+@@ -1,7 +1,10 @@
+ //! Coarse-grained parallel Wi-Fi decoding over bounded overlapping time windows.
+ use super::{
+     dsss::DsssCckDecoder,
+-    ofdm::{DecoderStats, LegacyOfdmDecoder, OfdmRejectionStats, OfdmStrongLongTrainingStats},
++    ofdm::{
++        DecoderStats, LegacyOfdmDecoder, OfdmDataFailureStats, OfdmRejectionStats,
++        OfdmStrongLongTrainingStats,
++    },
+     LegacyWifiDecoder,
+ };
+ use crate::radio::{
+@@ -64,6 +67,12 @@ impl WindowDecoder {
+             Self::Dsss(_) => OfdmRejectionStats::default(),
+         }
+     }
++    fn ofdm_data_failure_stats(&self) -> OfdmDataFailureStats {
++        match self {
++            Self::Legacy(decoder) => decoder.ofdm_data_failure_stats(),
++            Self::Dsss(_) => OfdmDataFailureStats::default(),
++        }
++    }
+     fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         match self {
+             Self::Legacy(decoder) => decoder.ofdm_strong_long_training_stats(),
+@@ -109,6 +118,7 @@ struct Reply {
+     result: RadioResult<DecodeOutput>,
+     ofdm: DecoderStats,
+     ofdm_rejections: OfdmRejectionStats,
++    ofdm_data_failures: OfdmDataFailureStats,
+     ofdm_strong_long_training: OfdmStrongLongTrainingStats,
+     dsss: DecoderStats,
+ }
+@@ -121,6 +131,7 @@ fn run_worker(
+ ) {
+     let mut ofdm = DecoderStats::default();
+     let mut ofdm_rejections = OfdmRejectionStats::default();
++    let mut ofdm_data_failures = OfdmDataFailureStats::default();
+     let mut ofdm_strong_long_training = OfdmStrongLongTrainingStats::default();
+     let mut dsss = DecoderStats::default();
+     loop {
+@@ -173,6 +184,10 @@ fn run_worker(
+         }
+         ofdm = sum_stats(&[ofdm, decoder.ofdm_stats()]);
+         let next_rejections = ofdm_rejections.saturating_add(decoder.ofdm_rejection_stats());
++        ofdm_data_failures = ofdm_data_failures.saturating_add_to(
++            decoder.ofdm_data_failure_stats(),
++            next_rejections.data_decode_failed,
++        );
+         ofdm_strong_long_training = ofdm_strong_long_training.saturating_add_to(
+             decoder.ofdm_strong_long_training_stats(),
+             next_rejections.strong_long_training_not_found,
+@@ -189,6 +204,7 @@ fn run_worker(
+                 result,
+                 ofdm,
+                 ofdm_rejections,
++                ofdm_data_failures,
+                 ofdm_strong_long_training,
+                 dsss,
+             })
+@@ -218,10 +234,12 @@ pub struct WindowedLegacyWifiDecoder {
+     failed: bool,
+     ofdm: DecoderStats,
+     ofdm_rejections: OfdmRejectionStats,
++    ofdm_data_failures: OfdmDataFailureStats,
+     ofdm_strong_long_training: OfdmStrongLongTrainingStats,
+     dsss: DecoderStats,
+     worker_ofdm: Vec<DecoderStats>,
+     worker_ofdm_rejections: Vec<OfdmRejectionStats>,
++    worker_ofdm_data_failures: Vec<OfdmDataFailureStats>,
+     worker_ofdm_strong_long_training: Vec<OfdmStrongLongTrainingStats>,
+     worker_dsss: Vec<DecoderStats>,
+     workers: usize,
+@@ -275,10 +293,12 @@ impl WindowedLegacyWifiDecoder {
+             failed: false,
+             ofdm: DecoderStats::default(),
+             ofdm_rejections: OfdmRejectionStats::default(),
++            ofdm_data_failures: OfdmDataFailureStats::default(),
+             ofdm_strong_long_training: OfdmStrongLongTrainingStats::default(),
+             dsss: DecoderStats::default(),
+             worker_ofdm: vec![DecoderStats::default(); workers],
+             worker_ofdm_rejections: vec![OfdmRejectionStats::default(); workers],
++            worker_ofdm_data_failures: vec![OfdmDataFailureStats::default(); workers],
+             worker_ofdm_strong_long_training: vec![OfdmStrongLongTrainingStats::default(); workers],
+             worker_dsss: vec![DecoderStats::default(); workers],
+             workers,
+@@ -291,6 +311,10 @@ impl WindowedLegacyWifiDecoder {
+             self.ofdm_rejections.checked_total(),
+             Some(self.ofdm.rejected_frames)
+         );
++        debug_assert_eq!(
++            self.ofdm_data_failures.checked_total(),
++            Some(self.ofdm_rejections.data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.ofdm_strong_long_training.checked_total(),
+             Some(self.ofdm_rejections.strong_long_training_not_found)
+@@ -302,17 +326,40 @@ impl WindowedLegacyWifiDecoder {
+             self.ofdm_rejections.checked_total(),
+             Some(self.ofdm.rejected_frames)
+         );
++        debug_assert_eq!(
++            self.ofdm_data_failures.checked_total(),
++            Some(self.ofdm_rejections.data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.ofdm_strong_long_training.checked_total(),
+             Some(self.ofdm_rejections.strong_long_training_not_found)
+         );
+         self.ofdm_rejections
+     }
++    pub fn ofdm_data_failure_stats(&self) -> OfdmDataFailureStats {
++        debug_assert_eq!(
++            self.ofdm_rejections.checked_total(),
++            Some(self.ofdm.rejected_frames)
++        );
++        debug_assert_eq!(
++            self.ofdm_data_failures.checked_total(),
++            Some(self.ofdm_rejections.data_decode_failed)
++        );
++        debug_assert_eq!(
++            self.ofdm_strong_long_training.checked_total(),
++            Some(self.ofdm_rejections.strong_long_training_not_found)
++        );
++        self.ofdm_data_failures
++    }
+     pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         debug_assert_eq!(
+             self.ofdm_rejections.checked_total(),
+             Some(self.ofdm.rejected_frames)
+         );
++        debug_assert_eq!(
++            self.ofdm_data_failures.checked_total(),
++            Some(self.ofdm_rejections.data_decode_failed)
++        );
+         debug_assert_eq!(
+             self.ofdm_strong_long_training.checked_total(),
+             Some(self.ofdm_rejections.strong_long_training_not_found)
+@@ -421,11 +468,17 @@ impl WindowedLegacyWifiDecoder {
+             let unique_dsss = self.dsss.valid_frames;
+             self.worker_ofdm[reply.worker] = reply.ofdm;
+             self.worker_ofdm_rejections[reply.worker] = reply.ofdm_rejections;
++            self.worker_ofdm_data_failures[reply.worker] = reply.ofdm_data_failures;
+             self.worker_ofdm_strong_long_training[reply.worker] = reply.ofdm_strong_long_training;
+             self.worker_dsss[reply.worker] = reply.dsss;
+             self.ofdm = sum_stats(&self.worker_ofdm);
+             self.ofdm_rejections =
+                 merge_rejections(self.ofdm_rejections, &self.worker_ofdm_rejections);
++            self.ofdm_data_failures = merge_data_failures(
++                self.ofdm_data_failures,
++                &self.worker_ofdm_data_failures,
++                self.ofdm_rejections.data_decode_failed,
++            );
+             self.ofdm_strong_long_training = merge_strong_long_training(
+                 self.ofdm_strong_long_training,
+                 &self.worker_ofdm_strong_long_training,
+@@ -529,6 +582,19 @@ fn merge_strong_long_training(
+     current.saturating_add_to(observed.saturating_sub(current), aggregate)
+ }
+ 
++fn merge_data_failures(
++    current: OfdmDataFailureStats,
++    stats: &[OfdmDataFailureStats],
++    aggregate: u64,
++) -> OfdmDataFailureStats {
++    let observed = stats
++        .iter()
++        .fold(OfdmDataFailureStats::default(), |sum, value| {
++            sum.saturating_add_each(*value)
++        });
++    current.saturating_add_to(observed.saturating_sub(current), aggregate)
++}
++
+ impl Drop for WindowedLegacyWifiDecoder {
+     fn drop(&mut self) {
+         self.jobs.take();
+@@ -644,6 +710,9 @@ impl WindowedWifiDecoder {
+     pub fn ofdm_rejection_stats(&self) -> OfdmRejectionStats {
+         self.ofdm.rejection_stats()
+     }
++    pub fn ofdm_data_failure_stats(&self) -> OfdmDataFailureStats {
++        self.ofdm.data_failure_stats()
++    }
+     pub fn ofdm_strong_long_training_stats(&self) -> OfdmStrongLongTrainingStats {
+         self.ofdm.strong_long_training_stats()
+     }
+@@ -839,6 +908,41 @@ mod tests {
+ 
+     #[test]
+     fn rejection_merge_remains_closed_and_monotonic_at_saturation() {
++        let current_data_rejections = OfdmRejectionStats {
++            data_decode_failed: u64::MAX - 1,
++            ..OfdmRejectionStats::default()
++        };
++        let merged_data_rejections = merge_rejections(
++            current_data_rejections,
++            &[
++                OfdmRejectionStats {
++                    signal_or_probe_rejected: 2,
++                    ..OfdmRejectionStats::default()
++                },
++                current_data_rejections,
++            ],
++        );
++        let current_data = OfdmDataFailureStats {
++            legacy: u64::MAX - 1,
++            ..OfdmDataFailureStats::default()
++        };
++        let merged_data = merge_data_failures(
++            current_data,
++            &[
++                OfdmDataFailureStats {
++                    ht_bcc: 2,
++                    ..OfdmDataFailureStats::default()
++                },
++                current_data,
++            ],
++            merged_data_rejections.data_decode_failed,
++        );
++        assert_eq!(merged_data, current_data);
++        assert_eq!(
++            merged_data.checked_total(),
++            Some(merged_data_rejections.data_decode_failed)
++        );
++
+         let current = OfdmRejectionStats {
+             strong_long_training_not_found: u64::MAX - 1,
+             ..OfdmRejectionStats::default()
+diff --git a/crafter/tests/radio_parallel.rs b/crafter/tests/radio_parallel.rs
+index 49d3460e..cce501c5 100644
+--- a/crafter/tests/radio_parallel.rs
++++ b/crafter/tests/radio_parallel.rs
+@@ -28,6 +28,50 @@ fn clone_event(event: &IqEvent) -> IqEvent {
+         IqEvent::End(e) => IqEvent::End(*e),
+     }
+ }
++
++fn wifi_failure_snapshots(
++    bytes: &[u8],
++) -> [(DecoderStats, OfdmRejectionStats, OfdmDataFailureStats); 3] {
++    let mut c = config(bytes.len() / 2);
++    c.max_buffer_samples = 17_000_000;
++    c.max_capture_samples = bytes.len() as u64 / 2;
++    let event = || {
++        IqEvent::Chunk(
++            IqChunk::new(
++                c.clone(),
++                position(),
++                bytes.iter().map(|value| *value as i8).collect(),
++            )
++            .unwrap(),
++        )
++    };
++    let mut serial = WifiDecoder::new();
++    let mut parallel = ParallelWifiDecoder::new().unwrap();
++    let mut windowed = WindowedWifiDecoder::new(2).unwrap();
++    serial.consume(event()).unwrap();
++    parallel.consume(event()).unwrap();
++    windowed.consume(event()).unwrap();
++    serial.consume(IqEvent::End(StreamEnd::Eof)).unwrap();
++    parallel.consume(IqEvent::End(StreamEnd::Eof)).unwrap();
++    windowed.consume(IqEvent::End(StreamEnd::Eof)).unwrap();
++    [
++        (
++            serial.ofdm_stats(),
++            serial.ofdm_rejection_stats(),
++            serial.ofdm_data_failure_stats(),
++        ),
++        (
++            parallel.ofdm_stats(),
++            parallel.ofdm_rejection_stats(),
++            parallel.ofdm_data_failure_stats(),
++        ),
++        (
++            windowed.ofdm_stats(),
++            windowed.ofdm_rejection_stats(),
++            windowed.ofdm_data_failure_stats(),
++        ),
++    ]
++}
+ #[test]
+ fn parallel_matches_serial_on_all_independent_vectors() {
+     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/iq");
+@@ -62,6 +106,10 @@ fn parallel_matches_serial_on_all_independent_vectors() {
+                     parallel.ofdm_rejection_stats(),
+                     serial.ofdm_rejection_stats()
+                 );
++                assert_eq!(
++                    parallel.ofdm_data_failure_stats(),
++                    serial.ofdm_data_failure_stats()
++                );
+                 assert_eq!(
+                     parallel.ofdm_strong_long_training_stats(),
+                     serial.ofdm_strong_long_training_stats()
+@@ -109,6 +157,10 @@ fn windowed_ofdm_rejection_accounting_matches_one_serial_window() {
+         windowed.ofdm_rejection_stats(),
+         serial.ofdm_rejection_stats()
+     );
++    assert_eq!(
++        windowed.ofdm_data_failure_stats(),
++        serial.ofdm_data_failure_stats()
++    );
+     assert_eq!(
+         windowed.ofdm_strong_long_training_stats(),
+         serial.ofdm_strong_long_training_stats()
+@@ -117,6 +169,10 @@ fn windowed_ofdm_rejection_accounting_matches_one_serial_window() {
+         windowed.ofdm_rejection_stats().checked_total(),
+         Some(windowed.ofdm_stats().rejected_frames)
+     );
++    assert_eq!(
++        windowed.ofdm_data_failure_stats().checked_total(),
++        Some(windowed.ofdm_rejection_stats().data_decode_failed)
++    );
+     assert_eq!(
+         windowed.ofdm_strong_long_training_stats().checked_total(),
+         Some(
+@@ -127,6 +183,51 @@ fn windowed_ofdm_rejection_accounting_matches_one_serial_window() {
+     );
+ }
+ 
++#[test]
++fn data_failure_paths_propagate_through_serial_parallel_and_windowed_decoders() {
++    let legacy = include_bytes!("fixtures/iq/ofdm-6-invalid_service.cs8");
++    let mut ht_bcc = include_bytes!("fixtures/iq/ht-bcc-0-gi800-len100-clean.cs8").to_vec();
++    let bcc_end = ht_bcc.len() / 2 - 64;
++    ht_bcc[757 * 2..bcc_end * 2].fill(0);
++    let ht_ldpc = include_bytes!("fixtures/iq/ht-ldpc-7-invalid_service.cs8");
++
++    for (name, bytes, expected_path) in [
++        ("legacy", legacy.as_slice(), 0),
++        ("ht_bcc", ht_bcc.as_slice(), 1),
++        ("ht_ldpc", ht_ldpc.as_slice(), 2),
++    ] {
++        let snapshots = wifi_failure_snapshots(bytes);
++        assert_eq!(snapshots[1], snapshots[0], "{name}: parallel");
++        assert_eq!(snapshots[2], snapshots[0], "{name}: windowed");
++        let (stats, rejections, data_failures) = snapshots[0];
++        assert_eq!(rejections.checked_total(), Some(stats.rejected_frames));
++        assert_eq!(
++            data_failures.checked_total(),
++            Some(rejections.data_decode_failed)
++        );
++        assert!(rejections.data_decode_failed > 0, "{name}");
++        let counts = [
++            data_failures.legacy,
++            data_failures.ht_bcc,
++            data_failures.ht_ldpc,
++        ];
++        assert_eq!(
++            counts[expected_path], rejections.data_decode_failed,
++            "{name}"
++        );
++        assert_eq!(
++            counts
++                .into_iter()
++                .enumerate()
++                .filter(|(index, _)| *index != expected_path)
++                .map(|(_, count)| count)
++                .sum::<u64>(),
++            0,
++            "{name}"
++        );
++    }
++}
++
+ #[test]
+ fn strong_long_training_detail_propagates_through_parallel_and_windowed_decoders() {
+     let bytes = include_bytes!("fixtures/iq/ofdm-6-clean-training-ltf.cs8");
+@@ -546,6 +647,16 @@ fn parallel_wifi_preserves_ht_frames_and_metadata() {
+                 format!("{expected:?}"),
+                 "{name}, chunk={size}, split DSSS"
+             );
++            assert_eq!(
++                parallel.ofdm_data_failure_stats(),
++                serial.ofdm_data_failure_stats(),
++                "{name}, chunk={size}, parallel DATA detail"
++            );
++            assert_eq!(
++                split.ofdm_data_failure_stats(),
++                serial.ofdm_data_failure_stats(),
++                "{name}, chunk={size}, split DATA detail"
++            );
+             assert_eq!(
+                 parallel.ofdm_strong_long_training_stats(),
+                 serial.ofdm_strong_long_training_stats(),
+@@ -624,6 +735,10 @@ fn windowed_wifi_preserves_ht_and_dsss_frames_and_metadata() {
+     assert_eq!(actual.len(), 2);
+     assert_eq!(windowed.ofdm_stats().valid_frames, 1);
+     assert_eq!(windowed.dsss_stats().valid_frames, 1);
++    assert_eq!(
++        windowed.ofdm_data_failure_stats(),
++        serial.ofdm_data_failure_stats()
++    );
+     assert_eq!(
+         windowed.ofdm_strong_long_training_stats(),
+         serial.ofdm_strong_long_training_stats()
+diff --git a/crafter/tests/radio_public_api.rs b/crafter/tests/radio_public_api.rs
+index 6f2af330..e953471a 100644
+--- a/crafter/tests/radio_public_api.rs
++++ b/crafter/tests/radio_public_api.rs
+@@ -8,12 +8,13 @@ use crafter::radio::{
+     IqSource, LegacyDsssCckRate, LegacyDsssCckTransmission, LegacyDsssCckTxConfig,
+     LegacyOfdmDecoder, LegacyOfdmRate, LegacyOfdmTransmission, LegacyOfdmTxConfig,
+     LegacyWifiDecoder, LegacyWifiPhy, LegacyWifiTransmission, LegacyWifiTxConfig, MemoryIqSink,
+-    MemoryIqSource, OfdmRejectionStats, OfdmSignalFields, OfdmStrongLongTrainingStats,
+-    OwnedSamples, PacketEncoder, ParallelLegacyWifiDecoder, ParallelWifiDecoder, PhyDecoder,
+-    PhyDiagnostic, RadioError, RadioPacketSource, RadioPacketWriter, RadioReceiveMetadata,
+-    RadioResult, ReaderIqSource, RecoveredFrame, ResetReason, RxConfig, SampleCompletion,
+-    SampleFormat, SampleLoss, SignalInfo, StreamEnd, TimeAnchor, WifiDecoder, WifiFcsPolicy,
+-    WifiPacketEncoder, WifiTxEncoder, WindowedLegacyWifiDecoder, WindowedWifiDecoder,
++    MemoryIqSource, OfdmDataFailureStats, OfdmRejectionStats, OfdmSignalFields,
++    OfdmStrongLongTrainingStats, OwnedSamples, PacketEncoder, ParallelLegacyWifiDecoder,
++    ParallelWifiDecoder, PhyDecoder, PhyDiagnostic, RadioError, RadioPacketSource,
++    RadioPacketWriter, RadioReceiveMetadata, RadioResult, ReaderIqSource, RecoveredFrame,
++    ResetReason, RxConfig, SampleCompletion, SampleFormat, SampleLoss, SignalInfo, StreamEnd,
++    TimeAnchor, WifiDecoder, WifiFcsPolicy, WifiPacketEncoder, WifiTxEncoder,
++    WindowedLegacyWifiDecoder, WindowedWifiDecoder,
+ };
+ use crafter::{prelude, PacketWriter};
+ use std::{io::Cursor, time::Duration};
+@@ -75,6 +76,7 @@ fn radio_facade_exports_the_existing_public_surface() {
+     assert_type::<IqContinuity>();
+ 
+     assert_type::<DecoderStats>();
++    assert_type::<OfdmDataFailureStats>();
+     assert_type::<OfdmRejectionStats>();
+     assert_type::<OfdmStrongLongTrainingStats>();
+     assert_type::<SignalInfo>();
+diff --git a/docs/radio.md b/docs/radio.md
+index a84405e9..83549e6d 100644
+--- a/docs/radio.md
++++ b/docs/radio.md
+@@ -356,7 +356,13 @@ the unchanged strong gate, so it remains a
+ `strong_long_reference_not_found` observation if the original candidate later
+ expires. Probe recovery, invalid FCS, a downstream rejection, and that original
+ strong timeout can coexist because these counters describe decoder hypotheses,
+-not mutually exclusive outcomes for unique RF bursts. The corresponding
++not mutually exclusive outcomes for unique RF bursts. The
++`ofdm_data_failure_stats()` accessors return a closed `OfdmDataFailureStats`
++subpartition whose checked total equals `data_decode_failed`. Its `legacy`,
++`ht_bcc`, and `ht_ldpc` fields identify the decoder path selected by an
++integrity-checked header, not a proven over-the-air PHY or unique frame.
++
++The corresponding
+ `ofdm_strong_long_training_stats()` accessors return a separate closed
+ `OfdmStrongLongTrainingStats` subpartition. Its checked total equals
+ `strong_long_training_not_found`, and each candidate is assigned by the
+diff --git a/tools/oracle/specs/features/wifi-receiver-quality.yaml b/tools/oracle/specs/features/wifi-receiver-quality.yaml
+index 368e5c6b..2f469962 100644
+--- a/tools/oracle/specs/features/wifi-receiver-quality.yaml
++++ b/tools/oracle/specs/features/wifi-receiver-quality.yaml
+@@ -13,6 +13,8 @@ behaviors:
+     checks: [distinct_header_and_data_failures, no_invalid_delivery]
+   - name: rejection-event-accounting
+     checks: [closed_terminal_branch_partition, exact_aggregate_sum, saturating_monotonicity, hypothesis_not_frame_semantics, strong_timeout_can_coexist_with_weak_recovery, independent_of_bounded_diagnostics, chunk_invariance]
++  - name: data-failure-detail
++    checks: [closed_legacy_ht_bcc_ht_ldpc_subpartition, exact_data_decode_failed_subtotal, decoder_path_not_ota_identity, invalid_service_branching, invalid_fcs_excluded, serial_parallel_windowed_closure, saturating_monotonicity]
+   - name: strong-long-training-detail
+     checks: [closed_four_way_subpartition, exact_strong_timeout_subtotal, furthest_eligible_gate, weak_short_candidate_independence, relaxed_probe_remains_reference_failure, successful_acquisition_suppresses_timeout, source_coordinate_failure_is_explicit, parallel_and_windowed_closure, saturating_monotonicity]
+   - name: signal-recovery
+@@ -58,6 +60,7 @@ backend_support:
+       - Rust clock-matrix tests verify long-frame estimates within 2 ppm and finite pilot residuals.
+       - Independent malformed SIGNAL, SERVICE and FCS fixtures distinguish rejection stages.
+       - OFDM rejection events retain a closed branch-aligned partition. They count terminal acquisition/decoder hypotheses, not physical frames, and do not infer missing reasons from the bounded overlapping diagnostic stream.
++      - Terminal DATA failures have a closed legacy, HT-BCC and HT-LDPC decoder-path subpartition whose total equals data_decode_failed; it does not assert the transmitted PHY identity.
+       - strong_long_training_not_found means the strong short-period path expired without accepted long training; a weak acquisition may still recover the same waveform.
+       - Strong long-training detail is a separate closed four-way subpartition selected by the furthest eligible gate reached. No eligible evaluation does not prove continued periodicity, and coordinates unavailable refers only to source-coordinate formation.
+       - Reference-relaxed probe recovery or downstream rejection may coexist with the original strong candidate's later timeout; the relaxed match remains a strong known-reference failure.

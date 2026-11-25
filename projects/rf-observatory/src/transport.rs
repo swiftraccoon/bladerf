@@ -11,8 +11,9 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::dsp::{HostPost, Iq16};
 use crate::receiver::ChannelFiles;
@@ -77,7 +78,11 @@ pub(crate) fn parse(raw: &[u8]) -> Result<Frame> {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Summary {
+    schema_version: u32,
     pub(crate) records: u64,
+    available_records: u64,
+    processed_bytes: u64,
+    processed_sha256: String,
     profile_id: u16,
     profile_source_sample_rate_hz: u32,
     transport_complex_slot_rate_hz: u32,
@@ -87,7 +92,137 @@ pub(crate) struct Summary {
     last_source_index: Option<u64>,
     receiver: Option<&'static str>,
     input_truncated_to_limit: bool,
+    mode: &'static str,
     interpretation: &'static str,
+}
+
+impl Summary {
+    pub(crate) fn receiver(&self) -> Option<&'static str> {
+        self.receiver
+    }
+
+    pub(crate) fn first_source_index(&self) -> Option<u64> {
+        self.first_source_index
+    }
+
+    pub(crate) fn last_source_index(&self) -> Option<u64> {
+        self.last_source_index
+    }
+}
+
+struct Scan {
+    available: u64,
+    records: u64,
+    first: Option<u64>,
+    previous: Option<u64>,
+    receiver: Option<bool>,
+    hash: Sha256,
+}
+
+impl Scan {
+    fn summary(self, mode: &'static str) -> Summary {
+        Summary {
+            schema_version: 1,
+            records: self.records,
+            available_records: self.available,
+            processed_bytes: self.records * RECORD_BYTES as u64,
+            processed_sha256: format!("{:x}", self.hash.finalize()),
+            profile_id: PROFILE_ID,
+            profile_source_sample_rate_hz: crate::SAMPLE_RATE,
+            transport_complex_slot_rate_hz: 8_000_000,
+            channel_sample_rate_hz: 1_000_000,
+            phase_words: PROFILE_WORDS,
+            first_source_index: self.first,
+            last_source_index: self.previous,
+            receiver: self.receiver.map(|rx2| if rx2 { "RX2" } else { "RX1" }),
+            input_truncated_to_limit: self.records < self.available,
+            mode,
+            interpretation: "Parsed profile-1 transport with exact source-index progression and no asserted error flags. The 20 MSps source clock is a profile assumption, not measured by framing. This alone does not prove RF continuity, fitted timing, or hardware execution.",
+        }
+    }
+}
+
+fn available_records(path: &Path) -> Result<u64> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() % RECORD_BYTES as u64 == 0,
+        "custom stream must be a regular file of complete records"
+    );
+    let available = metadata.len() / RECORD_BYTES as u64;
+    ensure!(available > 0, "empty custom stream");
+    Ok(available)
+}
+
+fn scan(
+    path: &Path,
+    record_limit: Option<u64>,
+    stop: &AtomicBool,
+    mut consume: impl FnMut(u64, u64, Frame) -> Result<()>,
+) -> Result<Scan> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() % RECORD_BYTES as u64 == 0,
+        "custom stream must be a regular file of complete records"
+    );
+    let initial_bytes = metadata.len();
+    let available = initial_bytes / RECORD_BYTES as u64;
+    ensure!(available > 0, "empty custom stream");
+    let records = record_limit.map_or(available, |limit| available.min(limit));
+    let mut input = BufReader::new(file);
+    let mut first = None;
+    let mut previous: Option<u64> = None;
+    let mut receiver = None;
+    let mut hash = Sha256::new();
+    for record in 0..records {
+        ensure!(
+            !stop.load(Ordering::Relaxed),
+            "custom stream processing interrupted; partial output retained"
+        );
+        let mut raw = [0u8; RECORD_BYTES];
+        input
+            .read_exact(&mut raw)
+            .with_context(|| format!("read custom stream record {record}"))?;
+        let frame =
+            parse(&raw).with_context(|| format!("validate custom stream record {record}"))?;
+        if let Some(index) = previous {
+            ensure!(
+                Some(frame.source_index) == index.checked_add(20),
+                "source index gap/reorder at record {record}; refusing continuous-output claim"
+            );
+        }
+        if let Some(rx2) = receiver {
+            ensure!(
+                rx2 == frame.rx2,
+                "receive input changed at record {record} within custom stream"
+            );
+        }
+        consume(record, records, frame)?;
+        hash.update(raw);
+        previous = Some(frame.source_index);
+        receiver = Some(frame.rx2);
+        first.get_or_insert(frame.source_index);
+    }
+    if records == available {
+        let mut trailing = [0u8; 1];
+        ensure!(
+            input.read(&mut trailing)? == 0,
+            "custom stream grew while it was being processed"
+        );
+    }
+    ensure!(
+        input.get_ref().metadata()?.len() == initial_bytes,
+        "custom stream extent changed while it was being processed"
+    );
+    Ok(Scan {
+        available,
+        records,
+        first,
+        previous,
+        receiver,
+        hash,
+    })
 }
 
 pub(crate) fn decode(
@@ -100,69 +235,48 @@ pub(crate) fn decode(
         (1..=1_000_000).contains(&max_records),
         "invalid record limit"
     );
-    let metadata = std::fs::metadata(path)?;
-    ensure!(
-        metadata.is_file() && metadata.len() % RECORD_BYTES as u64 == 0,
-        "custom stream must be a regular file of complete records"
-    );
-    let available = metadata.len() / RECORD_BYTES as u64;
-    ensure!(available > 0, "empty custom stream");
-    let mut input = BufReader::new(File::open(path)?);
+    // Refuse obviously malformed inputs before creating any derived files.
+    // scan() repeats the check on the descriptor it actually consumes so a
+    // concurrent input replacement cannot bypass validation.
+    available_records(path)?;
     let mut posts = (0..4)
         .map(|_| HostPost::new(1_000_000))
         .collect::<Result<Vec<_>>>()?;
     let mut files = (0..4)
         .map(|i| ChannelFiles::new(directory, i))
         .collect::<Result<Vec<_>>>()?;
-    let mut first = None;
-    let mut previous: Option<u64> = None;
-    let mut receiver = None;
-    let records = available.min(max_records);
-    for _ in 0..records {
-        ensure!(
-            !stop.load(Ordering::Relaxed),
-            "custom stream decoding interrupted; partial output retained"
-        );
-        let mut raw = [0u8; RECORD_BYTES];
-        input.read_exact(&mut raw)?;
-        let frame = parse(&raw)?;
-        if let Some(index) = previous {
-            ensure!(
-                Some(frame.source_index) == index.checked_add(20),
-                "source index gap/reorder; refusing continuous-output claim"
-            );
-        }
-        if let Some(rx2) = receiver {
-            ensure!(
-                rx2 == frame.rx2,
-                "receive input changed within custom stream"
-            );
-        }
-        previous = Some(frame.source_index);
-        receiver = Some(frame.rx2);
-        first.get_or_insert(frame.source_index);
+    let scan = scan(path, Some(max_records), stop, |_, _, frame| {
         for channel in 0..4 {
             if let Some(post) = posts[channel].push(frame.samples[channel]) {
                 files[channel].write(post)?;
             }
         }
-    }
+        Ok(())
+    })?;
     for file in files {
         file.finish()?;
     }
-    Ok(Summary {
-        records,
-        profile_id: PROFILE_ID,
-        profile_source_sample_rate_hz: crate::SAMPLE_RATE,
-        transport_complex_slot_rate_hz: 8_000_000,
-        channel_sample_rate_hz: 1_000_000,
-        phase_words: PROFILE_WORDS,
-        first_source_index: first,
-        last_source_index: previous,
-        receiver: receiver.map(|rx2| if rx2 { "RX2" } else { "RX1" }),
-        input_truncated_to_limit: available > max_records,
-        interpretation: "Parsed profile-1 transport with exact source-index progression and no asserted error flags. The 20 MSps source clock is a profile assumption, not measured by framing. This alone does not prove RF continuity, fitted timing, or hardware execution.",
-    })
+    Ok(scan.summary("decode_and_derive"))
+}
+
+/// Validate every complete record without allocating or publishing channel outputs.
+pub(crate) fn validate(path: &Path, stop: &AtomicBool) -> Result<Summary> {
+    Ok(scan(path, None, stop, |_, _, _| Ok(()))?.summary("validate_only"))
+}
+
+/// Visit a complete stream or an explicitly bounded prefix after validating
+/// each consumed frame. The callback receives the zero-based record number and
+/// the number of records selected from the descriptor opened by this scan.
+pub(crate) fn inspect(
+    path: &Path,
+    max_records: Option<u64>,
+    stop: &AtomicBool,
+    consume: impl FnMut(u64, u64, Frame) -> Result<()>,
+) -> Result<Summary> {
+    if let Some(limit) = max_records {
+        ensure!(limit > 0, "record limit must be positive");
+    }
+    Ok(scan(path, max_records, stop, consume)?.summary("relative_analysis"))
 }
 
 #[cfg(test)]
@@ -198,5 +312,79 @@ mod tests {
         std::fs::create_dir(&output).unwrap();
         assert!(decode(&input, &output, 100, &AtomicBool::new(false)).is_err());
         assert!(!output.join("channel-0.wav").exists());
+    }
+
+    #[test]
+    fn validation_has_no_derived_outputs_or_one_million_record_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("long-records.raw");
+        let mut output = std::io::BufWriter::new(File::create(&input).unwrap());
+        for record in 0..=1_000_000u64 {
+            std::io::Write::write_all(&mut output, &frame(record * 20 + 19, 0x20)).unwrap();
+        }
+        std::io::Write::flush(&mut output).unwrap();
+        drop(output);
+
+        let summary = validate(&input, &AtomicBool::new(false)).unwrap();
+        assert_eq!(summary.records, 1_000_001);
+        assert_eq!(summary.available_records, 1_000_001);
+        assert_eq!(summary.processed_bytes, 1_000_001 * RECORD_BYTES as u64);
+        assert_eq!(summary.first_source_index, Some(19));
+        assert_eq!(summary.last_source_index, Some(20_000_019));
+        assert_eq!(summary.receiver, Some("RX2"));
+        assert!(!summary.input_truncated_to_limit);
+        assert_eq!(summary.mode, "validate_only");
+        assert_eq!(summary.processed_sha256.len(), 64);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn malformed_extent_creates_no_derived_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("truncated.raw");
+        std::fs::write(&input, [0u8; RECORD_BYTES - 1]).unwrap();
+        let output = temp.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+
+        assert!(decode(&input, &output, 100, &AtomicBool::new(false)).is_err());
+        assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn explicit_prefix_rejects_extent_changes_on_the_open_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("growing.raw");
+        let mut raw = Vec::from(frame(19, 0));
+        raw.extend_from_slice(&frame(39, 0));
+        std::fs::write(&input, raw).unwrap();
+
+        let result = inspect(&input, Some(1), &AtomicBool::new(false), |_, _, _| {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&input)?
+                .write_all(&frame(59, 0))?;
+            Ok(())
+        });
+        assert!(
+            format!("{:#}", result.unwrap_err())
+                .contains("extent changed while it was being processed")
+        );
+    }
+
+    #[test]
+    fn summary_hash_and_schema_are_stable_for_a_known_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("one-record.raw");
+        std::fs::write(&input, frame(19, 0)).unwrap();
+
+        let summary = validate(&input, &AtomicBool::new(false)).unwrap();
+        assert_eq!(summary.schema_version, 1);
+        assert_eq!(
+            summary.processed_sha256,
+            "2218bf4c1cd5ce66508b70649eca222ad2a0226c363328ced9b2f690588afb82"
+        );
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["schema_version"], 1);
     }
 }

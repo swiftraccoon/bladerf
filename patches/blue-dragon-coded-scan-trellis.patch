@@ -1,0 +1,178 @@
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -1185,9 +1185,8 @@
+                 }
+             }
+ 
+-            let decoded = fec::viterbi_decode(&soft_coded);
+-            let (_, vit_best_state, termination_metric) =
+-                fec::viterbi_decode_terminated(&soft_coded);
++            let (decoded, vit_best_state, termination_metric) =
++                fec::viterbi_decode_with_metrics(&soft_coded);
+ 
+             if decoded.len() < 37 {
+                 continue;
+@@ -1238,20 +1237,7 @@
+ 
+     let terminated = best_best_state == 0;
+     let advertising = if best_hd <= BLE_MAX_HD {
+-        // Keep the advertising address tolerance and terminated CI unchanged.
+-        if terminated {
+-            let mut soft = coded_soft_symbols(demod, best_block1_start, block1_symbols, sps)?;
+-            if best_invert {
+-                for value in &mut soft {
+-                    *value = -*value;
+-                }
+-            }
+-            let encoded = fec::pattern_demap_s8(&soft);
+-            let (decoded, _, _) = fec::viterbi_decode_terminated(&encoded);
+-            if decoded.len() >= 37 {
+-                best_ci = decoded[32] | (decoded[33] << 1);
+-            }
+-        }
++        // A best final state of zero already gives the terminated path CI.
+         decode_coded_block2(
+             demod,
+             freq,
+diff --git a/crates/protocol/src/fec.rs b/crates/protocol/src/fec.rs
+--- a/crates/protocol/src/fec.rs
++++ b/crates/protocol/src/fec.rs
+@@ -143,75 +143,12 @@
+ /// The soft_coded input has 2*N values (N pairs). Each pair (c0, c1) represents
+ /// the soft-decision coded output. Positive = more likely 0.
+ pub fn viterbi_decode(soft_coded: &[f32]) -> Vec<u8> {
+-    let n_pairs = soft_coded.len() / 2;
+-    if n_pairs == 0 {
+-        return Vec::new();
+-    }
+-
+-    let branches = build_branch_table();
+-
+-    // Path metrics
+-    let mut pm = [f32::NEG_INFINITY; FEC_STATES];
+-    pm[0] = 0.0; // start in state 0
+-
+-    // Traceback: for each step, store (prev_state << 1 | input) per state.
+-    // Use u8 since we have 8 states (3-bit) + 1 bit input = 4 bits needed.
+-    let mut traceback = vec![[0u8; FEC_STATES]; n_pairs];
+-
+-    let mut pm_new;
+-
+-    for step in 0..n_pairs {
+-        let s0 = soft_coded[step * 2];     // soft c0 (positive = 0)
+-        let s1 = soft_coded[step * 2 + 1]; // soft c1 (positive = 0)
+-
+-        pm_new = [f32::NEG_INFINITY; FEC_STATES];
+-        let mut tb_step = [0u8; FEC_STATES];
+-
+-        for state in 0..(FEC_STATES as u8) {
+-            if pm[state as usize] == f32::NEG_INFINITY {
+-                continue;
+-            }
+-            for input in 0u8..2 {
+-                let br = &branches[state as usize][input as usize];
+-                // Branch metric: correlation of soft values with expected outputs
+-                let bm0 = if br.c0 == 0 { s0 } else { -s0 };
+-                let bm1 = if br.c1 == 0 { s1 } else { -s1 };
+-                let metric = pm[state as usize] + bm0 + bm1;
+-
+-                let ns = br.next_state as usize;
+-                if metric > pm_new[ns] {
+-                    pm_new[ns] = metric;
+-                    tb_step[ns] = (state << 1) | input;
+-                }
+-            }
+-        }
+-
+-        pm = pm_new;
+-        traceback[step] = tb_step;
+-    }
+-
+-    // Find best final state
+-    let mut best_state: u8 = 0;
+-    let mut best_metric = f32::NEG_INFINITY;
+-    for s in 0..(FEC_STATES as u8) {
+-        if pm[s as usize] > best_metric {
+-            best_metric = pm[s as usize];
+-            best_state = s;
+-        }
+-    }
+-
+-    // Traceback
+-    let mut decoded = vec![0u8; n_pairs];
+-    let mut state = best_state;
+-    for step in (0..n_pairs).rev() {
+-        let entry = traceback[step][state as usize];
+-        let input = entry & 1;
+-        let prev_state = entry >> 1;
+-        decoded[step] = input;
+-        state = prev_state;
+-    }
++    viterbi_decode_with_metrics(soft_coded).0
++}
+ 
+-    decoded
++/// Return the best path, its final state, and the metric at state 0.
++pub(crate) fn viterbi_decode_with_metrics(soft_coded: &[f32]) -> (Vec<u8>, u8, f32) {
++    viterbi_decode_path(soft_coded, false)
+ }
+ 
+ /// Viterbi decoder with forced termination to state 0.
+@@ -220,6 +157,10 @@
+ /// If the final state 0 has NEG_INFINITY metric, the signal is not a genuine
+ /// terminated block (i.e., false positive from WiFi/interference).
+ pub fn viterbi_decode_terminated(soft_coded: &[f32]) -> (Vec<u8>, u8, f32) {
++    viterbi_decode_path(soft_coded, true)
++}
++
++fn viterbi_decode_path(soft_coded: &[f32], force_state_zero: bool) -> (Vec<u8>, u8, f32) {
+     let n_pairs = soft_coded.len() / 2;
+     if n_pairs == 0 {
+         return (Vec::new(), 0, f32::NEG_INFINITY);
+@@ -273,9 +214,8 @@
+     }
+     let state0_metric = pm[0];
+ 
+-    // Force traceback from state 0 (terminated)
+     let mut decoded = vec![0u8; n_pairs];
+-    let mut state: u8 = 0;
++    let mut state = if force_state_zero { 0 } else { best_state };
+     for step in (0..n_pairs).rev() {
+         let entry = traceback[step][state as usize];
+         let input = entry & 1;
+@@ -411,6 +351,34 @@
+     }
+ 
+     #[test]
++    fn best_viterbi_path_reports_terminated_metrics() {
++        let controls: &[(&[f32], &[u8], &[u8], u8, f32)] = &[
++            (&[-1.0, -1.0], &[1], &[0], 4, -2.0),
++            (
++                &[0.0, 0.0, 1.0, -1.0, -1.0, 1.0, 0.0, 0.0, 1.0, -1.0],
++                &[1, 1, 1, 1, 1],
++                &[0, 1, 0, 0, 0],
++                7,
++                2.0,
++            ),
++            (&[0.0; 8], &[0; 4], &[0; 4], 0, 0.0),
++            (&[], &[], &[], 0, f32::NEG_INFINITY),
++        ];
++        for &(soft, best, forced, expected_state, expected_state_zero) in controls {
++            let (bits, state, state_zero) = viterbi_decode_with_metrics(soft);
++            assert_eq!(bits, best);
++            assert_eq!(state, expected_state);
++            assert_eq!(state_zero.to_bits(), expected_state_zero.to_bits());
++
++            assert_eq!(viterbi_decode(soft), best);
++            let (bits, state, state_zero) = viterbi_decode_terminated(soft);
++            assert_eq!(bits, forced);
++            assert_eq!(state, expected_state);
++            assert_eq!(state_zero.to_bits(), expected_state_zero.to_bits());
++        }
++    }
++
++    #[test]
+     fn test_pattern_map_s8_values() {
+         let coded = vec![0, 1];
+         let symbols = pattern_map_s8(&coded);

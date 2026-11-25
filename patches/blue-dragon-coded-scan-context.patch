@@ -1,0 +1,504 @@
+diff --git a/crates/app/src/pipeline.rs b/crates/app/src/pipeline.rs
+--- a/crates/app/src/pipeline.rs
++++ b/crates/app/src/pipeline.rs
+@@ -19,7 +19,7 @@
+ use bd_dsp::window;
+ use bd_output::pcap::PcapWriter;
+ use bd_protocol::ble::{self, AaCorrelator};
+-use bd_protocol::ble_connection::ConnectionTable;
++use bd_protocol::ble_connection::{CodedScanConnections, ConnectionTable};
+ use bd_protocol::btbb::{self, SyndromeMap};
+ use bd_protocol::Timespec;
+ use bd_sdr::file::{FileSource, SampleFormat};
+@@ -170,6 +170,8 @@
+     let aa_correlator_2m = AaCorrelator::with_sps(1); // LE 2M: SPS=1
+     let syndrome_map = SyndromeMap::new(1);
+     let mut conn_table = ConnectionTable::new();
++    let mut scan_connections =
++        matches!(coded_scan, FileCodedScan::Secondary(_)).then(CodedScanConnections::default);
+     let mut bt_tracker = btbb::PiconetTracker::new();
+     seed_classic_uaps(&mut bt_tracker, classic_uaps);
+     let mut smp_parser = bd_protocol::smp::SmpParser::new();
+@@ -310,7 +312,12 @@
+                 let ordinary_burst = catcher.execute(sample, &ts);
+                 if let Some(scan_burst) = catcher.take_scan_burst() {
+                     record_burst(&mut burst_writer, &scan_burst);
+-                    for result in decode_coded_scan_burst(&scan_burst, &mut fsk, &mut conn_table) {
++                    for result in decode_coded_scan_burst(
++                        &scan_burst,
++                        &mut fsk,
++                        &mut conn_table,
++                        scan_connections.as_mut(),
++                    ) {
+                         let CodedScanResult::Packet(p) = result else {
+                             continue;
+                         };
+@@ -544,6 +551,13 @@
+                                 // Track CONNECT_IND
+                                 if p.aa == ble::BLE_ADV_AA && p.crc_valid {
+                                     conn_table.parse_connect_ind(&p, burst_ts.tv_sec);
++                                    if let Some(connections) = &mut scan_connections {
++                                        if p.phy != ble::BlePhy::PhyCoded {
++                                            let end =
++                                                channel_samples_after(&burst_ts, burst.samples.len());
++                                            connections.observe_request(&p, &end);
++                                        }
++                                    }
+                                 }
+ 
+                                 // Parse SMP from data channel packets
+@@ -1474,18 +1488,27 @@
+     burst: &bd_dsp::burst::Burst,
+     fsk: &mut FskDemod,
+     conn_table: &'a mut ConnectionTable,
++    replay_connections: Option<&mut CodedScanConnections>,
+ ) -> impl Iterator<Item = CodedScanResult> + 'a {
+     let raw_demod = fsk.fm_discriminate_raw(&burst.samples);
+-    let packets = ble::ble_coded_scan_packets(
+-        &raw_demod,
+-        burst.freq,
+-        burst.timestamp.clone(),
+-        &mut |aa| {
+-            conn_table
+-                .lookup(aa)
+-                .map(|connection| (connection.crc_init, true))
+-        },
+-    );
++    let packets = match replay_connections {
++        Some(connections) => ble::ble_coded_replay_packets(
++            &raw_demod,
++            burst.freq,
++            burst.timestamp.clone(),
++            connections,
++        ),
++        None => ble::ble_coded_scan_packets(
++            &raw_demod,
++            burst.freq,
++            burst.timestamp.clone(),
++            &mut |aa| {
++                conn_table
++                    .lookup(aa)
++                    .map(|connection| (connection.crc_init, true))
++            },
++        ),
++    };
+     let (rssi_db, noise_db) = (burst.rssi_db as i32, burst.noise_db as i32);
+     packets
+         .into_iter()
+@@ -1516,7 +1539,7 @@
+     // Scan bursts: coded PHY search only (no BT/BLE 1M/2M)
+     if burst.scan {
+         stats.coded_attempts += 1;
+-        for result in decode_coded_scan_burst(burst, fsk, conn_table) {
++        for result in decode_coded_scan_burst(burst, fsk, conn_table, None) {
+             match result {
+                 CodedScanResult::Packet(packet) => emit_ble(
+                     &packet,
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -1,5 +1,6 @@
+ // Copyright 2025-2026 CEMAXECUTER LLC
+ 
++use crate::ble_connection::CodedScanConnections;
+ use crate::{freq_to_channel, Timespec};
+ 
+ pub const BLE_ADV_AA: u32 = 0x8E89BED6;
+@@ -933,6 +934,41 @@
+     timestamp: Timespec,
+     crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
+ ) -> Vec<BlePacket> {
++    scan_coded_packets(
++        demod,
++        freq,
++        timestamp,
++        &mut CodedScanContext::Lookup(crc_init_fn),
++    )
++}
++
++/// Decode a 2 MSps file replay window using requests earlier in the recording.
++/// Learn valid requests as each packet is accepted, including within this window.
++pub fn ble_coded_replay_packets(
++    demod: &[f32],
++    freq: u32,
++    timestamp: Timespec,
++    connections: &mut CodedScanConnections,
++) -> Vec<BlePacket> {
++    scan_coded_packets(
++        demod,
++        freq,
++        timestamp,
++        &mut CodedScanContext::Replay(connections),
++    )
++}
++
++enum CodedScanContext<'a> {
++    Lookup(&'a mut dyn FnMut(u32) -> Option<(u32, bool)>),
++    Replay(&'a mut CodedScanConnections),
++}
++
++fn scan_coded_packets(
++    demod: &[f32],
++    freq: u32,
++    timestamp: Timespec,
++    context: &mut CodedScanContext<'_>,
++) -> Vec<BlePacket> {
+     let minimum = (CODED_PREAMBLE_SYMBOLS + CODED_BLOCK1_SYMBOLS) * BLE_SPS;
+     if demod.len() < minimum {
+         return Vec::new();
+@@ -976,7 +1012,7 @@
+             attempts += 1;
+             strongest_accounted |= position == strongest;
+             let Some((packet, end)) =
+-                decode_coded_scan_at(demod, freq, &timestamp, crc_init_fn, position)
++                decode_coded_scan_at(demod, freq, &timestamp, context, position)
+             else {
+                 continue;
+             };
+@@ -987,8 +1023,7 @@
+         }
+     }
+     if attempts == chronological_limit && !strongest_accounted {
+-        if let Some((packet, _)) =
+-            decode_coded_scan_at(demod, freq, &timestamp, crc_init_fn, strongest)
++        if let Some((packet, _)) = decode_coded_scan_at(demod, freq, &timestamp, context, strongest)
+         {
+             packets.push(packet);
+             packets.sort_by_key(|packet| (packet.timestamp.tv_sec, packet.timestamp.tv_nsec));
+@@ -1001,20 +1036,33 @@
+     demod: &[f32],
+     frequency: u32,
+     timestamp: &Timespec,
+-    crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
++    context: &mut CodedScanContext<'_>,
+     preamble_start: usize,
+ ) -> Option<(BlePacket, usize)> {
+-    decode_coded_at(
++    let (packet, end) = decode_coded_at(
+         demod,
+         frequency,
+         timestamp.clone(),
+         BLE_SPS,
+         true,
+-        crc_init_fn,
++        &mut |aa, preamble| match context {
++            CodedScanContext::Lookup(lookup) => lookup(aa),
++            CodedScanContext::Replay(connections) => {
++                let started = timestamp_with_sample_offset(timestamp, preamble, BLE_SPS);
++                connections.crc_init_at(aa, &started)
++            }
++        },
+         preamble_start,
+         true,
+     )
+-    .filter(|(packet, _)| packet.crc_checked && packet.crc_valid)
++    .filter(|(packet, _)| packet.crc_checked && packet.crc_valid)?;
++    if let CodedScanContext::Replay(connections) = context {
++        if !packet.is_data && end <= demod.len() {
++            let completed = timestamp_with_sample_offset(timestamp, end, BLE_SPS);
++            connections.observe_request(&packet, &completed);
++        }
++    }
++    Some((packet, end))
+ }
+ 
+ /// LE Coded PHY burst decoder.
+@@ -1070,7 +1118,14 @@
+ ) -> Option<BlePacket> {
+     let preamble_start = find_coded_preamble_freq(demod, sps, max_search, freq)?;
+     decode_coded_at(
+-        demod, freq, timestamp, sps, check_crc, crc_init_fn, preamble_start, false,
++        demod,
++        freq,
++        timestamp,
++        sps,
++        check_crc,
++        &mut |aa, _| crc_init_fn(aa),
++        preamble_start,
++        false,
+     )
+     .map(|(packet, _)| packet)
+ }
+@@ -1090,7 +1145,7 @@
+     timestamp: Timespec,
+     sps: usize,
+     check_crc: bool,
+-    crc_init_fn: &mut dyn FnMut(u32) -> Option<(u32, bool)>,
++    crc_init_fn: &mut dyn FnMut(u32, usize) -> Option<(u32, bool)>,
+     preamble_start: usize,
+     exact_pdu_length: bool,
+ ) -> Option<(BlePacket, usize)> {
+@@ -1222,7 +1277,11 @@
+     }
+ 
+     let connected = strongest_connected.and_then(|(_, block1)| {
+-        let context = crc_init_fn(block1.access_address).filter(|&(_, confirmed)| confirmed)?;
++        // Phase refinement can move the effective preamble earlier. Require
++        // prior context before either candidate start.
++        let start = preamble_start.min(block1.start_sample.saturating_sub(preamble_samples));
++        let context =
++            crc_init_fn(block1.access_address, start).filter(|&(_, confirmed)| confirmed)?;
+         decode_coded_block2(
+             demod,
+             freq,
+@@ -2025,6 +2084,70 @@
+     }
+ 
+     #[test]
++    fn coded_replay_learns_complete_requests_in_sample_order() {
++        let aa = 0xAA08192B;
++        let crc_init = 0xC4C181;
++        let frequency = 2444;
++        let channel = freq_to_channel(frequency);
++        let timestamp = Timespec {
++            tv_sec: 3,
++            tv_nsec: 0,
++        };
++        let pdu = [0x16, 5, 1, 2, 3, 4, 5];
++        let data_packet = |ci| coded_scan_fixture_on_channel(&pdu, ci, aa, crc_init, channel, true);
++        let mut request = [0; 36];
++        request[..2].copy_from_slice(&[5, 34]);
++        request[14..18].copy_from_slice(&aa.to_le_bytes());
++        request[18..21].copy_from_slice(&crc_init.to_le_bytes()[..3]);
++        request[28..30].copy_from_slice(&200u16.to_le_bytes());
++        let setup_packet = |valid_crc| {
++            coded_scan_fixture_on_channel(&request, 0, BLE_ADV_AA, 0x555555, channel, valid_crc)
++        };
++
++        let mut context = CodedScanConnections::default();
++        let mut window = vec![0.0; 512];
++        window.extend(setup_packet(true));
++        let request_completion = window.len();
++        for ci in [1, 0] {
++            window.extend(std::iter::repeat_n(0.0, 512));
++            window.extend(data_packet(ci));
++        }
++        let packets = ble_coded_replay_packets(&window, frequency, timestamp.clone(), &mut context);
++        assert_eq!(
++            packets.iter().map(|packet| packet.aa).collect::<Vec<_>>(),
++            [BLE_ADV_AA, aa, aa]
++        );
++        assert_eq!(packets[1].data[4], 1);
++        assert_eq!(packets[2].data[4], 0);
++        for packet in &packets[1..] {
++            assert_eq!(&packet.data[5..5 + pdu.len()], &pdu);
++            assert!(packet.crc_checked && packet.crc_valid && packet.conn_valid);
++        }
++
++        let mut earlier = vec![0.0; 256];
++        earlier.extend(data_packet(1));
++        assert!(earlier.len() < request_completion);
++        assert!(
++            ble_coded_replay_packets(&earlier, frequency, timestamp.clone(), &mut context)
++                .is_empty(),
++            "later request must not validate data revisited in an overlap"
++        );
++
++        for (valid_crc, cut_samples) in [(false, 0), (true, 48)] {
++            let mut invalid = vec![0.0; 512];
++            invalid.extend(setup_packet(valid_crc));
++            invalid.truncate(invalid.len() - cut_samples);
++            let mut context = CodedScanConnections::default();
++            ble_coded_replay_packets(&invalid, frequency, timestamp.clone(), &mut context);
++            let later = Timespec {
++                tv_sec: timestamp.tv_sec,
++                tv_nsec: 10_000_000,
++            };
++            assert!(ble_coded_replay_packets(&earlier, frequency, later, &mut context).is_empty());
++        }
++    }
++
++    #[test]
+     fn continuous_coded_scan_recovers_both_phases_after_a_bad_crc() {
+         let pdu = [0x02, 0x06, 1, 2, 3, 4, 5, 6];
+         for indicators in [[0, 1], [1, 0]] {
+diff --git a/crates/protocol/src/ble_connection.rs b/crates/protocol/src/ble_connection.rs
+--- a/crates/protocol/src/ble_connection.rs
++++ b/crates/protocol/src/ble_connection.rs
+@@ -1,6 +1,7 @@
+ // Copyright 2025-2026 CEMAXECUTER LLC
+ 
+-use crate::ble::{BlePacket, BLE_ADV_AA};
++use crate::Timespec;
++use crate::ble::{BLE_ADV_AA, BlePacket, BlePhy, crc24};
+ use std::collections::VecDeque;
+ 
+ pub const BLE_MAX_CONNECTIONS: usize = 128;
+@@ -132,6 +133,119 @@
+ const CODED_MEMORY_NS: i64 = 50_000_000;
+ const CODED_MEMORY_ENTRIES: usize = 128;
+ 
++struct ScanConnection {
++    aa: u32,
++    crc_init: Option<u32>,
++    started_ns: u128,
++    completed_ns: u128,
++    expires_ns: u128,
++}
++
++/// CRC initialization observed in one file replay. Keep only the latest
++/// request per access address and evict the oldest at the connection limit.
++/// A request authorizes CRC validation through its declared supervision
++/// timeout. Data decodes and overlapping copies do not renew that interval.
++#[derive(Default)]
++pub struct CodedScanConnections {
++    latest: Vec<ScanConnection>,
++}
++
++impl CodedScanConnections {
++    /// Resolve an address only after its request completed in the recording.
++    pub fn crc_init_at(&self, aa: u32, preamble: &Timespec) -> Option<(u32, bool)> {
++        let at = timespec_ns(preamble);
++        let entry = self.latest.iter().find(|entry| entry.aa == aa)?;
++        if at <= entry.completed_ns || at > entry.expires_ns {
++            return None;
++        }
++        entry.crc_init.map(|crc_init| (crc_init, true))
++    }
++
++    /// Observe a completed non-periodic connection request with a verified CRC.
++    /// Use the containing burst's bounds when the exact packet bounds are unknown.
++    pub fn observe_request(&mut self, packet: &BlePacket, completed: &Timespec) {
++        let Some((aa, crc_init, timeout_ns)) = scan_request(packet) else {
++            return;
++        };
++        let started_ns = timespec_ns(&packet.timestamp);
++        let completed_ns = timespec_ns(completed);
++        if completed_ns <= started_ns {
++            return;
++        }
++        let incoming = ScanConnection {
++            aa,
++            crc_init: Some(crc_init),
++            started_ns,
++            completed_ns,
++            expires_ns: completed_ns + timeout_ns,
++        };
++
++        if let Some(entry) = self.latest.iter_mut().find(|entry| entry.aa == aa) {
++            if started_ns > entry.completed_ns {
++                *entry = incoming;
++            } else if completed_ns >= entry.started_ns && entry.crc_init != incoming.crc_init {
++                // Overlap with conflicting seeds prevents an unambiguous order.
++                entry.crc_init = None;
++                entry.started_ns = entry.started_ns.max(started_ns);
++                entry.completed_ns = entry.completed_ns.max(completed_ns);
++            }
++        } else if self.latest.len() < BLE_MAX_CONNECTIONS {
++            self.latest.push(incoming);
++        } else if let Some(oldest) = self.latest.iter_mut().min_by_key(|entry| entry.started_ns) {
++            if started_ns > oldest.started_ns {
++                *oldest = incoming;
++            }
++        }
++    }
++}
++
++fn timespec_ns(timestamp: &Timespec) -> u128 {
++    u128::from(timestamp.tv_sec) * 1_000_000_000 + u128::from(timestamp.tv_nsec)
++}
++
++fn scan_request(packet: &BlePacket) -> Option<(u32, u32, u128)> {
++    if packet.aa != BLE_ADV_AA
++        || !packet.crc_checked
++        || !packet.crc_valid
++        || packet.len != packet.data.len()
++    {
++        return None;
++    }
++    let offset = match packet.phy {
++        BlePhy::PhyCoded => {
++            if !(2404..=2478).contains(&packet.freq)
++                || packet.freq % 2 != 0
++                || packet.freq == 2426
++                || !matches!(packet.data.get(4), Some(0 | 1))
++            {
++                return None;
++            }
++            5
++        }
++        BlePhy::Phy1M | BlePhy::Phy2M => 4,
++    };
++    if u32::from_le_bytes(packet.data.get(..4)?.try_into().ok()?) != BLE_ADV_AA {
++        return None;
++    }
++    // Core 6.2, Vol 6, Part B sections 2.3.3.1 and 3.1.1 describe the
++    // request payload and advertising CRC initialization.
++    let body = packet.data.get(offset..)?;
++    if body.len() != 39 || body[0] & 0x0F != 5 || body[1] != 34 {
++        return None;
++    }
++    let (pdu, crc) = body.split_at(36);
++    if crc24(pdu, 0x555555).to_le_bytes()[..3] != *crc {
++        return None;
++    }
++    let aa = u32::from_le_bytes(pdu[14..18].try_into().ok()?);
++    let crc_init = u32::from_le_bytes([pdu[18], pdu[19], pdu[20], 0]);
++    let timeout = u16::from_le_bytes(pdu[28..30].try_into().ok()?);
++    if aa == BLE_ADV_AA || !(10..=3200).contains(&timeout) {
++        return None;
++    }
++    Some((aa, crc_init, u128::from(timeout) * 10_000_000))
++}
++
+ /// Connection table: tracks active BLE connections from CONNECT_IND PDUs
+ pub struct ConnectionTable {
+     slots: Vec<BleConnection>,
+@@ -449,6 +563,57 @@
+     }
+ 
+     #[test]
++    fn scan_context_expires_and_rejects_ambiguous_or_older_setup() {
++        let aa = 0xAA08192Bu32;
++        let make_request = |seed: u32, start_ns| {
++            let mut pdu = [0; 36];
++            pdu[..2].copy_from_slice(&[5, 34]);
++            pdu[14..18].copy_from_slice(&aa.to_le_bytes());
++            pdu[18..21].copy_from_slice(&seed.to_le_bytes()[..3]);
++            pdu[28..30].copy_from_slice(&10u16.to_le_bytes());
++            let mut data = BLE_ADV_AA.to_le_bytes().to_vec();
++            data.push(0);
++            data.extend(pdu);
++            data.extend(&crc24(&pdu, 0x555555).to_le_bytes()[..3]);
++            coded_packet(start_ns, 2444, &data)
++        };
++        let time = |tv_nsec| Timespec {
++            tv_sec: 100,
++            tv_nsec,
++        };
++        let mut contexts = CodedScanConnections::default();
++        let first = make_request(0x123456, 10_000_000);
++        contexts.observe_request(&first, &time(11_000_000));
++        assert_eq!(contexts.crc_init_at(aa, &time(11_000_000)), None);
++        assert_eq!(
++            contexts.crc_init_at(aa, &time(111_000_000)),
++            Some((0x123456, true))
++        );
++        let duplicate = make_request(0x123456, 10_000_500);
++        contexts.observe_request(&duplicate, &time(11_000_500));
++        assert_eq!(contexts.crc_init_at(aa, &time(111_000_001)), None);
++
++        let replacement = make_request(0x654321, 120_000_000);
++        contexts.observe_request(&replacement, &time(121_000_000));
++        contexts.observe_request(&first, &time(11_000_000));
++        assert_eq!(contexts.crc_init_at(aa, &time(20_000_000)), None);
++        assert_eq!(
++            contexts.crc_init_at(aa, &time(130_000_000)),
++            Some((0x654321, true))
++        );
++
++        let conflicting = make_request(0xABCDEF, 120_000_500);
++        contexts.observe_request(&conflicting, &time(121_000_500));
++        assert_eq!(contexts.crc_init_at(aa, &time(130_000_000)), None);
++        let next = make_request(0x123456, 140_000_000);
++        contexts.observe_request(&next, &time(141_000_000));
++        assert_eq!(
++            contexts.crc_init_at(aa, &time(150_000_000)),
++            Some((0x123456, true))
++        );
++    }
++
++    #[test]
+     fn test_connection_table_add_lookup() {
+         let mut table = ConnectionTable::new();
+         let init_addr = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
