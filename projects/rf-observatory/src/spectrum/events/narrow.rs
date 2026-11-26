@@ -6,7 +6,7 @@ use std::collections::BinaryHeap;
 use serde::Serialize;
 
 use super::{
-    ACTIVITY_THRESHOLD_DB, CELL_WIDTH_HZ, CellBaseline, Event, FFT, NARROW_MAX_CELLS,
+    ACTIVITY_THRESHOLD_DB, CELL_WIDTH_HZ, CandidateSet, CellBaseline, Event, FFT, NARROW_MAX_CELLS,
     NARROW_WINDOWS,
 };
 
@@ -19,6 +19,15 @@ pub(super) struct SearchReport {
     candidate_limit: usize,
     candidate_count: usize,
     candidates: Vec<Event>,
+}
+
+impl SearchReport {
+    pub(super) fn into_candidates(self) -> CandidateSet {
+        CandidateSet {
+            count: self.candidate_count,
+            retained: self.candidates,
+        }
+    }
 }
 
 pub(super) struct Search {
@@ -63,11 +72,12 @@ impl Search {
                 band.run
                     .get_or_insert(Run {
                         start_window: window,
+                        peak_window: window,
                         contrast_sum_db: 0.0,
                         peak_excess_db: ACTIVITY_THRESHOLD_DB,
                         hit_tile_count: 0,
                     })
-                    .add(target, contrast_db);
+                    .add(window, target, contrast_db);
             } else if let Some(event) =
                 band.finish_run(window, self.lower_edge_hz, self.window_stride)
             {
@@ -140,6 +150,7 @@ impl Band {
             upper_frequency_hz_exclusive: lower_frequency_hz
                 + self.cells as u64 * CELL_WIDTH_HZ as u64,
             peak_excess_db: run.peak_excess_db,
+            peak_window_start_sample: (run.peak_window * stride) as u64,
             hit_tile_count: run.hit_tile_count,
             narrow_contrast_db: Some(run.contrast_sum_db / windows as f64),
         })
@@ -148,16 +159,20 @@ impl Band {
 
 struct Run {
     start_window: usize,
+    peak_window: usize,
     contrast_sum_db: f64,
     peak_excess_db: f64,
     hit_tile_count: usize,
 }
 
 impl Run {
-    fn add(&mut self, target: &[f64], contrast_db: f64) {
+    fn add(&mut self, window: usize, target: &[f64], contrast_db: f64) {
         self.contrast_sum_db += contrast_db;
         for &excess_db in target {
-            self.peak_excess_db = self.peak_excess_db.max(excess_db);
+            if excess_db > self.peak_excess_db {
+                self.peak_excess_db = excess_db;
+                self.peak_window = window;
+            }
             self.hit_tile_count += usize::from(excess_db >= ACTIVITY_THRESHOLD_DB);
         }
     }

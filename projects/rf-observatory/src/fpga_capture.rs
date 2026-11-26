@@ -229,16 +229,14 @@ impl Runner for ProcessRunner {
             }
             Err(error) => return Err(error).context("open custom capture log"),
         };
-        let mut child = crate::AcquisitionChild {
-            child: command
+        let mut child = crate::acquisition::AcquisitionChild::new(
+            command
                 .spawn()
                 .with_context(|| format!("start {} CLI", invocation.stage.label()))?,
-            reaped: false,
-        };
+        );
         let started = Instant::now();
         loop {
-            if let Some(status) = child.child.try_wait()? {
-                child.reaped = true;
+            if let Some(status) = child.try_wait()? {
                 ensure!(
                     status.success(),
                     "{} CLI exited with {status}",

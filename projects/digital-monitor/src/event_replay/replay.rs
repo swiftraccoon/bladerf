@@ -1,5 +1,6 @@
 //! Direct bounded decoder invocations and terminal packet contracts.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::ops::Range;
@@ -214,6 +215,8 @@ pub(crate) struct LaneEvidence {
     #[serde(skip)]
     packet_starts: Vec<u64>,
     #[serde(skip)]
+    validated_ble_counts: BTreeMap<u16, u64>,
+    #[serde(skip)]
     wifi_frame_spans: Option<Vec<Range<u64>>>,
     #[serde(rename = "ht_signal", skip_serializing_if = "Option::is_none")]
     wifi_ht_signal: Option<WifiSignalEvidence>,
@@ -260,6 +263,11 @@ impl SampleOwnership {
 impl LaneEvidence {
     pub(crate) fn validated_packets(&self) -> usize {
         self.validated_packets
+    }
+
+    /// Return the owned CRC-valid Bluetooth LE counts keyed by RF frequency in MHz.
+    pub(crate) fn validated_ble_counts(&self) -> &BTreeMap<u16, u64> {
+        &self.validated_ble_counts
     }
 
     pub(crate) fn packet_starts(&self) -> &[u64] {
@@ -329,6 +337,28 @@ impl LaneEvidence {
 
     pub(crate) fn verify(&self) -> Result<()> {
         self.files.iter().try_for_each(EvidenceFile::verify)
+    }
+
+    /// Bind the pinned Bluetooth request to the exact admitted replay files.
+    pub(crate) fn verify_bluetooth_input(&self, source: &SourceReport) -> Result<()> {
+        let evidence = self
+            .files
+            .request
+            .as_ref()
+            .context("missing pinned Bluetooth replay request")?;
+        let (request, sha256, stamp) = report::read_json_with_snapshot(&evidence.path, JSON_BYTES)?;
+        evidence.verify_stamp(&stamp)?;
+        ensure!(
+            sha256 == evidence.sha256,
+            "Bluetooth replay request changed after verification"
+        );
+        ensure!(
+            request["input"].as_str().map(Path::new) == Some(source.input.as_path())
+                && request["sidecar"].as_str().map(Path::new) == Some(source.sidecar.as_path())
+                && report::required_u64(&request["input_identity"], "length")? == source.bytes,
+            "Bluetooth replay request differs from the admitted IQ input"
+        );
+        Ok(())
     }
 }
 
@@ -590,11 +620,69 @@ fn test_source() -> SourceReport {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn bluetooth_request_binds_paths_extent_and_pinned_bytes() {
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("request.json");
+    let source = test_source();
+    let request = json!({
+        "input": source.input,
+        "sidecar": source.sidecar,
+        "input_identity": { "length": source.bytes },
+    });
+    fs::write(&path, request.to_string()).unwrap();
+    let pin = || EvidenceFile::read_json(path.clone(), JSON_BYTES).unwrap().1;
+    let evidence = LaneEvidence {
+        validated_packets: 0,
+        observed_validated_packets: None,
+        monitor_sha256: String::new(),
+        decoder_sha256: None,
+        files: ReplayFiles {
+            summary: pin(),
+            terminal: pin(),
+            request: Some(pin()),
+            packets: pin(),
+            frame_spans: None,
+            ht_signal_events: None,
+            he_su_signal_events: None,
+        },
+        packet_starts: Vec::new(),
+        validated_ble_counts: BTreeMap::new(),
+        wifi_frame_spans: None,
+        wifi_ht_signal: None,
+        wifi_he_su_signal: None,
+        q11_gain: None,
+    };
+    evidence.verify_bluetooth_input(&source).unwrap();
+    for wrong in [
+        SourceReport {
+            input: "other.iq".into(),
+            ..source.clone()
+        },
+        SourceReport {
+            sidecar: "other.json".into(),
+            ..source.clone()
+        },
+        SourceReport {
+            bytes: source.bytes + 4,
+            ..source.clone()
+        },
+    ] {
+        assert!(evidence.verify_bluetooth_input(&wrong).is_err());
+    }
+    fs::write(&path, format!("{request}\n")).unwrap();
+    assert!(evidence.verify_bluetooth_input(&source).is_err());
+}
+
 struct ReplayInput<'a> {
     source: &'a SourceReport,
     iq: &'a Path,
     start_sample: u64,
     decoder: Option<&'a Path>,
+    workspace: Option<&'a Path>,
     wifi: WifiReplayOptions,
 }
 
@@ -730,13 +818,28 @@ pub(crate) struct WifiTuning {
 }
 
 impl WifiTuning {
+    pub(crate) const SWEEP_MAX_OFFSET_HZ: u64 = 5_000_000;
+
     /// An equal decoder center uses the original samples and decoder contract.
     pub(crate) fn new(capture_frequency_hz: u64, center_mhz: u32) -> Result<Option<Self>> {
+        Self::within_offset(capture_frequency_hz, center_mhz, 2_000_000)
+    }
+
+    /// Use the full offline decoder translation range for a saved sweep.
+    pub(crate) fn for_sweep(capture_frequency_hz: u64, center_mhz: u32) -> Result<Option<Self>> {
+        Self::within_offset(capture_frequency_hz, center_mhz, Self::SWEEP_MAX_OFFSET_HZ)
+    }
+
+    fn within_offset(
+        capture_frequency_hz: u64,
+        center_mhz: u32,
+        maximum_offset_hz: u64,
+    ) -> Result<Option<Self>> {
         let center_frequency_hz = u64::from(center_mhz) * 1_000_000;
         let distance_hz = capture_frequency_hz.abs_diff(center_frequency_hz);
         ensure!(
-            distance_hz <= 2_000_000,
-            "rolling Wi-Fi decoder center must be within 2 MHz of the capture center"
+            distance_hz <= maximum_offset_hz,
+            "Wi-Fi decoder center must be within {maximum_offset_hz} Hz of the capture center"
         );
         let frequency_shift_hz =
             i64::try_from(capture_frequency_hz)? - i64::try_from(center_frequency_hz)?;
@@ -772,6 +875,19 @@ impl WifiTuning {
         );
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn sweep_uses_the_offline_translation_limit_without_widening_rolling_replay() {
+    let center_hz = 2_412_000_000;
+    assert!(WifiTuning::new(center_hz + 3_500_000, 2412).is_err());
+    let tuning = WifiTuning::for_sweep(center_hz + 5_000_000, 2412)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tuning.frequency_shift_hz, 5_000_000);
+    assert_eq!(tuning.translation_filter, Some(WIFI_TRANSLATION_FILTER));
+    assert!(WifiTuning::for_sweep(center_hz + 5_000_001, 2412).is_err());
 }
 
 #[cfg(test)]
@@ -908,6 +1024,9 @@ fn run_input(
     if let Some(decoder) = input.decoder {
         args.extend(["--decoder".into(), decoder.as_os_str().to_owned()]);
     }
+    if let Some(workspace) = input.workspace {
+        args.extend(["--workspace".into(), workspace.as_os_str().to_owned()]);
+    }
     let supervision_started = Instant::now();
     let command = process::run(program, &args, directory, "decode", LOG_BYTES, budget, stop)?;
     let supervised = supervision_started.elapsed();
@@ -932,6 +1051,11 @@ pub(crate) enum ReplayLane<'a> {
     Bluetooth {
         decoder: &'a process::ProgramProvenance,
     },
+    /// Use the explicitly selected workspace for Bluetooth's patched source checks.
+    BluetoothSweep {
+        decoder: &'a process::ProgramProvenance,
+        workspace: &'a Path,
+    },
 }
 
 /// Replay the complete admitted IQ with one pinned decoder and sync its evidence.
@@ -943,11 +1067,18 @@ pub(crate) fn run_full(
     directory: &Path,
     stop: &AtomicBool,
 ) -> Result<LaneEvidence> {
-    let (protocol, blue_dragon, wifi) = match lane {
-        ReplayLane::Wifi(wifi) => (Protocol::Wifi, None, wifi),
+    let (protocol, blue_dragon, workspace, wifi) = match lane {
+        ReplayLane::Wifi(wifi) => (Protocol::Wifi, None, None, wifi),
         ReplayLane::Bluetooth { decoder } => (
             Protocol::Bluetooth,
             Some(decoder),
+            None,
+            WifiReplayOptions::default(),
+        ),
+        ReplayLane::BluetoothSweep { decoder, workspace } => (
+            Protocol::Bluetooth,
+            Some(decoder),
+            Some(workspace),
             WifiReplayOptions::default(),
         ),
     };
@@ -970,6 +1101,7 @@ pub(crate) fn run_full(
             iq: &source.input,
             start_sample,
             decoder: blue_dragon.map(|decoder| decoder.path.as_path()),
+            workspace,
             wifi,
         },
         directory,
@@ -997,19 +1129,15 @@ pub(crate) fn run_full(
         .flatten()
         .for_each(|headers| headers.count_owned(window));
     }
+    let (validated_packets, validated_ble_counts) = count_owned_packets(&replay.packets, ownership);
     Ok(LaneEvidence {
-        validated_packets: ownership.map_or(observed, |window| {
-            replay
-                .packets
-                .iter()
-                .filter(|packet| window.owns(packet.sample))
-                .count()
-        }),
+        validated_packets,
         observed_validated_packets: ownership.map(|_| observed),
         monitor_sha256: program.sha256.clone(),
         decoder_sha256: replay.decoder_sha256,
         files: replay.files,
         wifi_frame_spans: replay.wifi_frame_spans,
+        validated_ble_counts,
         wifi_ht_signal: replay.wifi_ht_signal,
         wifi_he_su_signal: replay.wifi_he_su_signal,
         q11_gain: replay.q11_gain,
@@ -1019,6 +1147,85 @@ pub(crate) fn run_full(
             .map(|packet| packet.sample)
             .collect(),
     })
+}
+
+fn count_owned_packets(
+    packets: &[Packet],
+    ownership: Option<SampleOwnership>,
+) -> (usize, BTreeMap<u16, u64>) {
+    let mut validated_packets = 0;
+    let mut validated_ble_counts = BTreeMap::new();
+    for packet in packets {
+        if ownership.is_some_and(|window| !window.owns(packet.sample)) {
+            continue;
+        }
+        validated_packets += 1;
+        if let Some(frequency_mhz) = packet.ble_frequency_mhz {
+            *validated_ble_counts.entry(frequency_mhz).or_default() += 1;
+        }
+    }
+    (validated_packets, validated_ble_counts)
+}
+
+#[cfg(test)]
+#[test]
+fn ble_frequency_counts_include_only_validated_owned_occurrences() {
+    use std::io::Write;
+
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("packets.jsonl");
+    let mut file = File::create(&path).unwrap();
+    for (index, (status, micros, frequency)) in [
+        ("advertising_crc_valid", 1, 2426),
+        ("connection_crc_valid", 2, 2426),
+        ("connection_crc_valid", 3, 2428),
+        ("crc_invalid", 2, 2428),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "index": index + 1,
+                "validation": status,
+                "timestamp_precision": "microseconds",
+                "timestamp_seconds": 0,
+                "timestamp_fraction": micros,
+                "ble_dewhitened_hex": "10111213141516171819",
+                "frequency_mhz": frequency,
+                "upstream_phy_bits": 0,
+            })
+        )
+        .unwrap();
+    }
+    drop(file);
+    let packets = read_packets(
+        &path,
+        Protocol::Bluetooth,
+        1000,
+        80,
+        3,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .packets;
+    let ownership = SampleOwnership {
+        decoded_start_sample: 1000,
+        owned_start_sample: 1020,
+        owned_end_sample_exclusive: 1060,
+    };
+    assert_eq!(
+        count_owned_packets(&packets, None),
+        (3, BTreeMap::from([(2426, 2), (2428, 1)]))
+    );
+    assert_eq!(
+        count_owned_packets(&packets, Some(ownership)),
+        (2, BTreeMap::from([(2426, 2)]))
+    );
 }
 
 #[cfg(test)]
@@ -1073,6 +1280,7 @@ impl Runner<'_> {
                 iq: &iq,
                 start_sample: slice.start_sample,
                 decoder: None,
+                workspace: None,
                 wifi: WifiReplayOptions::default(),
             },
             directory,

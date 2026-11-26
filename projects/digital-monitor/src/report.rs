@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use data_encoding::HEXLOWER;
 use ring::digest::{self, SHA256};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::input::SourceReport;
@@ -164,6 +164,14 @@ pub(crate) fn read_json_with_snapshot(
     path: &Path,
     maximum_bytes: u64,
 ) -> Result<(Value, String, fs::Metadata)> {
+    read_typed_json_with_snapshot(path, maximum_bytes)
+}
+
+/// Read a bounded structured receipt while retaining its bytes' identity.
+pub(crate) fn read_typed_json_with_snapshot<T: DeserializeOwned>(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<(T, String, fs::Metadata)> {
     ensure!(maximum_bytes > 0, "JSON size limit must be positive");
     let read_limit = maximum_bytes
         .checked_add(1)

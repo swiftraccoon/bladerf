@@ -13,24 +13,23 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use num_complex::Complex;
-use soapysdr::{Direction::Rx, RxReadMetadata};
+use soapysdr::Direction::Rx;
 
 use super::segment_output::{Segment, publish_segment};
-use super::segment_stream::{ReadBlock, SegmentEvent, SegmentPlan, stream_segments};
+use super::segment_stream::{SegmentEvent, SegmentPlan, stream_segments};
 use super::{
-    CHUNK_SAMPLES, FpgaVersion, MAX_DISCARD_INITIAL_SAMPLES, READ_TIMEOUT_US, RadioArgs,
-    SampleRateHz, capture_metadata, interrupt_flag, receive_stream_args, with_active_stream,
+    CHUNK_SAMPLES, END_WITNESS_SAMPLES, FpgaVersion, MAX_DISCARD_INITIAL_SAMPLES, READ_TIMEOUT_US,
+    RadioArgs, STOCK_FPGA_VERSION, SampleRateHz, TIMESTAMPED_SAMPLE_RATE_HZ,
+    TIMESTAMPED_USB_BUFFER_SAMPLES, capture_metadata, interrupt_flag, receive_stream_args,
+    timed_read, with_active_stream,
 };
 
-const SAMPLE_RATE_HZ: f64 = 20_000_000.0;
 const SEGMENT_SAMPLES: usize = 19_988_480;
-const WITNESS_SAMPLES: usize = 8192;
 const MAX_UNSPOOLED_SEGMENTS: u16 = 12;
 const MAX_SPOOLED_SEGMENTS: u16 = 120;
 const MAX_RETIRED_RUN_SEGMENTS: u16 = 3_600;
 const MAX_SPOOL_SLOTS: u16 = 120;
 const MAX_WRITER_QUEUE_DEPTH: u8 = 8;
-const DEFAULT_USB_BUFFER_SAMPLES: u32 = 32_768;
 const MAX_USB_BUFFER_SAMPLES: u32 = 65_536;
 // SC16 Q11 uses four bytes per complex sample. Align to a full 8 KiB
 // metadata buffer so libbladeRF can use the requested size without rounding.
@@ -65,7 +64,7 @@ pub(crate) struct SegmentCaptureArgs {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=i64::from(MAX_WRITER_QUEUE_DEPTH)))]
     writer_queue_depth: u8,
     /// Complex samples per USB transfer, in multiples of 2,048.
-    #[arg(long, default_value_t = DEFAULT_USB_BUFFER_SAMPLES, value_parser = usb_buffer_samples)]
+    #[arg(long, default_value_t = TIMESTAMPED_USB_BUFFER_SAMPLES, value_parser = usb_buffer_samples)]
     usb_buffer_samples: u32,
     /// Allow the consumer to retire released segments using a durable checkpoint.
     #[arg(long, requires = "spool_segments")]
@@ -91,19 +90,6 @@ fn usb_buffer_samples(value: &str) -> Result<u32, String> {
             "USB buffer size must be a multiple of {USB_BUFFER_SAMPLE_ALIGNMENT} from {USB_BUFFER_SAMPLE_ALIGNMENT} through {MAX_USB_BUFFER_SAMPLES} samples"
         ))
     }
-}
-
-fn timed_read(metadata: RxReadMetadata) -> Result<ReadBlock> {
-    ensure!(
-        !metadata.end_abrupt && !metadata.end_burst,
-        "RX driver marked the read as a stream ending"
-    );
-    Ok(ReadBlock {
-        count: metadata.samples,
-        timestamp_ns: metadata
-            .timestamp_ns
-            .context("RX read lacked a timestamp")?,
-    })
 }
 
 fn finish_requested(path: &Path) -> Result<bool> {
@@ -177,13 +163,13 @@ pub(crate) fn capture_segments(args: SegmentCaptureArgs) -> Result<()> {
                 .and_then(|samples| samples.checked_add(discard))
                 .context("segmented capture sample count overflow")?;
             Ok(Duration::from_secs_f64(
-                capture_samples as f64 / SAMPLE_RATE_HZ + 15.0,
+                capture_samples as f64 / TIMESTAMPED_SAMPLE_RATE_HZ + 15.0,
             ))
         })
         .transpose()?;
     let radio = RadioArgs {
         frequency: args.frequency,
-        sample_rate: SAMPLE_RATE_HZ,
+        sample_rate: TIMESTAMPED_SAMPLE_RATE_HZ,
         gain: args.gain,
         channel: 1,
         serial: args.serial,
@@ -207,7 +193,7 @@ pub(crate) fn capture_segments(args: SegmentCaptureArgs) -> Result<()> {
 
     let (recycle, available) =
         prepare_segment_buffers(segments, writer_queue_depth, SEGMENT_SAMPLES)?;
-    let required: FpgaVersion = "0.16.0".parse().map_err(anyhow::Error::msg)?;
+    let required: FpgaVersion = STOCK_FPGA_VERSION.parse().map_err(anyhow::Error::msg)?;
     let device = radio.open(Some(&required))?;
     if let Some(bandwidth) = args.bandwidth_hz {
         device
@@ -224,14 +210,14 @@ pub(crate) fn capture_segments(args: SegmentCaptureArgs) -> Result<()> {
         Some(&required),
     )?;
     ensure!(
-        settings.sample_rate_hz == SAMPLE_RATE_HZ,
+        settings.sample_rate_hz == TIMESTAMPED_SAMPLE_RATE_HZ,
         "timestamp-checked segments require 20 MSps"
     );
     ensure!(
         if args.bandwidth_hz.is_some() {
-            settings.bandwidth_hz > 0.0 && settings.bandwidth_hz <= SAMPLE_RATE_HZ
+            settings.bandwidth_hz > 0.0 && settings.bandwidth_hz <= TIMESTAMPED_SAMPLE_RATE_HZ
         } else {
-            settings.bandwidth_hz == SAMPLE_RATE_HZ
+            settings.bandwidth_hz == TIMESTAMPED_SAMPLE_RATE_HZ
         },
         "unexpected RX1 bandwidth readback: {} Hz",
         settings.bandwidth_hz
@@ -300,7 +286,7 @@ pub(crate) fn capture_segments(args: SegmentCaptureArgs) -> Result<()> {
                         segment_samples: SEGMENT_SAMPLES,
                         segment_count: segments,
                         discard_samples: discard,
-                        witness_samples: WITNESS_SAMPLES,
+                        witness_samples: END_WITNESS_SAMPLES,
                     },
                     |buffer| {
                         ensure!(
@@ -338,6 +324,7 @@ pub(crate) fn capture_segments(args: SegmentCaptureArgs) -> Result<()> {
                             index,
                             timing,
                             finished_on_request,
+                            ..
                         } => enqueue(
                             &sender,
                             Segment {
@@ -486,33 +473,6 @@ mod tests {
         assert!(finish_requested(&marker).is_err());
         fs::write(&marker, []).unwrap();
         assert!(finish_requested(&marker).unwrap());
-    }
-
-    #[test]
-    fn timestamp_zero_is_valid_but_missing_and_ending_flags_are_rejected() {
-        let metadata = RxReadMetadata {
-            samples: 1,
-            timestamp_ns: Some(0),
-            end_burst: false,
-            end_abrupt: false,
-        };
-        assert_eq!(timed_read(metadata).unwrap().timestamp_ns, 0);
-        for invalid in [
-            RxReadMetadata {
-                timestamp_ns: None,
-                ..metadata
-            },
-            RxReadMetadata {
-                end_burst: true,
-                ..metadata
-            },
-            RxReadMetadata {
-                end_abrupt: true,
-                ..metadata
-            },
-        ] {
-            assert!(timed_read(invalid).is_err());
-        }
     }
 
     #[test]

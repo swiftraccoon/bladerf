@@ -2,7 +2,7 @@
 
 use std::f64::consts::TAU;
 use std::fs::{File, Metadata};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek};
 use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -24,7 +24,7 @@ pub(super) const FILTER_HALF_TAPS: usize = 400;
 pub(super) const FILTER_CUTOFF_HZ: u64 = 350_000;
 
 pub(super) struct SavedIq {
-    input: BufReader<File>,
+    input: File,
     before: Metadata,
     source_samples: usize,
 }
@@ -33,10 +33,34 @@ impl SavedIq {
     pub(super) fn open(path: &Path, max_samples: usize, stop: &AtomicBool) -> Result<Self> {
         check_stop(stop)?;
         let (input, length) = file_pin::open_regular(path, (4 * max_samples) as u64)?;
-        ensure!(length.is_multiple_of(4), "clip ends within an I/Q sample");
+        let source = Self::from_file(input, max_samples)?;
+        ensure!(
+            source.before.len() == length,
+            "waveform clip extent changed before reading"
+        );
+        Ok(source)
+    }
+
+    /// Read from sample zero of the supplied inode. The clone shares its cursor.
+    pub(super) fn from_pinned(file: &File, max_samples: usize, stop: &AtomicBool) -> Result<Self> {
+        check_stop(stop)?;
+        Self::from_file(
+            file.try_clone().context("clone pinned IQ descriptor")?,
+            max_samples,
+        )
+    }
+
+    fn from_file(mut input: File, max_samples: usize) -> Result<Self> {
         let before = input.metadata()?;
+        let length = before.len();
+        ensure!(
+            before.is_file() && (1..=(4 * max_samples) as u64).contains(&length),
+            "saved IQ must be a nonempty regular file of at most {max_samples} complex samples"
+        );
+        ensure!(length.is_multiple_of(4), "clip ends within an I/Q sample");
+        input.rewind().context("seek to the start of saved IQ")?;
         Ok(Self {
-            input: BufReader::with_capacity(65_536, input),
+            input,
             before,
             source_samples: length as usize / 4,
         })
@@ -46,12 +70,14 @@ impl SavedIq {
         self.source_samples
     }
 
-    fn finish(&mut self, stop: &AtomicBool) -> Result<()> {
-        ensure!(
-            self.input.read(&mut [0])? == 0,
-            "waveform clip grew while reading"
-        );
-        let after = self.input.get_ref().metadata()?;
+    fn finish(&mut self, whole_file: bool, stop: &AtomicBool) -> Result<()> {
+        if whole_file {
+            ensure!(
+                self.input.read(&mut [0])? == 0,
+                "waveform clip grew while reading"
+            );
+        }
+        let after = self.input.metadata()?;
         let before = &self.before;
         ensure!(
             (
@@ -72,21 +98,28 @@ impl SavedIq {
         check_stop(stop)
     }
 
-    /// Visit complete windows in file order. Validate and hash the entire
-    /// pinned input, including samples past the final complete window.
+    /// Visit complete windows in file order and hash the selected prefix.
+    /// A partial final window is validated and hashed without being visited.
     pub(super) fn read_windows<const SIZE: usize>(
         mut self,
+        samples: usize,
         stop: &AtomicBool,
         mut visit: impl FnMut(&[Complex<f64>; SIZE]),
     ) -> Result<String> {
+        ensure!(
+            (1..=self.source_samples).contains(&samples),
+            "waveform prefix must be nonempty and inside the saved IQ"
+        );
         let mut digest = digest::Context::new(&SHA256);
         let mut raw = vec![0; 4 * SIZE];
         let mut window = [Complex::default(); SIZE];
-        for first in (0..self.source_samples).step_by(SIZE) {
+        let mut input =
+            BufReader::with_capacity(65_536, (&mut self.input).take(4 * samples as u64));
+        for first in (0..samples).step_by(SIZE) {
             check_stop(stop)?;
-            let count = SIZE.min(self.source_samples - first);
+            let count = SIZE.min(samples - first);
             let bytes = &mut raw[..4 * count];
-            self.input
+            input
                 .read_exact(bytes)
                 .context("read saved waveform samples")?;
             digest.update(bytes);
@@ -99,7 +132,8 @@ impl SavedIq {
                 visit(&window);
             }
         }
-        self.finish(stop)?;
+        drop(input);
+        self.finish(samples == self.source_samples, stop)?;
         Ok(HEXLOWER.encode(digest.finish().as_ref()))
     }
 }
@@ -120,12 +154,32 @@ pub(super) struct Baseband {
     pub(super) samples: Vec<Complex<f64>>,
 }
 
+pub(super) enum ClipInput<'a> {
+    Path(&'a Path),
+    Bytes(Vec<u8>),
+}
+
 pub(super) struct SavedClip {
     pub(super) source_sha256: String,
     bytes: Vec<u8>,
 }
 
 impl SavedClip {
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        ensure!(
+            (1..=4 * MAX_INPUT_SAMPLES).contains(&bytes.len()),
+            "saved IQ must contain 1 through {MAX_INPUT_SAMPLES} complex samples"
+        );
+        ensure!(
+            bytes.len().is_multiple_of(4),
+            "clip ends within an I/Q sample"
+        );
+        Ok(Self {
+            source_sha256: HEXLOWER.encode(digest::digest(&SHA256, &bytes).as_ref()),
+            bytes,
+        })
+    }
+
     pub(super) fn source_samples(&self) -> usize {
         self.bytes.len() / 4
     }
@@ -161,11 +215,8 @@ pub(super) fn read_clip(path: &Path, stop: &AtomicBool) -> Result<SavedClip> {
         .input
         .read_exact(&mut bytes)
         .context("read saved waveform clip")?;
-    source.finish(stop)?;
-    Ok(SavedClip {
-        source_sha256: HEXLOWER.encode(digest::digest(&SHA256, &bytes).as_ref()),
-        bytes,
-    })
+    source.finish(true, stop)?;
+    SavedClip::from_bytes(bytes)
 }
 
 fn low_pass() -> Vec<f64> {
@@ -190,7 +241,7 @@ fn low_pass() -> Vec<f64> {
 
 /// Output sample zero is centered on the first requested input sample.
 pub(super) fn channel(
-    path: &Path,
+    input: ClipInput<'_>,
     center_hz: u64,
     target_hz: u64,
     extent: Range<usize>,
@@ -202,7 +253,10 @@ pub(super) fn channel(
         center_hz > 0 && target_hz > 0 && center_hz.abs_diff(target_hz) <= half_rate - 500_000,
         "waveform target requires 500 kHz of margin inside the sampled band"
     );
-    let clip = read_clip(path, stop)?;
+    let clip = match input {
+        ClipInput::Path(path) => read_clip(path, stop)?,
+        ClipInput::Bytes(bytes) => SavedClip::from_bytes(bytes)?,
+    };
     let source_samples = clip.source_samples();
     let padded_end = extent
         .end
@@ -266,7 +320,7 @@ mod tests {
             }
         }
         let result = channel(
-            input.path(),
+            ClipInput::Path(input.path()),
             center,
             target,
             400..15_000,

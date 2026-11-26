@@ -232,7 +232,7 @@ impl IeeeChannelization {
             .with_context(|| format!("missing validated IEEE 802.15.4 channel {channel} input"))
     }
 
-    fn verify_unchanged(&self) -> Result<()> {
+    pub(crate) fn verify_unchanged(&self) -> Result<()> {
         self.channels
             .iter()
             .try_for_each(IeeeChannelInput::verify_unchanged)
@@ -1979,7 +1979,66 @@ pub(crate) fn validate_channelize(
     source: &SourceReport,
     output: &Path,
 ) -> Result<IeeeChannelization> {
-    validate_channelize_for(summary, source, output, IEEE_CHANNELS)
+    validate_channelize_for(summary, source, output, IEEE_CHANNELS, false)
+}
+
+/// Verify one strictly interior IEEE channel selected from a saved sweep.
+pub(crate) fn validate_sweep_channelize(
+    summary: &Value,
+    source: &SourceReport,
+    output: &Path,
+    channel: u8,
+) -> Result<IeeeChannelization> {
+    validate_channelize_filter(summary)?;
+    let channel_report = summary
+        .get("channels")
+        .and_then(Value::as_array)
+        .and_then(|channels| channels.first())
+        .context("IEEE 802.15.4 sweep channelizer summary lacks its channel")?;
+    validate_channelize_geometry(channel_report, source, channel, false)?;
+    validate_channelize_for(summary, source, output, [channel], false)
+}
+
+const IEEE_STOPBAND_EDGE_HZ: u64 = 2_000_000;
+
+fn validate_channelize_filter(summary: &Value) -> Result<()> {
+    ensure!(
+        summary
+            .pointer("/filter/passband_edge_hz")
+            .and_then(Value::as_u64)
+            == Some(1_500_000)
+            && summary
+                .pointer("/filter/stopband_edge_hz")
+                .and_then(Value::as_u64)
+                == Some(IEEE_STOPBAND_EDGE_HZ),
+        "IEEE 802.15.4 channelizer filter margins differ from the reviewed contract"
+    );
+    Ok(())
+}
+
+fn validate_channelize_geometry(
+    channel: &Value,
+    source: &SourceReport,
+    expected_channel: u8,
+    allow_nyquist_edge: bool,
+) -> Result<()> {
+    ensure!(
+        (11..=26).contains(&expected_channel),
+        "IEEE 802.15.4 channel is outside the 2.4 GHz raster"
+    );
+    let center_hz = 2_405_000_000 + u64::from(expected_channel - 11) * 5_000_000;
+    let offset_hz = i64::try_from(center_hz)? - i64::try_from(source.center_frequency_hz)?;
+    let margin = (source.sample_rate_hz / 2)
+        .checked_sub(offset_hz.unsigned_abs() + IEEE_STOPBAND_EDGE_HZ)
+        .context("IEEE 802.15.4 channel falls outside the planned Nyquist range")?;
+    ensure!(
+        (allow_nyquist_edge || margin > 0)
+            && channel["center_frequency_hz"].as_u64() == Some(center_hz)
+            && channel["source_offset_hz"].as_i64() == Some(offset_hz)
+            && channel["source_edge_margin_hz"].as_u64() == Some(margin),
+        "IEEE 802.15.4 channel {expected_channel} has inconsistent Nyquist geometry"
+    );
+    Ok(())
 }
 
 fn validate_channelize_for<const N: usize>(
@@ -1987,6 +2046,7 @@ fn validate_channelize_for<const N: usize>(
     source: &SourceReport,
     output: &Path,
     requested_channels: [u8; N],
+    allow_nyquist_edge: bool,
 ) -> Result<IeeeChannelization> {
     ensure!(
         report::required_u64(summary, "schema_version")? == 1,
@@ -2040,22 +2100,12 @@ fn validate_channelize_for<const N: usize>(
         channels.len() == requested_channels.len(),
         "IEEE 802.15.4 channelizer did not report all requested channels"
     );
-    let includes_channel_19 = requested_channels.contains(&19);
-    const STOPBAND_EDGE_HZ: u64 = 2_000_000;
-    if includes_channel_19 {
+    if allow_nyquist_edge {
         ensure!(
-            source.center_frequency_hz == 2_437_000_000
-                && source.sample_rate_hz == 20_000_000
-                && summary
-                    .pointer("/filter/passband_edge_hz")
-                    .and_then(Value::as_u64)
-                    == Some(1_500_000)
-                && summary
-                    .pointer("/filter/stopband_edge_hz")
-                    .and_then(Value::as_u64)
-                    == Some(STOPBAND_EDGE_HZ),
-            "IEEE 802.15.4 Nyquist-edge plan differs from the reviewed source or filter"
+            source.center_frequency_hz == 2_437_000_000 && source.sample_rate_hz == 20_000_000,
+            "IEEE 802.15.4 Nyquist-edge plan differs from the reviewed source"
         );
+        validate_channelize_filter(summary)?;
     }
     let mut maximum_bytes = 0u64;
     let mut pending_inputs = Vec::with_capacity(requested_channels.len());
@@ -2071,21 +2121,8 @@ fn validate_channelize_for<const N: usize>(
             "IEEE 802.15.4 channelizer did not report channel {expected_channel} exactly once"
         );
         let channel = matches[0];
-        if includes_channel_19 {
-            let raster_index = expected_channel
-                .checked_sub(11)
-                .context("IEEE 802.15.4 channel precedes the 2.4 GHz raster")?;
-            let center_hz = 2_405_000_000 + u64::from(raster_index) * 5_000_000;
-            let offset_hz = i64::try_from(center_hz)? - i64::try_from(source.center_frequency_hz)?;
-            let margin = (source.sample_rate_hz / 2)
-                .checked_sub(offset_hz.unsigned_abs() + STOPBAND_EDGE_HZ)
-                .context("IEEE 802.15.4 channel falls outside the Nyquist-edge plan")?;
-            ensure!(
-                channel["center_frequency_hz"].as_u64() == Some(center_hz)
-                    && channel["source_offset_hz"].as_i64() == Some(offset_hz)
-                    && channel["source_edge_margin_hz"].as_u64() == Some(margin),
-                "IEEE 802.15.4 channel {expected_channel} has inconsistent Nyquist-edge geometry"
-            );
+        if allow_nyquist_edge {
+            validate_channelize_geometry(channel, source, expected_channel, true)?;
         }
         ensure!(
             channel.get("output_format").and_then(Value::as_str) == Some("CF32_LE")
@@ -2844,7 +2881,7 @@ fn ieee802154(
     }
 }
 
-fn ieee_channelize_arguments(
+pub(crate) fn ieee_channelize_arguments(
     source: &SourceReport,
     output: &Path,
     max_samples: u64,
@@ -5632,14 +5669,14 @@ mod tests {
             channel["source_edge_margin_hz"] = json!(margin);
         }
         assert!(validate_channelize(&edged, &source(), &output).is_err());
-        assert!(validate_channelize_for(&edged, &source(), &output, requested).is_err());
+        assert!(validate_channelize_for(&edged, &source(), &output, requested, true).is_err());
         let edge_file = output.join("channel-19.cf32");
         fs::copy(output.join("channel-18.cf32"), &edge_file).unwrap();
         let validated_edge =
-            validate_channelize_for(&edged, &source(), &output, requested).unwrap();
+            validate_channelize_for(&edged, &source(), &output, requested, true).unwrap();
         assert_eq!(validated_edge.channel(19).unwrap().digest.bytes, 1640 * 8);
         edged["channels"][3]["source_edge_margin_hz"] = json!(1);
-        assert!(validate_channelize_for(&edged, &source(), &output, requested).is_err());
+        assert!(validate_channelize_for(&edged, &source(), &output, requested, true).is_err());
 
         let channel_16 = output.join("channel-16.cf32");
         let replacement = output.join("replacement.cf32");

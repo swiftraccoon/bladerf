@@ -9,15 +9,23 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use data_encoding::HEXLOWER;
+use ring::digest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dsp::{self, FixedBank, FloatBank, HostPost, Iq16};
+
+/// Maximum number of original-rate samples retained in one replay prefix.
+pub(crate) const MAX_SHARED_IQ_SAMPLES: u64 = 10_000_000;
+/// Number of original-rate samples between replay cancellation checks.
+pub(crate) const IQ_REPLAY_BLOCK_SAMPLES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Acquisition {
@@ -34,12 +42,108 @@ pub(crate) struct Acquisition {
     channel: String,
     num_samples: u64,
     started_utc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_timing: Option<SampleTiming>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fpga_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_fpga_version: Option<String>,
 }
 
 impl Acquisition {
     pub(crate) fn frequency_hz(&self) -> u64 {
         self.frequency_hz.round() as u64
     }
+
+    /// Device timestamp evidence for a completed single dwell, when requested.
+    pub(crate) fn sample_timing(&self) -> Option<SampleTiming> {
+        self.sample_timing
+    }
+}
+
+/// Bounds of one contiguous 20 MSps RX1 dwell in the device clock domain.
+/// The native receiver read a positive block starting at the exclusive end.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct SampleTiming {
+    first_sample_ns: i64,
+    end_sample_exclusive_ns: i64,
+    witness_samples: u32,
+}
+
+impl SampleTiming {
+    fn validate(self, samples: u64) -> Result<()> {
+        const SAMPLE_PERIOD_NS: i64 = 1_000_000_000 / crate::SAMPLE_RATE as i64;
+        const MAX_WITNESS_SAMPLES: u32 = 8192;
+
+        ensure!(
+            self.first_sample_ns >= 0 && (1..=MAX_WITNESS_SAMPLES).contains(&self.witness_samples),
+            "invalid acquisition sample timing start or witness count"
+        );
+        let duration_ns = i64::try_from(samples)?
+            .checked_mul(SAMPLE_PERIOD_NS)
+            .context("acquisition sample duration overflow")?;
+        ensure!(
+            self.first_sample_ns.checked_add(duration_ns) == Some(self.end_sample_exclusive_ns),
+            "acquisition sample timing extent differs from the saved samples"
+        );
+        self.end_sample_exclusive_ns
+            .checked_add(i64::from(self.witness_samples) * SAMPLE_PERIOD_NS)
+            .context("acquisition sample witness end overflow")?;
+        Ok(())
+    }
+}
+
+/// Maximum error between requested and read-back hosted acquisition centers.
+pub(crate) const ACQUISITION_CENTER_TOLERANCE_HZ: u64 = 10;
+
+pub(crate) const ACQUISITION_SIDECAR_LIMIT: u64 = 64 * 1024;
+
+pub(crate) fn acquisition_sidecar(iq: &Path) -> PathBuf {
+    iq.with_extension("sc16q11.json")
+}
+
+#[derive(Serialize)]
+struct DerivedIqSidecar {
+    format: &'static str,
+    dtype: &'static str,
+    interleave: &'static str,
+    complex_scale: u16,
+    frequency_hz: u64,
+    sample_rate_hz: u32,
+    bandwidth_hz: u32,
+    num_samples: u64,
+    source_kind: &'static str,
+    source_start_sample: u64,
+    continuity_guaranteed: bool,
+}
+
+/// Write replay metadata for an original-rate slice with its source LO and offset.
+///
+/// # Errors
+/// Returns an error if the adjacent sidecar cannot be created, written or synced.
+pub(crate) fn write_derived_iq_sidecar(
+    iq: &Path,
+    center_hz: u64,
+    source_kind: &'static str,
+    source_start_sample: u64,
+    samples: u64,
+) -> Result<()> {
+    crate::json_file(
+        &acquisition_sidecar(iq),
+        &DerivedIqSidecar {
+            format: "SC16_Q11",
+            dtype: "<i2",
+            interleave: "I,Q",
+            complex_scale: 2048,
+            frequency_hz: center_hz,
+            sample_rate_hz: crate::SAMPLE_RATE,
+            bandwidth_hz: crate::SAMPLE_RATE,
+            num_samples: samples,
+            source_kind,
+            source_start_sample,
+            continuity_guaranteed: false,
+        },
+    )
 }
 
 pub(crate) fn validate_acquisition(
@@ -49,12 +153,35 @@ pub(crate) fn validate_acquisition(
     antenna: u8,
     gain: f64,
 ) -> Result<Acquisition> {
-    let mut bytes = Vec::new();
-    File::open(iq.with_extension("sc16q11.json"))?
-        .take(65_537)
+    let (sidecar, length) =
+        crate::file_pin::open_regular(&acquisition_sidecar(iq), ACQUISITION_SIDECAR_LIMIT)?;
+    let mut bytes = Vec::with_capacity(length as usize);
+    sidecar
+        .take(ACQUISITION_SIDECAR_LIMIT + 1)
         .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 65_536, "acquisition sidecar exceeds 64 KiB");
-    let metadata: Acquisition = serde_json::from_slice(&bytes)?;
+    let metadata = validate_acquisition_metadata(&bytes, center, samples, antenna, gain)?;
+    let (_, iq_bytes) = crate::file_pin::open_regular(iq, samples * 4)?;
+    ensure!(
+        iq_bytes == samples * 4,
+        "acquisition count/byte length differs from request"
+    );
+    Ok(metadata)
+}
+
+/// Validate metadata already read from a bounded acquisition sidecar.
+/// The caller checks the corresponding IQ file's byte extent separately.
+pub(crate) fn validate_acquisition_metadata(
+    bytes: &[u8],
+    center: u64,
+    samples: u64,
+    antenna: u8,
+    gain: f64,
+) -> Result<Acquisition> {
+    ensure!(
+        bytes.len() as u64 <= ACQUISITION_SIDECAR_LIMIT,
+        "acquisition sidecar exceeds 64 KiB"
+    );
+    let mut metadata: Acquisition = serde_json::from_slice(bytes)?;
     ensure!(
         metadata.format == "SC16_Q11"
             && metadata.dtype == "<i2"
@@ -65,7 +192,8 @@ pub(crate) fn validate_acquisition(
     ensure!(
         (metadata.sample_rate_hz - 20_000_000.0).abs() <= 1.0
             // The synthesizer has finite tuning resolution; retain its readback.
-            && (metadata.frequency_hz - center as f64).abs() <= 10.0
+            && (metadata.frequency_hz - center as f64).abs()
+                <= ACQUISITION_CENTER_TOLERANCE_HZ as f64
             && (metadata.bandwidth_hz - 20_000_000.0).abs() <= 1.0,
         "acquisition tuning/rate/bandwidth differs from request"
     );
@@ -77,9 +205,27 @@ pub(crate) fn validate_acquisition(
         "acquisition receive state differs from request"
     );
     ensure!(
-        metadata.num_samples == samples && fs::metadata(iq)?.len() == samples * 4,
+        metadata.num_samples == samples,
         "acquisition count/byte length differs from request"
     );
+    if let Some(timing) = metadata.sample_timing {
+        const CHECKED_FPGA_VERSION: &str = "0.16.0";
+
+        ensure!(
+            antenna == 1 && metadata.sample_rate_hz == f64::from(crate::SAMPLE_RATE),
+            "acquisition sample timing requires RX1 at exactly 20 MSps"
+        );
+        timing.validate(samples)?;
+        ensure!(
+            metadata.fpga_version.as_deref() == Some(CHECKED_FPGA_VERSION)
+                && metadata.required_fpga_version.as_deref() == Some(CHECKED_FPGA_VERSION),
+            "acquisition sample timing requires a checked FPGA version of {CHECKED_FPGA_VERSION}"
+        );
+    } else {
+        // FPGA fields belong to the normalized sidecar only as continuity evidence.
+        metadata.fpga_version = None;
+        metadata.required_fpga_version = None;
+    }
     chrono::DateTime::parse_from_rfc3339(&metadata.started_utc)?;
     Ok(metadata)
 }
@@ -105,6 +251,61 @@ pub(crate) fn parse_sample(raw: &[u8]) -> Result<Iq16> {
         "input contains a component outside SC16 Q11"
     );
     Ok(Iq16 { i, q })
+}
+
+/// Validate and visit exactly `samples` I/Q pairs from the current position.
+/// Returns the lowercase SHA-256 of the original bytes. The caller admits the
+/// input and checks the source identity after replay.
+///
+/// # Errors
+/// Returns an error for invalid SC16 Q11, a short read, interruption, or a
+/// failed visit.
+pub(crate) fn read_q11_prefix(
+    input: &mut dyn Read,
+    samples: u64,
+    stop: &AtomicBool,
+    visit: impl FnMut(Iq16, u64) -> Result<()>,
+) -> Result<String> {
+    let mut hash = digest::Context::new(&digest::SHA256);
+    read_q11_range(input, 0..samples, stop, &mut hash, visit)?;
+    Ok(HEXLOWER.encode(hash.finish().as_ref()))
+}
+
+/// Read and validate a range beginning at the reader's current position.
+/// Range bounds label the visited samples and do not seek. Extend the supplied
+/// digest with the exact bytes read, allowing a previously validated prefix.
+///
+/// # Errors
+/// Returns an error for invalid ranges or Q11, short input, interruption, or a
+/// failed visit. The caller must discard incomplete digest and visit state.
+pub(crate) fn read_q11_range(
+    input: &mut dyn Read,
+    samples: Range<u64>,
+    stop: &AtomicBool,
+    hash: &mut digest::Context,
+    mut visit: impl FnMut(Iq16, u64) -> Result<()>,
+) -> Result<()> {
+    const SAMPLE_BYTES: usize = 4;
+    ensure!(samples.start <= samples.end, "invalid IQ replay range");
+    if samples.is_empty() {
+        return Ok(());
+    }
+
+    let mut buffer = vec![0; IQ_REPLAY_BLOCK_SAMPLES * SAMPLE_BYTES];
+    for start in samples.clone().step_by(IQ_REPLAY_BLOCK_SAMPLES) {
+        ensure!(!stop.load(Ordering::Relaxed), "IQ replay interrupted");
+        let count = (samples.end - start).min(IQ_REPLAY_BLOCK_SAMPLES as u64) as usize;
+        let chunk = &mut buffer[..count * SAMPLE_BYTES];
+        input.read_exact(chunk).context("read saved IQ samples")?;
+        hash.update(chunk);
+        for (offset, raw) in chunk.as_chunks::<SAMPLE_BYTES>().0.iter().enumerate() {
+            let index = start + offset as u64;
+            let sample =
+                parse_sample(raw).with_context(|| format!("validate IQ sample {index}"))?;
+            visit(sample, index)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -458,6 +659,16 @@ mod tests {
                 .frequency_hz(),
             97_999_998
         );
+        let aliased = temp.path().join("aliased.sc16q11");
+        let aliased_sidecar = acquisition_sidecar(&aliased);
+        fs::copy(&iq, &aliased).unwrap();
+        std::os::unix::fs::symlink(&sidecar, &aliased_sidecar).unwrap();
+        assert!(validate_acquisition(&aliased, 98_000_000, 20, 2, 40.0).is_err());
+        fs::remove_file(&aliased).unwrap();
+        fs::remove_file(&aliased_sidecar).unwrap();
+        std::os::unix::fs::symlink(&iq, &aliased).unwrap();
+        fs::copy(&sidecar, &aliased_sidecar).unwrap();
+        assert!(validate_acquisition(&aliased, 98_000_000, 20, 2, 40.0).is_err());
         for (field, value) in [
             ("frequency_hz", serde_json::json!(97_999_900)),
             ("sample_rate_hz", serde_json::json!(10_000_000)),

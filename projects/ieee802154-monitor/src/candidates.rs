@@ -26,6 +26,8 @@
 //! Recovered-chip counts are strictly increasing ordering/timing estimates from
 //! the software decoder. They are not hardware sample timestamps or RF time.
 
+mod addressing;
+
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -128,6 +130,8 @@ struct MacObservation {
     source_address_mode: Option<&'static str>,
     sequence_number_status: &'static str,
     sequence_number: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addressing: Option<addressing::Observation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -460,6 +464,7 @@ fn unavailable_mac(status: &'static str, sequence_status: &'static str) -> MacOb
         source_address_mode: None,
         sequence_number_status: sequence_status,
         sequence_number: None,
+        addressing: None,
     }
 }
 
@@ -543,6 +548,7 @@ fn observe_mac(psdu: &[u8]) -> MacObservation {
             .then_some(address_mode((control >> 14) & 0x3)),
         sequence_number_status,
         sequence_number,
+        addressing: None,
     }
 }
 
@@ -731,11 +737,17 @@ pub(crate) fn run(request: Request) -> Result<Summary> {
         counters.records += 1;
         counters.first_chip_count.get_or_insert(chip_count);
         counters.last_chip_count = Some(chip_count);
-        let mac = observe_mac(candidate);
+        let mut mac = observe_mac(candidate);
         match status {
             FcsStatus::LengthInvalid => counters.invalid_length += 1,
             FcsStatus::Invalid => counters.invalid += 1,
             FcsStatus::Valid => {
+                if let Some(control) = mac.frame_control {
+                    mac.addressing = Some(addressing::observe(
+                        &candidate[2..candidate.len() - 2],
+                        control,
+                    ));
+                }
                 counters.valid += 1;
                 counters.validated_bytes = counters
                     .validated_bytes
@@ -1214,6 +1226,52 @@ mod tests {
             "unavailable_for_frame_type"
         );
         assert_eq!(version_dependent.sequence_number, None);
+    }
+
+    #[test]
+    fn adds_only_fcs_valid_wire_addresses_to_the_packet_report() {
+        // Legacy compressed data with short destination and extended source.
+        let body = [
+            0x41, 0xd8, 0x3a, 0x34, 0x12, 0x78, 0x56, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+            0x00,
+        ];
+        let with_fcs = |body: &[u8]| {
+            let mut psdu = body.to_vec();
+            psdu.extend_from_slice(&dot15d4_fcs(body).to_le_bytes());
+            psdu
+        };
+        let valid = with_fcs(&body);
+        let mut corrupt = valid.clone();
+        corrupt[5] ^= 1;
+        let truncated = with_fcs(&body[..body.len() - 1]);
+        let mut archive = archive_header(17);
+        append_record(&mut archive, 100, &valid, 0);
+        append_record(&mut archive, 200, &corrupt, 0);
+        append_record(&mut archive, 300, &truncated, 0);
+
+        let (summary, output) = inspect_bytes(&archive, 3).unwrap();
+        assert_eq!(summary.valid_fcs_record_count, 2);
+        assert_eq!(summary.invalid_fcs_record_count, 1);
+        let lines = fs::read_to_string(output.path().join("out/packets.jsonl")).unwrap();
+        let packets: Vec<serde_json::Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            packets[0]["mac"]["addressing"],
+            serde_json::json!({
+                "status": "observed",
+                "destination_pan_id": 0x1234,
+                "destination_address": {"mode": "short", "value": 0x5678},
+                "source_address": {"mode": "extended", "value": "0011223344556677"},
+            })
+        );
+        assert!(packets[1]["mac"].get("addressing").is_none());
+        assert_eq!(packets[1]["mac"]["sequence_number"], 0x3a);
+        assert_eq!(
+            packets[2]["mac"]["addressing"],
+            serde_json::json!({"status": "truncated_addressing_fields"})
+        );
     }
 
     #[test]

@@ -69,6 +69,8 @@ fn ble_rebase_uses_microseconds_and_key_retains_frequency_and_phy() {
         .unwrap()
         .packets;
     assert!(packets.iter().all(|packet| packet.sample == 4080));
+    assert_eq!(packets[0].ble_frequency_mhz, Some(2426));
+    assert_eq!(packets[1].ble_frequency_mhz, Some(2428));
     assert_ne!(packets[0].key, packets[1].key);
     assert_ne!(packets[0].key, packets[2].key);
 }
@@ -113,6 +115,7 @@ fn packet(key_byte: u8, sample: u64) -> Packet {
         key: [key_byte; 32],
         sample,
         record_index: 1,
+        ble_frequency_mhz: None,
     }
 }
 

@@ -9,8 +9,8 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 use super::{
-    ACTIVITY_THRESHOLD_DB, CELL_WIDTH_HZ, CENTER_GUARD_HZ, EventBand, EventStride, FFT, median,
-    power_db,
+    ACTIVITY_THRESHOLD_DB, CELL_WIDTH_HZ, CENTER_GUARD_HZ, CandidateSet, EventBand,
+    EventCandidates, EventStride, FFT, median, power_db,
 };
 
 mod narrow;
@@ -37,17 +37,35 @@ pub(super) struct Detection {
     narrow_search: Option<narrow::SearchReport>,
 }
 
+impl Detection {
+    pub(super) fn into_candidates(self) -> EventCandidates {
+        EventCandidates {
+            components: CandidateSet {
+                count: self.component_count,
+                retained: self.events,
+            },
+            narrow: self
+                .narrow_search
+                .map(narrow::SearchReport::into_candidates),
+        }
+    }
+}
+
 /// Half-open bounds can enclose tiles below the detection threshold.
 #[derive(Debug, Serialize)]
-struct Event {
-    start_sample: u64,
-    end_sample_exclusive: u64,
-    lower_frequency_hz: u64,
-    upper_frequency_hz_exclusive: u64,
-    peak_excess_db: f64,
+pub(crate) struct Event {
+    pub(crate) start_sample: u64,
+    pub(crate) end_sample_exclusive: u64,
+    pub(crate) lower_frequency_hz: u64,
+    pub(crate) upper_frequency_hz_exclusive: u64,
+    pub(crate) peak_excess_db: f64,
+    /// First sample of the FFT window containing the strongest hit.
+    #[serde(skip)]
+    pub(crate) peak_window_start_sample: u64,
     hit_tile_count: usize,
+    /// Mean excess over the stronger adjacent band when available.
     #[serde(skip_serializing_if = "Option::is_none")]
-    narrow_contrast_db: Option<f64>,
+    pub(crate) narrow_contrast_db: Option<f64>,
 }
 
 struct RankedEvent {
@@ -271,7 +289,8 @@ fn component(
     let mut last_window = 0;
     let mut first_cell = cell_count;
     let mut last_cell = 0;
-    let mut peak_excess_db = ACTIVITY_THRESHOLD_DB;
+    let mut peak_excess_db = f64::NEG_INFINITY;
+    let mut peak_window = 0;
     let mut hit_tile_count: usize = 0;
     while let Some(index) = pending.pop_front() {
         if hit_tile_count.is_multiple_of(1024) {
@@ -283,8 +302,11 @@ fn component(
         last_window = last_window.max(window);
         first_cell = first_cell.min(cell);
         last_cell = last_cell.max(cell);
-        peak_excess_db = peak_excess_db
-            .max(power_db(cell_window_powers[cell][window]) - baselines[cell].median_db);
+        let excess_db = power_db(cell_window_powers[cell][window]) - baselines[cell].median_db;
+        if excess_db > peak_excess_db || (excess_db == peak_excess_db && window < peak_window) {
+            peak_excess_db = excess_db;
+            peak_window = window;
+        }
         hit_tile_count += 1;
 
         if cell > 0 {
@@ -307,6 +329,7 @@ fn component(
         lower_frequency_hz: lower_edge + first_cell as u64 * CELL_WIDTH_HZ as u64,
         upper_frequency_hz_exclusive: lower_edge + (last_cell + 1) as u64 * CELL_WIDTH_HZ as u64,
         peak_excess_db,
+        peak_window_start_sample: (peak_window * window_stride) as u64,
         hit_tile_count,
         narrow_contrast_db: None,
     })

@@ -379,6 +379,8 @@ pub(crate) struct Summary {
     pub(crate) block_ack: BlockAckSummary,
     pub(crate) eapol: EapolSummary,
     pub(crate) advertisements: AdvertisementSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_id_basic_id_observations: Option<u64>,
     pub(crate) frames_by_type: BTreeMap<String, u64>,
     pub(crate) information_element_ids: BTreeMap<String, u64>,
     pub(crate) frames_by_frequency_mhz: BTreeMap<u16, u64>,
@@ -406,6 +408,7 @@ impl Default for Summary {
             block_ack: BlockAckSummary::default(),
             eapol: EapolSummary::default(),
             advertisements: AdvertisementSummary::default(),
+            remote_id_basic_id_observations: None,
             frames_by_type: BTreeMap::new(),
             information_element_ids: BTreeMap::new(),
             frames_by_frequency_mhz: BTreeMap::new(),
@@ -892,6 +895,7 @@ struct InformationElements {
 
 fn information_elements(
     bytes: &[u8],
+    beacon_remote_id: bool,
     record: &mut PacketRecord,
     summary: &mut Summary,
 ) -> InformationElements {
@@ -899,6 +903,7 @@ fn information_elements(
     let mut position = 0;
     let mut layout_complete = true;
     let mut evidence = AdvertisementEvidence::default();
+    let mut remote_id_basic_id_observations = 0;
     while position < bytes.len() {
         if bytes.len() - position < 2 {
             record.warnings.push("truncated_information_element_header");
@@ -1002,6 +1007,14 @@ fn information_elements(
                         }
                     }
                 }
+                if beacon_remote_id {
+                    let basic_ids: Vec<_> =
+                        bladerf_remote_id::wifi_beacon_basic_ids(data).collect();
+                    if !basic_ids.is_empty() {
+                        remote_id_basic_id_observations += basic_ids.len() as u64;
+                        field["remote_id_basic_ids"] = json!(basic_ids);
+                    }
+                }
             }
             255 if !data.is_empty() => {
                 field["extension_id"] = json!(data[0]);
@@ -1031,6 +1044,19 @@ fn information_elements(
             _ => {}
         }
         fields.push(field);
+    }
+    if remote_id_basic_id_observations != 0 {
+        if layout_complete {
+            *summary.remote_id_basic_id_observations.get_or_insert(0) +=
+                remote_id_basic_id_observations;
+        } else {
+            // Preserve the raw completed elements from a truncated IE layout.
+            for field in &mut fields {
+                if let Some(field) = field.as_object_mut() {
+                    field.remove("remote_id_basic_ids");
+                }
+            }
+        }
     }
     InformationElements {
         fields,
@@ -1388,7 +1414,12 @@ fn decode_frame(frame: &[u8], record: &mut PacketRecord, summary: &mut Summary) 
         // SAE commit/confirm and other algorithm-specific authentication data
         // are not an arbitrary sequence of information elements.
         if matches!(subtype, 0..=5 | 8) || (subtype == 11 && matches!(le16(payload), 0..=2)) {
-            let elements = information_elements(&payload[fixed..], record, summary);
+            let elements = information_elements(
+                &payload[fixed..],
+                subtype == 8 && fc & 0x0300 == 0,
+                record,
+                summary,
+            );
             if matches!(subtype, 5 | 8) {
                 let capabilities = le16(&payload[10..]);
                 summary
@@ -1582,6 +1613,9 @@ fn analyze(
     summary.protected_frames += counted.protected_frames;
     summary.eapol.merge(counted.eapol);
     summary.advertisements.merge(counted.advertisements);
+    if let Some(observations) = counted.remote_id_basic_id_observations {
+        *summary.remote_id_basic_id_observations.get_or_insert(0) += observations;
+    }
     for (key, value) in counted.frames_by_type {
         *summary.frames_by_type.entry(key).or_default() += value;
     }
@@ -1962,6 +1996,97 @@ mod tests {
         assert_eq!(fields[3]["rsn"]["akm_suites"][0]["name"], "PSK");
         assert_eq!(fields[3]["rsn"]["pmf_required"], true);
         assert_eq!(fields[3]["rsn"]["pmf_capable"], true);
+    }
+
+    #[test]
+    fn remote_id_requires_an_independently_validated_complete_beacon() {
+        use crate::inventory::{Inventory, Limits, SourceContext, TimestampBasis};
+
+        let mut body = beacon();
+        body.truncate(body.len() - 4);
+        body.extend_from_slice(&[221, 33, 0xfa, 0x0b, 0xbc, 0x0d]);
+        let counter = body.len();
+        body.extend_from_slice(&[7, 0xf2, 25, 1, 0x02, 0x12]);
+        body.extend_from_slice(b"RUST-RID-TEST");
+        body.extend_from_slice(&[0; 10]);
+        let with_fcs = |mut frame: Vec<u8>| {
+            frame.extend_from_slice(&crc32(&frame).to_le_bytes());
+            radio(&frame, FCS_PRESENT)
+        };
+
+        let first = with_fcs(body.clone());
+        body[counter] = 8;
+        let repeated = with_fcs(body.clone());
+        let mut corrupt = first.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let absent = radio(&body, 0);
+        let mut probe_response = body.clone();
+        probe_response[0] = 0x50;
+        let mut truncated = body;
+        truncated.extend_from_slice(&[221, 10, 0]);
+
+        let directory = TestDirectory::new();
+        let input = directory.0.join("input.pcap");
+        let packet_output = directory.0.join("packets.jsonl");
+        fs::write(
+            &input,
+            pcap(
+                ByteOrder::Little,
+                false,
+                DLT_RADIOTAP,
+                &[
+                    first,
+                    repeated,
+                    corrupt,
+                    absent,
+                    with_fcs(probe_response),
+                    with_fcs(truncated),
+                ],
+            ),
+        )
+        .unwrap();
+        let summary = inspect(&input, None, Some(&packet_output)).unwrap();
+        assert_eq!(summary.remote_id_basic_id_observations, Some(2));
+        assert_eq!(summary.invalid_fcs_frames, 1);
+        assert_eq!(summary.absent_fcs_frames, 1);
+        let records: Vec<Value> = fs::read_to_string(packet_output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for (index, record) in records.iter().enumerate() {
+            let ids: Vec<_> = record["frame"]["information_elements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|element| element.get("remote_id_basic_ids"))
+                .collect();
+            if index < 2 {
+                assert_eq!(record["frame"]["bssid"], "02:00:00:00:00:01");
+                assert_eq!(ids.len(), 1);
+                assert_eq!(ids[0][0]["message_counter"], 7 + index);
+                assert_eq!(ids[0][0]["id_text"], "RUST-RID-TEST");
+            } else {
+                assert!(ids.is_empty());
+            }
+        }
+
+        let mut inventory = Inventory::new(Limits::default()).unwrap();
+        inventory
+            .add_pcap(
+                &input,
+                SourceContext {
+                    label: "synthetic".to_owned(),
+                    tuned_frequency_hz: None,
+                    timestamp_basis: TimestampBasis::SampleRelative,
+                },
+            )
+            .unwrap();
+        let ids = &inventory.report().networks["02:00:00:00:00:01"].remote_id_basic_ids;
+        assert_eq!(ids.len(), 1);
+        assert!(!ids[0].basic_id.contains_key("message_counter"));
+        assert_eq!(ids[0].basic_id["id_text"], "RUST-RID-TEST");
+        assert_eq!(ids[0].per_source[&0].frames, 2);
     }
 
     #[test]
@@ -2751,6 +2876,7 @@ mod tests {
         assert!(security_element(&[2, 0, 0, 15, 172, 4, 0, 0, 0, 0], false).is_err());
         let fields = information_elements(
             &[1, 3, 0x82, 0xfa, 0xff],
+            false,
             &mut record(),
             &mut Summary::default(),
         )
@@ -2765,6 +2891,7 @@ mod tests {
     fn extension_ie_ids_distinguish_eht_operation_from_tid_mapping() {
         let extensions = information_elements(
             &[255, 1, 106, 255, 1, 108, 255, 1, 109],
+            false,
             &mut record(),
             &mut Summary::default(),
         )
@@ -2773,7 +2900,7 @@ mod tests {
         assert_eq!(extensions[1]["interpretation"], "EHT_capabilities_raw");
         assert_eq!(extensions[2]["interpretation"], "unrecognized_extension");
         let empty_operation =
-            information_elements(&[61, 0], &mut record(), &mut Summary::default());
+            information_elements(&[61, 0], false, &mut record(), &mut Summary::default());
         assert!(empty_operation.evidence.phy.ht_operation);
         assert_eq!(
             empty_operation.fields[0]["interpretation"],
@@ -2808,6 +2935,7 @@ mod tests {
             &[
                 0, 1, b'a', 48, 2, 1, 0, 221, 4, 0, 0x50, 0xf2, 1, 255, 1, 35, 1, 9, 0,
             ],
+            false,
             &mut rec,
             &mut summary,
         );

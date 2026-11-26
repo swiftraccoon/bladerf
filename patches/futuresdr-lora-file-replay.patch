@@ -1,0 +1,69 @@
+diff --git a/examples/lora/Cargo.toml b/examples/lora/Cargo.toml
+--- a/examples/lora/Cargo.toml
++++ b/examples/lora/Cargo.toml
+@@ -5,6 +5,10 @@
+ license = "GPL-3.0-only"
+ 
+ [workspace]
++
++[features]
++default = ["futuresdr/default", "radio"]
++radio = ["futuresdr/seify", "futuresdr/soapy"]
+ 
+ [dependencies]
+ aes = "0.9"
+@@ -14,7 +18,7 @@
+ clap = { version = "4.6", features = ["derive"] }
+ ctr = "0.10"
+ futuredsp = { path = "../../crates/futuredsp" }
+-futuresdr = { path = "../..", features = ["seify", "soapy"] }
++futuresdr = { path = "../..", default-features = false }
+ meshtastic = "0.1"
+ num-traits = "0.2"
+ rustfft = "6.4"
+@@ -26,3 +30,27 @@
+ rand = "0.10.2"
+ serde = { version = "1.0.229", features = ["derive"] }
+ regex = "1.13.1"
++
++[[bin]]
++name = "rx"
++required-features = ["radio"]
++
++[[bin]]
++name = "rx_all_channels_eu"
++required-features = ["radio"]
++
++[[bin]]
++name = "rx_meshtastic"
++required-features = ["radio"]
++
++[[bin]]
++name = "rx_meshtastic_all_channels"
++required-features = ["radio"]
++
++[[bin]]
++name = "tx"
++required-features = ["radio"]
++
++[[bin]]
++name = "tx_meshtastic"
++required-features = ["radio"]
+diff --git a/examples/lora/src/frame_sync.rs b/examples/lora/src/frame_sync.rs
+--- a/examples/lora/src/frame_sync.rs
++++ b/examples/lora/src/frame_sync.rs
+@@ -704,6 +704,14 @@
+         frame_info.insert(String::from("cfo_int"), Pmt::Isize(m_cfo_int));
+         frame_info.insert(String::from("cfo_frac"), Pmt::F64(self.m_cfo_frac));
+         frame_info.insert(String::from("sf"), Pmt::Usize(self.m_sf.into()));
++        frame_info.insert(
++            String::from("observed_sync_symbol_first"),
++            Pmt::Usize(self.net_id[0].into()),
++        );
++        frame_info.insert(
++            String::from("observed_sync_symbol_second"),
++            Pmt::Usize(self.net_id[1].into()),
++        );
+         frame_info.insert(
+             String::from("timestamp_unix_ns"),
+             Pmt::U64(

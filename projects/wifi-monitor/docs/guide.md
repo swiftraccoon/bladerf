@@ -129,6 +129,15 @@ The inspector accepts classic PCAP with raw IEEE 802.11 or radiotap records.
 PCAPNG is unsupported. FCS presence must be described by the capture metadata;
 unknown or absent FCS is distinct from an independently validated frame.
 
+`packets.jsonl` includes `remote_id_basic_ids` in matching vendor information
+elements from independently FCS-validated, complete, unprotected and
+unfragmented Wi-Fi beacons. Each observation preserves the advertised ID type,
+aircraft type, 20 ID bytes, protocol version and message counter alongside the
+frame's BSSID and PCAP timestamp. The optional summary field
+`remote_id_basic_id_observations` counts individual decoded Basic ID messages.
+The identifiers are unauthenticated broadcast claims. See the
+[Remote ID crate](../../../crates/bladerf-remote-id/README.md) for supported layouts.
+
 ## Survey selected channels
 
 `survey` records one bounded snapshot per selected channel, sequentially, and
@@ -168,6 +177,11 @@ identity. Advertised capabilities describe the transmitted information elements,
 not a successful decode of every advertised PHY.
 Security advertisements retain privacy capability and malformed-element state;
 an absent RSN/WPA element alone does not establish an open network.
+
+The JSON inventory groups Remote ID Basic ID variants under the beacon's BSSID
+and tracks each variant's frame counts and times per source. The transport
+counter remains in packet details and is excluded from inventory grouping.
+Existing variant, sighting and metadata limits also apply to these observations.
 
 Saved PCAP does not necessarily describe its original tuning or clock. The
 default `--clock unknown` keeps first/last timestamps scoped to each input

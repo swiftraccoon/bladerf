@@ -35,6 +35,9 @@ enum Command {
     /// Capture RX1 or RX2 IQ with actual settings in a JSON sidecar.
     #[cfg(feature = "radio")]
     Capture(radio::CaptureArgs),
+    /// Capture ascending frequency dwells on one open receive device.
+    #[cfg(feature = "radio")]
+    CaptureSweep(radio::SweepCaptureArgs),
     /// Save closed, timestamp-checked segments from one stock RX1 stream.
     #[cfg(all(feature = "radio", target_os = "linux", target_env = "gnu"))]
     CaptureSegments(radio::SegmentCaptureArgs),
@@ -84,6 +87,8 @@ fn dispatch(command: Command) -> Result<()> {
     match command {
         #[cfg(feature = "radio")]
         Command::Capture(args) => radio::capture(args),
+        #[cfg(feature = "radio")]
+        Command::CaptureSweep(args) => radio::capture_sweep(args),
         #[cfg(all(feature = "radio", target_os = "linux", target_env = "gnu"))]
         Command::CaptureSegments(args) => radio::capture_segments(args),
         #[cfg(feature = "analysis")]

@@ -378,7 +378,7 @@ impl RetainedFile {
 }
 
 #[derive(Serialize)]
-struct ChannelEvidence {
+pub(crate) struct ChannelEvidence {
     channel: u8,
     channelized_sha256: String,
     candidate_record_count: u64,
@@ -396,6 +396,10 @@ struct ChannelEvidence {
 }
 
 impl ChannelEvidence {
+    pub(crate) fn validated_frames(&self) -> u64 {
+        self.valid_fcs_record_count
+    }
+
     fn verify(&self) -> Result<()> {
         self.inspection.verify()?;
         self.worker_stdout.verify()?;
@@ -443,8 +447,27 @@ impl NominalPlan {
         }
         Ok(())
     }
+}
 
-    fn decode_channel(
+/// Demodulate and independently inspect one validated nominal hard-lane channel.
+pub(crate) struct NominalDecoder<'a> {
+    pub(crate) monitor: &'a ProgramProvenance,
+    pub(crate) worker: &'a ProgramProvenance,
+    pub(crate) executor_threads: Option<u8>,
+}
+
+impl NominalDecoder<'_> {
+    pub(crate) fn decode_channel(
+        &self,
+        channel: u8,
+        channelization: &super::IeeeChannelization,
+        output: &Path,
+        stop: &AtomicBool,
+    ) -> Result<ChannelEvidence> {
+        self.decode_with_ownership(channel, channelization, None, output, stop)
+    }
+
+    fn decode_with_ownership(
         &self,
         channel: u8,
         channelization: &super::IeeeChannelization,
@@ -457,8 +480,8 @@ impl NominalPlan {
         let mut commands = Vec::new();
         let mut interrupted = false;
         let evidence = run_ieee_hypothesis(
-            &self.monitor,
-            &self.worker,
+            self.monitor,
+            self.worker,
             spec,
             channel_input,
             channelization.worker_input_mib,
@@ -523,21 +546,20 @@ impl NominalPlan {
             )?,
             source_index: evidence.source_index,
         };
-        if channel_evidence.source_index.is_some() {
-            // Confirm the retained PCAP is sized for precisely the owned
-            // FCS-valid frame count and the inspector's validated payload.
-            let expected_pcap_bytes = 24
-                + 16 * channel_evidence.valid_fcs_record_count
-                + report::required_u64(&summary, "validated_psdu_bytes")?;
-            ensure!(
-                channel_evidence.validated_pcap.bytes == expected_pcap_bytes,
-                "nominal IEEE validated PCAP extent differs from the owned count"
-            );
-        }
+        // The inspector writes one classic PCAP record per validated PSDU.
+        let expected_pcap_bytes = 24
+            + 16 * channel_evidence.valid_fcs_record_count
+            + report::required_u64(&summary, "validated_psdu_bytes")?;
+        ensure!(
+            channel_evidence.validated_pcap.bytes == expected_pcap_bytes,
+            "nominal IEEE validated PCAP extent differs from the validated frame count"
+        );
         channel_evidence.verify()?;
         Ok(channel_evidence)
     }
+}
 
+impl NominalPlan {
     /// Channelize the complete segment and inspect one hard, zero-offset archive per channel.
     pub(crate) fn run(
         &self,
@@ -637,26 +659,39 @@ impl NominalPlan {
             ChannelOwnership::verify_channelizer_geometry(&manifest)?;
         }
         let channelization = if self.include_channel_19 {
-            validate_channelize_for(&manifest, source, &channelized, IEEE_CHANNELS_WITH_EDGE)?
+            validate_channelize_for(
+                &manifest,
+                source,
+                &channelized,
+                IEEE_CHANNELS_WITH_EDGE,
+                true,
+            )?
         } else {
             validate_channelize(&manifest, source, &channelized)?
         };
+        let decoder = NominalDecoder {
+            monitor: &self.monitor,
+            worker: &self.worker,
+            executor_threads: self.executor_threads,
+        };
         let channels = thread::scope(|scope| {
             let channelization = &channelization;
+            let decoder = &decoder;
             let workers: Vec<_> = requested_channels
                 .iter()
                 .map(|&channel| {
                     thread::Builder::new()
                         .name(format!("rolling-ieee-channel-{channel}"))
                         .spawn_scoped(scope, move || {
-                            self.decode_channel(
-                                channel,
-                                channelization,
-                                channel_ownership,
-                                output,
-                                stop,
-                            )
-                            .with_context(|| format!("nominal IEEE 802.15.4 channel {channel}"))
+                            decoder
+                                .decode_with_ownership(
+                                    channel,
+                                    channelization,
+                                    channel_ownership,
+                                    output,
+                                    stop,
+                                )
+                                .with_context(|| format!("nominal IEEE 802.15.4 channel {channel}"))
                         })
                 })
                 .collect();

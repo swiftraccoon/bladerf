@@ -329,3 +329,106 @@ The RF survey covers the central 16 MHz outside the ±100 kHz guard. IEEE
 802.15.4 decoding covers supported 2.4 GHz O-QPSK on channels 16–18.
 The default 2437 MHz capture excludes the Bluetooth primary advertising
 centers. See the [Wi-Fi PHY coverage](../../wifi-monitor/docs/guide.md#decoder-coverage).
+
+## Identify channels in a saved sweep
+
+Use the directory of a completed [RF observatory sweep](../../rf-observatory/docs/guide.md#sweep-a-frequency-range).
+Keep `sweep.json` schema 1 and the numbered tune directories with their IQ and
+acquisition sidecars together. Identification runs on the saved files without
+opening a radio.
+
+```console
+target/release/digital-monitor identify-sweep captures/observatory-sweep \
+  --output artifacts/digital-monitor/sweep-identification
+```
+
+The default search covers supported 2.4 and 5 GHz Wi-Fi channels and 2.4 GHz
+IEEE 802.15.4 channels 11–26. Choose one with `--protocol wifi` or
+`--protocol ieee802154`. Choose `--protocol bluetooth-le` for Bluetooth LE.
+Repeat `--protocol` to select any combination of the three. The command
+selects the nearest eligible readback per center. For an ordinary sweep, it
+considers all supported channel centers within the requested range. For a
+targeted sweep, it considers the exact requested centers.
+
+Add `--channel-scope eligible` to consider all supported channels that meet the
+decoder tuning limits, including neighboring channels in a targeted capture
+and channels outside an ordinary sweep's requested range. This scope reports
+eligible channels only and records `channel_scope`, `eligible_channel_count`, and
+`planned_decoder_attempt_count`. A report with both counts at zero means there
+was no eligible route for the selected protocols.
+
+Wi-Fi allows an offset of up to 5 MHz, where spectral edges of the channel may
+fall outside the capture. IEEE 802.15.4 requires an offset below 8 MHz and uses
+the nominal hard-decision lane. For each IEEE 802.15.4 result, open
+`channel-<n>-hard-inspection/packets.jsonl` inside its `evidence_directory`
+to read [checked MAC addresses and PAN IDs](../../ieee802154-monitor/docs/guide.md#inspect-demodulator-candidates).
+
+Bluetooth LE uses the nearest supported whole-MHz decoder center (2400–2480 MHz),
+translating by at most 500 kHz. Eligible channel centers lie within 8 MHz of both
+the original and decoder centers. One complete replay supplies all channel rows
+selected from that tune. Its shared `bluetooth.json` records CRC-validated
+packet counts by frequency, source and replay digests, sample extent and any
+translation clipping. Each Bluetooth LE result binds that receipt by SHA-256.
+Temporary translated IQ is removed after replay.
+The Bluetooth replay retains packet-level Ruuvi RAWv2, BTHome v2, and Remote ID
+Basic ID fields when present. [Bluetooth packet fields](../../bluetooth-monitor/docs/guide.md#what-can-be-observed)
+Wi-Fi replay retains Beacon Basic IDs in `decoded/packets.jsonl` inside its
+channel evidence directory. [Wi-Fi packet fields](../../wifi-monitor/docs/guide.md#capture-and-inspect)
+
+Use prebuilt decoders from the same checkout. Override their paths with
+`--wifi-monitor`, `--ieee802154-monitor`, `--ieee-worker`, `--bluetooth-monitor`,
+or `--blue-dragon`. Run from the repository root with the Blue Dragon source
+patches applied, or set `--bluetooth-workspace` to a prepared workspace. See the
+[Blue Dragon build guide](../../bluetooth-monitor/docs/guide.md#build-the-native-engines).
+
+The default limits are 20 million complex samples per selected tune and 64
+decoder attempts. Set them with `--max-samples-per-tune` and `--max-attempts`.
+The limits apply before replay. A selected tune must fit in full, and each
+Bluetooth LE tune counts as one attempt.
+
+Use `--all-visits` to replay every eligible saved visit per channel. Add
+`--series` and pass the series root to include all completed passes. With
+`--series` alone, the nearest visit is selected across the series. Reports
+identify the source pass and tune for each result and keep their evidence in
+separate directories. Bluetooth LE still shares one decoder run per visit.
+
+```console
+target/release/digital-monitor identify-sweep captures/observatory-series \
+  --series --all-visits --protocol wifi --plan-only
+```
+
+Preview checks the limits and lists routes and distinct IQ bytes from the
+receipts. It prints JSON without opening IQ or starting decoders. Set
+`--max-total-samples` to cap the aggregate IQ admitted across distinct visits.
+Replace `--plan-only` with `--output DIRECTORY` to replay the same plan.
+
+The fresh output directory retains per-channel decoder evidence and a terminal
+`identification.json`. SHA-256 digests identify the sweep receipt and the IQ
+and sidecars checked during replay. A channel is identified when its replay
+produces a validated frame. The report distinguishes a missing eligible tune,
+a completed replay without validated frames, and a decoder failure. Decoder
+failures and interruptions return nonzero and retain available evidence. Short
+dwells and tuning gaps can miss traffic.
+
+### Plan a sweep follow-up
+
+Use `plan-sweep-follow-up` to find supported channels that lack an eligible
+readback in a completed sweep. It reads the `sweep.json` receipt and prints a
+schema-1 `plan_sweep_follow_up` JSON object with the source digest, affected
+channels, and the sorted, distinct tuning centers. It runs without decoders
+or a receiver. Select protocols with the same `--protocol` options as
+`identify-sweep`.
+
+```sh
+mkdir -p artifacts
+target/release/digital-monitor plan-sweep-follow-up captures/observatory-sweep \
+  --protocol wifi > artifacts/follow-up.json
+```
+
+Follow-up planning uses the requested channel scope.
+
+Use the plan with [RF observatory's targeted sweep](../../rf-observatory/docs/guide.md#capture-selected-centers)
+then replay the new capture with `identify-sweep`. Its schema-1
+`identification.json` uses operation `identify_targeted_rf_sweep`. An empty
+`centers_hz` array means every selected channel has an eligible tune. A replay
+can still finish without validated frames when it has an eligible tune.

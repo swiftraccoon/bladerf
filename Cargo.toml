@@ -1,11 +1,12 @@
 [workspace]
 default-members = ["tools/bladerf-lab"]
-exclude = ["repos/libcrafter", "vendor/soapysdr-0.5.1"]
+exclude = ["repos/libcrafter", "tools/bladerf-lora-worker", "vendor/soapysdr-0.5.1"]
 members = [
     "crates/bladerf-profile2-loader-ipc",
     "crates/bladerf-profile2-ipc",
     "crates/bladerf-profile2-recovery-ipc",
     "crates/bladerf-profile2-session-ipc",
+    "crates/bladerf-remote-id",
     "projects/bluetooth-monitor",
     "projects/digital-monitor",
     "projects/ieee802154-monitor",

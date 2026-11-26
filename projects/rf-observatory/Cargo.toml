@@ -15,7 +15,7 @@ chrono = { default-features = false, features = ["clock", "std"], version = "0.4
 clap = { features = ["derive"], version = "4.5" }
 ctrlc = { features = ["termination"], version = "3.4" }
 data-encoding = "2"
-nix = { default-features = false, features = ["fs"], version = "0.31" }
+nix = { default-features = false, features = ["fs", "signal"], version = "0.31" }
 ring = { version = "0.17", default-features = false }
 rustfft = "6"
 serde = { features = ["derive"], version = "1" }

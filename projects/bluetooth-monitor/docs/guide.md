@@ -335,6 +335,41 @@ raw bytes remain useful even when a vendor-specific payload has no implemented
 interpretation. Advertised TX power is a field sent by the remote device; it is
 different from received signal amplitude.
 
+CRC-valid advertisements with complete Ruuvi RAWv2 manufacturer data include a
+`ruuvi_raw_v2` object in the corresponding AD field of `packets.jsonl`. Its
+`sensor_id` is the MAC carried in the payload. The packet's advertiser address
+has its own field. The object also reports temperature in millidegrees Celsius,
+relative humidity in ppm (100% equals 1,000,000 ppm), pressure in pascals,
+acceleration in milligravity units in X, Y, Z order, battery voltage in
+millivolts, advertised transmit power in dBm, and motion and measurement
+counters. Unavailable values are null. The `ruuvi_raw_v2_ad_structures` count
+in `summary.json` includes repeated advertisements. Compare the payload ID
+with a known sensor for attribution. [Ruuvi RAWv2 format](https://docs.ruuvi.com/communication/bluetooth-advertisements/data-format-5-rawv2)
+
+CRC-valid 16-bit service data for UUID `0xFCD2` may include a `bthome_v2`
+object. It reports the trigger flag and, for unencrypted data, supported
+button, contact, motion, telemetry and device-type fields. Its `objects`
+array stores `kind` and `value` in wire order, including repeated entries.
+`first_unknown_object_id` marks where interpretation stopped. Encrypted data
+keeps its opaque bytes and an `encrypted` encoding label.
+An embedded address, when present, is separate from the BLE advertiser.
+The packet ID tracks repeated data and the device type identifies a class.
+The optional `bthome_v2_ad_structures` summary count includes repeated
+structures. [BTHome format](https://bthome.io/format/)
+[Reference address extension](https://github.com/Bluetooth-Devices/bthome-ble/commit/1059aa1)
+
+CRC-valid advertisements with complete 16-bit service data for Remote ID
+(`0xFFFA`, application code `0x0D`) may include `remote_id_basic_ids` in the AD
+field of `packets.jsonl`. Each entry reports the advertised identifier, ID
+type, aircraft type, protocol version and message counter. `id_hex` preserves
+all 20 identifier bytes. `id_text` is present for printable serial or
+registration IDs. The packet's BLE advertiser address has its own field. The
+optional `remote_id_basic_id_observations` summary count includes repeated
+messages.
+Extended packets qualify when their header identifies the start of advertising
+data and the AD structure is contained in that packet. The values are sender
+claims. [OpenDroneID wire layout](https://github.com/opendroneid/opendroneid-core-c/blob/8384b6a4cbe4a3a7ecfff2fbf71f03d38852e366/libopendroneid/opendroneid.h#L423-L437)
+
 ## Decoder scope
 
 The capture layer reuses upstream SDR demodulation. The maintained orchestration
@@ -443,11 +478,14 @@ git -C repos/blue-dragon apply ../../patches/blue-dragon-coded-scan-s2-metrics.p
 git -C repos/blue-dragon apply ../../patches/blue-dragon-coded-scan-omit-squelch-iq.patch
 git -C repos/blue-dragon apply ../../patches/blue-dragon-coded-scan-narrow-fallback.patch
 git -C repos/blue-dragon apply ../../patches/blue-dragon-coded-scan-phase-fallback.patch
+git -C repos/blue-dragon apply ../../patches/blue-dragon-le1m-advertising-crc.patch
 cp config/blue-dragon.Cargo.lock repos/blue-dragon/Cargo.lock
 cargo build --release --locked --manifest-path repos/blue-dragon/Cargo.toml -p blue-dragon --no-default-features --features bladerf --target-dir build/blue-dragon --jobs 2
 ```
 
 The PFB patches streamline coefficient wrapping and the eight-tap AVX2 path.
+The LE 1M patch prefers a complete, CRC-valid advertising packet when burst
+padding would favor a shifted header under the length heuristic.
 The optional [AGC cutoff patch](../../../patches/blue-dragon-agc-gain-cutoff.patch)
 moves the squelch threshold comparison into gain units. Use it on runtimes
 where the rounded `f32` RSSI is monotone over the AGC gain clamp. Apply it

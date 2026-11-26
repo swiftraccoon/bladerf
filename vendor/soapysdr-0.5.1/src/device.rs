@@ -1334,6 +1334,9 @@ unsafe impl<E: StreamSample> Send for RxStream<E> {}
 
 impl<E: StreamSample> Drop for RxStream<E> {
     fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
         unsafe {
             if self.active {
                 self.deactivate(None).ok();
@@ -1344,6 +1347,31 @@ impl<E: StreamSample> Drop for RxStream<E> {
 }
 
 impl<E: StreamSample> RxStream<E> {
+    /// Close an inactive receive stream and report the native result.
+    ///
+    /// Call [`Self::deactivate`] first if the stream is active. This consumes
+    /// the stream and may block while the driver stops receive operations. A
+    /// native close error leaves the device's stream state uncertain. The
+    /// wrapper relinquishes the handle after one native close attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream is active or if the driver fails to close
+    /// it. An active stream follows the usual best-effort cleanup on drop.
+    pub fn close(mut self) -> Result<(), Error> {
+        if self.active {
+            return Err(Error {
+                code: ErrorCode::Other,
+                message: "Deactivate the receive stream before closing it".into(),
+            });
+        }
+
+        let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
+        // SAFETY: setup created this handle for the device retained by self.
+        // Consuming self and clearing its handle makes this the only close.
+        unsafe { check_ret_error(SoapySDRDevice_closeStream(self.device.inner.ptr, handle)) }
+    }
+
     /// Get the stream's maximum transmission unit (MTU) in number of elements.
     ///
     /// The MTU specifies the maximum payload transfer in a stream operation.

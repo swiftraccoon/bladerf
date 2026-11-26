@@ -1,0 +1,233 @@
+diff --git a/crates/protocol/src/ble.rs b/crates/protocol/src/ble.rs
+--- a/crates/protocol/src/ble.rs
++++ b/crates/protocol/src/ble.rs
+@@ -513,53 +513,86 @@
+ 
+     let channel = freq_to_channel(freq);
+ 
+-    let mut smallest_delta: u32 = 0xffffffff;
+-    let mut smallest_offset: usize = 0;
+-    let mut smallest_aa: u32 = 0;
+-    let mut smallest_header_len: u8 = 0;
+-
+-    // Try three candidates for AA start position
+-    for i in 6..9 {
+-        if i + 32 + 16 >= bits_len {
++    let mut smallest_delta = 20;
++    let mut by_length = None;
++    let mut advertising = None;
++
++    for offset in 6..9 {
++        if offset + 32 + 16 >= bits_len {
+             continue;
+         }
+-        let mut aa: u32 = 0;
+-        for j in 0..32 {
+-            aa |= (bits[i + j] as u32) << j;
+-        }
+-        let mut header_len: u8 = 0;
+-        for j in 0..8u32 {
+-            let whiten_bit = whitening_bit(channel, 8 + j);
+-            header_len |= (bits[i + 32 + 8 + j as usize] ^ whiten_bit) << j;
+-        }
+-        let bit_len = 8 + 32 + 16 + (header_len as u32) * 8 + 24;
+-        let delta = (bits_len as i32) - (bit_len as i32);
+-        if delta > 0 && (delta as u32) < smallest_delta {
+-            smallest_delta = delta as u32;
+-            smallest_offset = i;
+-            smallest_aa = aa;
+-            smallest_header_len = header_len;
+-        }
+-    }
+-
+-    if smallest_delta >= 20 {
+-        return None;
+-    }
+-
++        let mut aa = 0_u32;
++        for bit in 0..32 {
++            aa |= u32::from(bits[offset + bit]) << bit;
++        }
++        let mut payload_bytes = 0_u8;
++        for bit in 0..8 {
++            let whiten_bit = whitening_bit(channel, 8 + bit as u32);
++            payload_bytes |= (bits[offset + 32 + 8 + bit] ^ whiten_bit) << bit;
++        }
++        let packet_bits = 32 + 16 + usize::from(payload_bytes) * 8 + 24;
++        let candidate = Ble1mStart {
++            offset,
++            aa,
++            payload_bytes,
++        };
++        if check_crc && aa == BLE_ADV_AA && offset + packet_bits <= bits_len {
++            advertising = Some(candidate);
++        }
++
++        let delta = bits_len.saturating_sub(8 + packet_bits);
++        if delta > 0 && delta < smallest_delta {
++            smallest_delta = delta;
++            by_length = Some(candidate);
++        }
++    }
++
++    // Burst padding can make a shifted header look closer to the burst length.
++    // A complete advertising packet can establish its start and extent by CRC.
++    if let Some(candidate) = advertising {
++        let packet =
++            decode_ble_1m_at(bits, candidate, freq, timestamp.clone(), true, &mut crc_init_fn);
++        if packet.crc_valid || by_length == Some(candidate) {
++            return Some(packet);
++        }
++    }
++    by_length.map(|candidate| {
++        decode_ble_1m_at(bits, candidate, freq, timestamp, check_crc, &mut crc_init_fn)
++    })
++}
++
++#[derive(Clone, Copy, Eq, PartialEq)]
++struct Ble1mStart {
++    offset: usize,
++    aa: u32,
++    payload_bytes: u8,
++}
++
++fn decode_ble_1m_at(
++    bits: &[u8],
++    candidate: Ble1mStart,
++    freq: u32,
++    timestamp: Timespec,
++    check_crc: bool,
++    crc_init_fn: &mut impl FnMut(u32) -> Option<(u32, bool)>,
++) -> BlePacket {
++    let Ble1mStart { offset, aa, payload_bytes } = candidate;
++    let channel = freq_to_channel(freq);
++    let bits_len = bits.len();
+     // Build packet
+-    let pkt_len = 4 + 2 + smallest_header_len as usize + 3;
++    let pkt_len = 4 + 2 + payload_bytes as usize + 3;
+     let mut data = vec![0u8; pkt_len.max(64)];
+ 
+-    data[0] = (smallest_aa >> 0) as u8;
+-    data[1] = (smallest_aa >> 8) as u8;
+-    data[2] = (smallest_aa >> 16) as u8;
+-    data[3] = (smallest_aa >> 24) as u8;
++    data[0] = (aa >> 0) as u8;
++    data[1] = (aa >> 8) as u8;
++    data[2] = (aa >> 16) as u8;
++    data[3] = (aa >> 24) as u8;
+ 
+     for i in 0..(pkt_len - 4) {
+         let mut byte: u8 = 0;
+         for j in 0..8u32 {
+             let wb = whitening_bit(channel, i as u32 * 8 + j);
+-            let bit_idx = smallest_offset + 32 + i * 8 + j as usize;
++            let bit_idx = offset + 32 + i * 8 + j as usize;
+             if bit_idx < bits_len {
+                 byte |= (bits[bit_idx] ^ wb) << j;
+             }
+@@ -567,7 +600,7 @@
+         data[i + 4] = byte;
+     }
+ 
+-    let is_data = smallest_aa != BLE_ADV_AA;
++    let is_data = aa != BLE_ADV_AA;
+ 
+     // CRC validation
+     let mut crc_checked = false;
+@@ -575,7 +608,7 @@
+     let mut conn_valid = false;
+ 
+     if check_crc {
+-        if smallest_aa == BLE_ADV_AA {
++        if aa == BLE_ADV_AA {
+             // Advertising AA: always use 0x555555
+             let crc_len = pkt_len - 4 - 3;
+             let computed = crc24(&data[4..4 + crc_len], 0x555555);
+@@ -586,7 +619,7 @@
+             crc_valid = computed == received;
+         } else {
+             // Data channel: look up connection for CRC init
+-            if let Some((init, valid)) = crc_init_fn(smallest_aa) {
++            if let Some((init, valid)) = crc_init_fn(aa) {
+                 let crc_len = pkt_len - 4 - 3;
+                 let computed = crc24(&data[4..4 + crc_len], init);
+                 let received = data[pkt_len - 3] as u32
+@@ -609,8 +642,8 @@
+         None
+     };
+ 
+-    Some(BlePacket {
+-        aa: smallest_aa,
++    BlePacket {
++        aa,
+         freq,
+         len: pkt_len,
+         data,
+@@ -623,7 +656,7 @@
+         conn_valid,
+         phy: BlePhy::Phy1M,
+         ext_header,
+-    })
++    }
+ }
+ 
+ /// LE 2M preamble-first BLE detection.
+@@ -1258,6 +1291,58 @@
+         assert_eq!(freq_to_channel(2478), 36);
+     }
+ 
++    #[test]
++    fn test_ble_burst_prefers_complete_crc_valid_advertising() {
++        let mut pdu = [0_u8; 33];
++        pdu[..12].copy_from_slice(&[0x42, 31, 0, 5, 4, 3, 2, 0xc1, 24, 0xff, 0x99, 4]);
++        // With six retained preamble bits, the offset-8 candidate reports a
++        // larger payload that fits the burst tail better than the real frame.
++        let mut bits = vec![0, 1, 0, 1, 0, 1];
++        bits.extend((0..32).map(|bit| ((BLE_ADV_AA >> bit) & 1) as u8));
++        let body = pdu.into_iter().chain([0x87, 0xf2, 0x47]); // Independent CRC-24/BLE.
++        bits.extend(
++            body.flat_map(|byte| (0..8).map(move |bit| (byte >> bit) & 1))
++                .enumerate()
++                .map(|(index, bit)| bit ^ whitening_bit(37, index as u32)),
++        );
++        let complete = bits.len();
++        let decode = |bits: &[u8], check_crc| {
++            ble_burst(
++                bits,
++                2402,
++                crate::Timespec { tv_sec: 0, tv_nsec: 0 },
++                check_crc,
++                |_| None,
++            )
++        };
++
++        bits.resize(complete + 19, 0);
++        let advertising = decode(&bits, true).unwrap();
++        assert_eq!(advertising.aa, BLE_ADV_AA);
++        assert!(!advertising.is_data);
++        assert!(advertising.crc_checked && advertising.crc_valid);
++        assert_eq!(advertising.data.len(), 40);
++        assert_eq!(&advertising.data[4..37], &pdu);
++        assert_eq!(&advertising.data[37..], &[0x87, 0xf2, 0x47]);
++
++        let unchecked = decode(&bits, false).unwrap();
++        assert_eq!(unchecked.aa, 0xe3a2_6fb5);
++        assert!(unchecked.is_data && !unchecked.crc_checked && !unchecked.crc_valid);
++
++        // The missing CRC bit would dewhiten to zero if padded.
++        assert!(decode(&bits[..complete - 1], true).is_none());
++        assert!(decode(&bits[..complete], true).unwrap().crc_valid);
++        bits[complete - 1] ^= 1;
++        let fallback = decode(&bits, true).unwrap();
++        assert_eq!(fallback.aa, unchecked.aa);
++        assert!(fallback.is_data && !fallback.crc_checked && !fallback.crc_valid);
++
++        bits.truncate(complete + 4);
++        let bad_advertising = decode(&bits, true).unwrap();
++        assert_eq!(bad_advertising.aa, BLE_ADV_AA);
++        assert!(bad_advertising.crc_checked && !bad_advertising.crc_valid);
++    }
++
+     /// End-to-end test: construct a known BLE advertising packet,
+     /// whiten it, convert to bit array, and verify ble_burst decodes it
+     /// with correct CRC.

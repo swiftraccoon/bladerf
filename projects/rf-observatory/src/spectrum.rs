@@ -7,7 +7,9 @@
 
 mod events;
 
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,11 +20,15 @@ use ring::digest::{self, SHA256};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::Serialize;
 
+pub(crate) use events::Event;
+
 pub(crate) const FFT: usize = 8192;
 const POWER_FLOOR: f64 = 1e-24;
-const CELL_WIDTH_HZ: f64 = 100_000.0;
-const USABLE_HALF_SPAN_HZ: f64 = 8_000_000.0;
-const CENTER_GUARD_HZ: f64 = 100_000.0;
+pub(crate) const CELL_WIDTH_HZ: f64 = 100_000.0;
+/// Extent of the inner activity grid on each side of the tuning center.
+pub(crate) const USABLE_HALF_SPAN_HZ: f64 = 8_000_000.0;
+/// Half-width of the center region excluded from activity inference.
+pub(crate) const CENTER_GUARD_HZ: f64 = 100_000.0;
 const CANDIDATE_HALF_WIDTH_HZ: f64 = 80_000.0;
 const ACTIVITY_THRESHOLD_DB: f64 = 6.0;
 const CELL_COUNT: usize = EventBand::Inner.cell_count();
@@ -67,15 +73,27 @@ enum WindowLayout {
     Contiguous,
     ContiguousWithEvents {
         band: EventBand,
-        stride: EventStride,
+        event_windows: EventWindows,
         include_active_window_ranges: bool,
     },
+}
+
+enum InputExtent {
+    Prefix(u64),
+    Interval(Range<u64>),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum EventStride {
     Contiguous,
     HalfWindow,
+}
+
+/// Select one event stride or retain both independently from a shared FFT pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EventWindows {
+    Stride(EventStride),
+    Both,
 }
 
 impl EventStride {
@@ -139,6 +157,17 @@ pub(crate) struct ActivityDetection {
     interpretation: &'static str,
 }
 
+impl ActivityDetection {
+    /// Return inner-grid cells whose mean power clears the frequency baseline threshold.
+    pub(crate) fn mean_activity_cells(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        self.cells.iter().enumerate().filter_map(|(index, cell)| {
+            let excess = cell.mean_excess_over_frequency_baseline_db;
+            (cell.excluded_reason.is_none() && excess >= ACTIVITY_THRESHOLD_DB)
+                .then_some((index, excess))
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ContiguousWindowExtent {
     stride_samples: usize,
@@ -173,8 +202,8 @@ pub(crate) struct EventReport {
     sample_rate_hz: u32,
     source_format: &'static str,
     input_samples: u64,
-    analyzed_samples: u64,
-    analyzed_prefix_sha256: String,
+    pub(crate) analyzed_samples: u64,
+    pub(crate) analyzed_prefix_sha256: String,
     window_samples: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     window_stride_samples: Option<usize>,
@@ -189,6 +218,41 @@ pub(crate) struct EventReport {
     narrow_contrast_method: Option<&'static str>,
     #[serde(flatten)]
     detection: events::Detection,
+    #[serde(skip)]
+    overlap_detection: Option<events::Detection>,
+}
+
+impl EventReport {
+    /// Return the counts and retained candidates for each detector run.
+    pub(crate) fn into_candidates(self) -> EventCandidateSets {
+        EventCandidateSets {
+            primary: self.detection.into_candidates(),
+            overlap: self
+                .overlap_detection
+                .map(events::Detection::into_candidates),
+        }
+    }
+}
+
+pub(crate) struct EventCandidateSets {
+    /// Candidates on the selected grid, or the contiguous grid when scanning both.
+    pub(crate) primary: EventCandidates,
+    /// Half-window candidates when scanning both grids.
+    pub(crate) overlap: Option<EventCandidates>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EventCandidates {
+    pub(crate) components: CandidateSet,
+    /// Present when the adjacent-band contrast search ran.
+    pub(crate) narrow: Option<CandidateSet>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CandidateSet {
+    /// Number of candidates before applying the detector's retention limit.
+    pub(crate) count: usize,
+    pub(crate) retained: Vec<Event>,
 }
 
 fn power_db(power: f64) -> f64 {
@@ -218,6 +282,14 @@ fn quantile(values: &[f64], fraction: f64) -> f64 {
 
 fn overlaps(low: f64, high: f64, other_low: f64, other_high: f64) -> bool {
     low < other_high && high > other_low
+}
+
+/// Sum the inclusive candidate band in frequency order over sorted linear-power bins.
+fn candidate_power(bins: &[(f64, f64)], frequency_hz: f64) -> f64 {
+    let first =
+        bins.partition_point(|&(bin_hz, _)| bin_hz - frequency_hz < -CANDIDATE_HALF_WIDTH_HZ);
+    let end = bins.partition_point(|&(bin_hz, _)| bin_hz - frequency_hz <= CANDIDATE_HALF_WIDTH_HZ);
+    bins[first..end].iter().map(|&(_, power)| power).sum()
 }
 
 fn activity_regions(cells: &[ActivityCell]) -> Vec<ActivityRegion> {
@@ -408,13 +480,85 @@ pub(crate) fn survey_with_events(
     include_active_window_ranges: bool,
     stop: &AtomicBool,
 ) -> Result<(Report, EventReport)> {
-    let (report, events) = survey_with_layout(
-        path,
+    let (mut file, _) = crate::receiver::input(path)?;
+    survey_file_with_events(
+        &mut file,
         center,
         max_samples,
+        band,
+        stride,
+        include_active_window_ranges,
+        stop,
+    )
+}
+
+/// Survey an already opened recording so callers can extract IQ from the same inode.
+pub(crate) fn survey_file_with_events(
+    file: &mut File,
+    center: u64,
+    max_samples: u64,
+    band: EventBand,
+    stride: EventStride,
+    include_active_window_ranges: bool,
+    stop: &AtomicBool,
+) -> Result<(Report, EventReport)> {
+    survey_event_extent(
+        file,
+        center,
+        InputExtent::Prefix(max_samples),
+        band,
+        EventWindows::Stride(stride),
+        include_active_window_ranges,
+        stop,
+    )
+}
+
+/// Survey an exact sample interval in an already admitted recording.
+///
+/// The half-open endpoints are on the absolute FFT grid. The output's sample
+/// offsets are relative to the interval start. The event digest covers exactly
+/// the interval's Q11 bytes, and the descriptor advances to its end on success.
+/// With overlap, shared samples are read once. With both strides selected,
+/// each detector uses its own grid and scores the same samples independently.
+///
+/// # Errors
+/// Returns an error for an invalid interval or IQ sample, a short read, a
+/// changed file, or interruption. The caller verifies the source path.
+pub(crate) fn survey_file_interval_with_events(
+    file: &mut File,
+    center: u64,
+    interval: Range<u64>,
+    event_windows: EventWindows,
+    narrow: bool,
+    stop: &AtomicBool,
+) -> Result<(Report, EventReport)> {
+    survey_event_extent(
+        file,
+        center,
+        InputExtent::Interval(interval),
+        EventBand::Inner,
+        event_windows,
+        narrow,
+        stop,
+    )
+}
+
+fn survey_event_extent(
+    file: &mut File,
+    center: u64,
+    extent: InputExtent,
+    band: EventBand,
+    event_windows: EventWindows,
+    include_active_window_ranges: bool,
+    stop: &AtomicBool,
+) -> Result<(Report, EventReport)> {
+    let (report, events) = survey_file_with_layout(
+        file,
+        center,
+        extent,
         WindowLayout::ContiguousWithEvents {
             band,
-            stride,
+            event_windows,
             include_active_window_ranges,
         },
         stop,
@@ -432,35 +576,76 @@ fn survey_with_layout(
     layout: WindowLayout,
     stop: &AtomicBool,
 ) -> Result<(Report, Option<EventReport>)> {
-    ensure!(
-        (1..=crate::MAX_SAMPLES).contains(&max_samples),
-        "invalid spectrum sample limit"
-    );
+    let (mut file, _) = crate::receiver::input(path)?;
+    survey_file_with_layout(
+        &mut file,
+        center,
+        InputExtent::Prefix(max_samples),
+        layout,
+        stop,
+    )
+}
+
+fn survey_file_with_layout(
+    file: &mut File,
+    center: u64,
+    extent: InputExtent,
+    layout: WindowLayout,
+    stop: &AtomicBool,
+) -> Result<(Report, Option<EventReport>)> {
+    if let InputExtent::Prefix(max_samples) = &extent {
+        ensure!(
+            (1..=crate::MAX_SAMPLES).contains(max_samples),
+            "invalid spectrum sample limit"
+        );
+    }
     if let WindowLayout::Distributed(requested) = layout {
         ensure!(
             (1..=512).contains(&requested),
             "invalid spectrum window count"
         );
     }
-    let (mut file, available) = crate::receiver::input(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len().is_multiple_of(4),
+        "spectrum requires a regular file of complete complex i16 samples"
+    );
+    let available = metadata.len() / 4;
+    let interval = match extent {
+        InputExtent::Prefix(max_samples) => 0..available.min(max_samples),
+        InputExtent::Interval(interval) => {
+            ensure!(
+                interval.start < interval.end
+                    && interval.end <= available
+                    && interval.end - interval.start <= crate::MAX_SAMPLES
+                    && interval.start.is_multiple_of(FFT as u64)
+                    && interval.end.is_multiple_of(FFT as u64),
+                "spectrum interval must be a nonempty range of complete FFT windows in the saved extent and within the sample limit"
+            );
+            interval
+        }
+    };
+    file.seek(SeekFrom::Start(interval.start * 4))?;
     let locate_events = matches!(layout, WindowLayout::ContiguousWithEvents { .. });
-    let (band, event_stride, include_active_window_ranges) = match layout {
+    let (band, event_windows, include_active_window_ranges) = match layout {
         WindowLayout::ContiguousWithEvents {
             band,
-            stride,
+            event_windows,
             include_active_window_ranges,
-        } => (band, stride, include_active_window_ranges),
-        _ => (EventBand::Inner, EventStride::Contiguous, false),
-    };
-    let event_input_metadata = locate_events.then(|| file.metadata()).transpose()?;
-    ensure!(
-        event_input_metadata.as_ref().is_none_or(
-            |metadata| metadata.len() / 4 == available && metadata.len().is_multiple_of(4)
+        } => (band, event_windows, include_active_window_ranges),
+        _ => (
+            EventBand::Inner,
+            EventWindows::Stride(EventStride::Contiguous),
+            false,
         ),
-        "event survey IQ extent changed before analysis"
-    );
+    };
+    let (primary_stride, fft_stride) = match event_windows {
+        EventWindows::Stride(stride) => (stride, stride),
+        EventWindows::Both => (EventStride::Contiguous, EventStride::HalfWindow),
+    };
+    let event_input_metadata = locate_events.then_some(metadata);
     let mut event_input_digest = locate_events.then(|| digest::Context::new(&SHA256));
-    let samples = available.min(max_samples);
+    let samples = interval.end - interval.start;
     ensure!(
         samples >= FFT as u64,
         "spectrum requires at least {FFT} samples"
@@ -470,7 +655,7 @@ fn survey_with_layout(
         WindowLayout::Distributed(requested) => requested.min(complete_windows),
         WindowLayout::Contiguous | WindowLayout::ContiguousWithEvents { .. } => complete_windows,
     };
-    let stride_samples = event_stride.samples();
+    let stride_samples = fft_stride.samples();
     let overlap = stride_samples < FFT;
     let processed_windows = if overlap {
         (samples as usize - FFT) / stride_samples + 1
@@ -510,7 +695,7 @@ fn survey_with_layout(
         ensure!(!stop.load(Ordering::Relaxed), "spectrum interrupted");
         if matches!(layout, WindowLayout::Distributed(_)) && windows > 1 {
             let offset = window as u64 * (samples - FFT as u64) / (windows - 1) as u64;
-            file.seek(SeekFrom::Start(offset * 4))?;
+            file.seek(SeekFrom::Start((interval.start + offset) * 4))?;
         }
         // Hash only the fresh suffix after reusing the shared half of a window.
         let retained_bytes = if overlap && window > 0 {
@@ -600,12 +785,7 @@ fn survey_with_layout(
         ) {
             continue;
         }
-        let power = linear
-            .iter()
-            .filter(|(f, _)| (*f - frequency).abs() <= CANDIDATE_HALF_WIDTH_HZ)
-            .map(|(_, p)| p)
-            .sum::<f64>();
-        ranked.push((frequency, power));
+        ranked.push((frequency, candidate_power(&linear, frequency)));
     }
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut candidates: Vec<Bin> = Vec::new();
@@ -630,19 +810,37 @@ fn survey_with_layout(
     let activity_detection =
         activity_detection(center, samples, windows, inner_powers, layout, stop)?;
     let event_report = if let Some(digest) = event_input_digest {
-        let event_powers = overlapping_event_powers
+        let overlap_powers = overlapping_event_powers
             .as_deref()
             .unwrap_or(&cell_window_powers);
+        let primary_overlaps = matches!(primary_stride, EventStride::HalfWindow);
+        let primary_powers = if primary_overlaps {
+            overlap_powers
+        } else {
+            &cell_window_powers
+        };
         let detection = events::locate(
-            event_powers,
+            primary_powers,
             band,
             center,
-            event_stride,
+            primary_stride,
             include_active_window_ranges,
             stop,
         )?;
+        let overlap_detection = if matches!(event_windows, EventWindows::Both) {
+            Some(events::locate(
+                overlap_powers,
+                band,
+                center,
+                EventStride::HalfWindow,
+                include_active_window_ranges,
+                stop,
+            )?)
+        } else {
+            None
+        };
         Some(EventReport {
-            schema_version: match (include_active_window_ranges, overlap) {
+            schema_version: match (include_active_window_ranges, primary_overlaps) {
                 (true, _) => 3,
                 (false, true) => 2,
                 (false, false) => 1,
@@ -655,8 +853,8 @@ fn survey_with_layout(
             analyzed_samples: ((processed_windows - 1) * stride_samples + FFT) as u64,
             analyzed_prefix_sha256: HEXLOWER.encode(digest.finish().as_ref()),
             window_samples: FFT,
-            window_stride_samples: (overlap || include_active_window_ranges)
-                .then_some(stride_samples),
+            window_stride_samples: (primary_overlaps || include_active_window_ranges)
+                .then_some(primary_stride.samples()),
             cell_width_hz: CELL_WIDTH_HZ as u64,
             usable_half_span_hz: band.half_span_hz(),
             center_guard_hz: CENTER_GUARD_HZ as u64,
@@ -667,6 +865,7 @@ fn survey_with_layout(
             narrow_contrast_method: include_active_window_ranges
                 .then_some("mean_target_excess_minus_stronger_adjacent_band"),
             detection,
+            overlap_detection,
         })
     } else {
         None
@@ -762,6 +961,22 @@ mod tests {
             excluded_reason: None,
             activity_triggered: triggered,
         }
+    }
+
+    #[test]
+    fn candidate_power_includes_both_band_edges() {
+        let center = 915_000_000.0;
+        let half_width = CANDIDATE_HALF_WIDTH_HZ;
+        let bins = [
+            (center - half_width - 1.0, 100.0),
+            (center - half_width, 2.0),
+            (center, 4.0),
+            (center + half_width, 8.0),
+            (center + half_width + 1.0, 100.0),
+        ];
+        assert_eq!(candidate_power(&bins, center), 14.0);
+        assert_eq!(candidate_power(&bins, center - 3.0 * half_width), 0.0);
+        assert_eq!(candidate_power(&bins, center + 3.0 * half_width), 0.0);
     }
 
     #[test]
@@ -968,6 +1183,94 @@ mod tests {
                 && event["lower_frequency_hz"].as_f64().unwrap() <= tone_frequency
                 && tone_frequency < event["upper_frequency_hz_exclusive"].as_f64().unwrap()
         ));
+    }
+
+    #[test]
+    fn interval_survey_reads_and_hashes_only_the_selected_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("interval.iq");
+        let center = 100_000_000;
+        let tone_bin = 900.0;
+        let tone_frequency = center as f64 + tone_bin * f64::from(crate::SAMPLE_RATE) / FFT as f64;
+        write_iq(&path, 7, |window, index| {
+            let background = noise(window, index, 8.0);
+            match window {
+                // Invalid Q11 outside the interval catches accidental extra reads.
+                0 | 6 => Complex::new(3000.0, 0.0),
+                3 => background + analytic(tone_bin, index, 700.0),
+                _ => background,
+            }
+        });
+        let mut input = File::open(&path).unwrap();
+        let stop = AtomicBool::new(false);
+        let start = FFT as u64;
+        let end = 6 * FFT as u64;
+        let (report, events) = survey_file_interval_with_events(
+            &mut input,
+            center,
+            start..end,
+            EventWindows::Stride(EventStride::Contiguous),
+            true,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(report.windows, 5);
+        assert_eq!(report.inspected_prefix_samples, end - start);
+        assert_eq!(events.analyzed_samples, end - start);
+        assert_eq!(input.stream_position().unwrap(), end * 4);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            events.analyzed_prefix_sha256,
+            format!("{:x}", Sha256::digest(&bytes[FFT * 4..6 * FFT * 4]))
+        );
+        let candidates = events.into_candidates().primary;
+        assert!(candidates.narrow.is_some());
+        assert!(candidates.components.retained.iter().any(|event| {
+            event.start_sample == 2 * FFT as u64
+                && event.end_sample_exclusive == 3 * FFT as u64
+                && event.lower_frequency_hz as f64 <= tone_frequency
+                && tone_frequency < event.upper_frequency_hz_exclusive as f64
+        }));
+        let (overlapped, events) = survey_file_interval_with_events(
+            &mut input,
+            center,
+            start..end,
+            EventWindows::Stride(EventStride::HalfWindow),
+            true,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(input.stream_position().unwrap(), end * 4);
+        assert_eq!(events.analyzed_samples, end - start);
+        assert_eq!(events.window_stride_samples, Some(FFT / 2));
+        assert_eq!(
+            events.analyzed_prefix_sha256,
+            format!("{:x}", Sha256::digest(&bytes[FFT * 4..6 * FFT * 4]))
+        );
+        assert_eq!(
+            serde_json::to_vec(&overlapped).unwrap(),
+            serde_json::to_vec(&report).unwrap()
+        );
+
+        for invalid in [
+            start..start,
+            start + 1..end,
+            start..end + 1,
+            start..end + 2 * start,
+        ] {
+            assert!(
+                survey_file_interval_with_events(
+                    &mut input,
+                    center,
+                    invalid,
+                    EventWindows::Both,
+                    false,
+                    &stop,
+                )
+                .is_err()
+            );
+            assert_eq!(input.stream_position().unwrap(), end * 4);
+        }
     }
 
     #[test]

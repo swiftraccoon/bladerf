@@ -16,7 +16,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::packets::{self, ValidatedPacket};
 
@@ -162,6 +162,14 @@ pub(crate) struct Advertisement {
     pub(crate) security: Vec<Value>,
 }
 
+/// One Basic ID claim and the validated beacon ranges that carried it.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RemoteIdBasicId {
+    #[serde(flatten)]
+    pub(crate) basic_id: Map<String, Value>,
+    pub(crate) per_source: BTreeMap<usize, Seen>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Network {
     pub(crate) bssid: String,
@@ -171,6 +179,8 @@ pub(crate) struct Network {
     pub(crate) frame_types: BTreeMap<String, u64>,
     pub(crate) ssids: BTreeMap<String, Ssid>,
     pub(crate) advertisements: Vec<Advertisement>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) remote_id_basic_ids: Vec<RemoteIdBasicId>,
     pub(crate) advertised_features: BTreeSet<String>,
     pub(crate) advertised_channels: BTreeSet<u8>,
     pub(crate) reported_frequencies_mhz: BTreeSet<u16>,
@@ -426,6 +436,7 @@ impl Inventory {
                     frame_types: BTreeMap::new(),
                     ssids: BTreeMap::new(),
                     advertisements: Vec::new(),
+                    remote_id_basic_ids: Vec::new(),
                     advertised_features: BTreeSet::new(),
                     advertised_channels: BTreeSet::new(),
                     reported_frequencies_mhz: BTreeSet::new(),
@@ -465,7 +476,7 @@ impl Inventory {
                 .insert("infrastructure_bssid_reference".to_owned());
         }
         if advertisement {
-            self.advertisement(&mut network, frame, packet.warnings)?;
+            self.advertisement(&mut network, source_id, packet)?;
         }
         self.report.networks.insert(bssid.to_owned(), network);
         Ok(())
@@ -474,9 +485,10 @@ impl Inventory {
     fn advertisement(
         &mut self,
         network: &mut Network,
-        frame: &Value,
-        warnings: &[&str],
+        source_id: usize,
+        packet: ValidatedPacket<'_>,
     ) -> Result<()> {
+        let frame = packet.frame;
         let capability_bits = u16::try_from(
             frame["capabilities"]
                 .as_u64()
@@ -494,6 +506,7 @@ impl Inventory {
         let max = self.report.limits.max_variants_per_network;
         let mut security = Vec::new();
         let mut seen_ssids = BTreeSet::new();
+        let mut seen_basic_ids = BTreeSet::new();
         for ie in frame["information_elements"]
             .as_array()
             .into_iter()
@@ -567,14 +580,32 @@ impl Inventory {
                     }
                 }
             }
+            for message in ie["remote_id_basic_ids"].as_array().into_iter().flatten() {
+                let mut basic_id = message
+                    .as_object()
+                    .context("invalid Basic ID evidence")?
+                    .clone();
+                basic_id.remove("message_counter");
+                let index = self.retain_basic_id(network, basic_id)?;
+                if seen_basic_ids.insert(index) {
+                    update_seen(
+                        &mut network.remote_id_basic_ids[index].per_source,
+                        source_id,
+                        packet.timestamp_ns,
+                        &mut self.sightings,
+                        self.report.limits.max_sightings,
+                    )?;
+                }
+            }
         }
         let advertisement = Advertisement {
             capability_bits,
             privacy_capability: capability_bits & 0x10 != 0,
-            ie_layout_complete: !warnings
+            ie_layout_complete: !packet
+                .warnings
                 .iter()
                 .any(|warning| warning.starts_with("truncated_information_element")),
-            security_malformed: warnings.iter().any(|warning| {
+            security_malformed: packet.warnings.iter().any(|warning| {
                 matches!(
                     *warning,
                     "malformed_rsn_information_element" | "malformed_wpa_information_element"
@@ -591,6 +622,31 @@ impl Inventory {
             network.advertisements.push(advertisement);
         }
         Ok(())
+    }
+
+    fn retain_basic_id(
+        &mut self,
+        network: &mut Network,
+        basic_id: Map<String, Value>,
+    ) -> Result<usize> {
+        if let Some(index) = network
+            .remote_id_basic_ids
+            .iter()
+            .position(|known| known.basic_id == basic_id)
+        {
+            return Ok(index);
+        }
+        let index = network.remote_id_basic_ids.len();
+        ensure!(
+            index < self.report.limits.max_variants_per_network,
+            "network Remote ID Basic ID variant limit exceeded"
+        );
+        self.reserve_metadata(serde_json::to_vec(&basic_id)?.len())?;
+        network.remote_id_basic_ids.push(RemoteIdBasicId {
+            basic_id,
+            per_source: BTreeMap::new(),
+        });
+        Ok(index)
     }
 }
 
@@ -750,6 +806,13 @@ impl Report {
                     output,
                     "```json\n{}\n```\n",
                     serde_json::to_string_pretty(advertisement).unwrap_or_default()
+                );
+            }
+            if !network.remote_id_basic_ids.is_empty() {
+                let _ = writeln!(
+                    output,
+                    "Remote ID Basic ID variants observed in beacons ({}, with claims and source ranges in `inventory.json`).\n",
+                    network.remote_id_basic_ids.len()
                 );
             }
             output.push_str("Per-source observation ranges:\n\n");

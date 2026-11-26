@@ -6,32 +6,57 @@
 
 #![forbid(unsafe_code)]
 
+mod acquisition;
+mod adsb;
+mod ais;
+mod aprs;
+mod dect;
+mod dmr;
 mod dsp;
+mod ecowitt;
+mod efergy;
 mod event_slices;
 mod file_pin;
 mod fpga_analysis;
 mod fpga_capture;
 mod gateware;
+mod halow;
+mod lora;
+mod lte;
+mod morse;
+mod nr;
+mod ook;
+mod private_output;
 mod profile2_adapter;
 mod profile2_analysis;
 mod profile2_control;
 mod profile2_image;
 mod profile2_session;
+mod rds;
 mod receiver;
+mod rs41;
+mod scm;
+mod signal_profile;
 mod spectrum;
+mod sweep;
 mod transport;
 // Profile 2 is decoded independently until its capture path is integrated.
+mod tpms;
 mod transport_v2;
+mod triage;
+mod uat;
 mod waveform;
+mod wh51;
+mod ws90;
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
@@ -39,6 +64,8 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
 
+pub(crate) const MIN_CENTER_HZ: u64 = 70_000_000;
+pub(crate) const MAX_CENTER_HZ: u64 = 6_000_000_000;
 const SAMPLE_RATE: u32 = 20_000_000;
 const MAX_SAMPLES: u64 = 200_000_000;
 
@@ -70,6 +97,100 @@ enum Action {
     CaptureProfile2(profile2_session::CaptureArgs),
     /// Produce a bounded DC-aware spectrum and unclassified activity regions.
     Survey(Survey),
+    /// Plan or record a bounded receive sweep across multiple tunings.
+    Sweep(sweep::Args),
+    /// Measure saved listening time for selected bands in a completed sweep or series.
+    SweepCoverage(triage::coverage::Args),
+    /// Run selected protocol analyzers on one completed sweep or series.
+    ReplaySweep(triage::replay::Args),
+    /// Find transient RF activity and export evidence clips from a saved sweep.
+    TriageSweep(triage::Args),
+    /// Find frequency bands with repeated detector evidence across a saved sweep series.
+    TriageSeries(triage::series::Args),
+    /// Check saved follow-up bands and controls against original IQ.
+    AnalyzeFollowUp(triage::follow_up::Args),
+    /// Decode APRS-format AX.25 frames on one channel in saved IQ.
+    IdentifyAprs(aprs::IdentifyAprs),
+    /// Decode APRS channels in eligible dwells of a completed sweep or series.
+    IdentifyAprsSweep(triage::aprs_sweep::Args),
+    /// Identify full DMR Voice Link Control in headers and terminators on one saved channel.
+    IdentifyDmr(dmr::Args),
+    /// Identify full DMR Voice Link Control across a completed sweep or series.
+    IdentifyDmrSweep(triage::channel_sweep::Args),
+    /// Search a guarded 12.5 kHz DMR channel grid in a completed sweep or series.
+    IdentifyDmrRasterSweep(triage::dmr_raster::Args),
+    /// Identify DECT fixed-part broadcasts on one saved channel.
+    IdentifyDect(dect::Args),
+    /// Identify DECT fixed-part broadcasts across a completed sweep or series.
+    IdentifyDectSweep(triage::channel_sweep::Args),
+    /// Identify Wi-Fi HaLow 2 MHz S1G beacons on one saved channel.
+    IdentifyHalow(halow::Args),
+    /// Identify Wi-Fi HaLow 2 MHz S1G beacons across a completed sweep or series.
+    IdentifyHalowSweep(triage::channel_sweep::Args),
+    /// Identify legacy Itron SCM endpoints on one saved channel.
+    IdentifyScm(scm::Args),
+    /// Identify legacy Itron SCM endpoints across a completed sweep or series.
+    IdentifyScmSweep(triage::channel_sweep::Args),
+    /// Identify Itron SCM+ endpoints on one saved channel.
+    IdentifyScmPlus(scm::Args),
+    /// Identify Itron SCM+ endpoints across a completed sweep or series.
+    IdentifyScmPlusSweep(triage::channel_sweep::Args),
+    /// Identify VHF AIS stations on one saved channel.
+    IdentifyAis(ais::Args),
+    /// Identify VHF AIS stations across a completed sweep or series.
+    IdentifyAisSweep(triage::channel_sweep::Args),
+    /// Identify supported 433 MHz OOK sensors in one saved IQ channel.
+    IdentifyOok(ook::Args),
+    /// Identify supported OOK sensors across a completed sweep or series.
+    IdentifyOokSweep(triage::ook_sweep::Args),
+    /// Identify Efergy e2-compatible transmitters on one saved IQ channel.
+    IdentifyEfergy(efergy::Args),
+    /// Identify Efergy e2-compatible transmitters across a completed sweep or series.
+    IdentifyEfergySweep(triage::sensor_sweep::Args),
+    /// Decode WH51-format FSK packets on one saved IQ channel.
+    IdentifyWh51(wh51::Args),
+    /// Decode WH51-format packets across a completed sweep or series.
+    IdentifyWh51Sweep(triage::sensor_sweep::Args),
+    /// Decode WS90-format FSK packets on one saved IQ channel.
+    IdentifyWs90(ws90::Args),
+    /// Decode WS90-format packets across a completed sweep or series.
+    IdentifyWs90Sweep(triage::sensor_sweep::Args),
+    /// Identify supported Pacific TPMS frames on one saved IQ channel.
+    IdentifyTpms(tpms::Args),
+    /// Identify supported Pacific TPMS frames across a completed sweep or series.
+    IdentifyTpmsSweep(triage::sensor_sweep::Args),
+    /// Identify Vaisala RS41 radiosondes on one saved IQ channel.
+    IdentifyRs41(rs41::Args),
+    /// Identify Vaisala RS41 radiosondes across a completed sweep or series.
+    IdentifyRs41Sweep(triage::sensor_sweep::Args),
+    /// Search a Vaisala RS41 channel raster in a completed sweep or series.
+    IdentifyRs41RasterSweep(triage::rs41_raster::Args),
+    /// Decode validated broadcast FM RDS groups and text from one saved channel.
+    IdentifyRds(rds::Args),
+    /// Decode broadcast FM RDS stations in a completed sweep or series.
+    IdentifyRdsSweep(triage::rds_sweep::Args),
+    /// Identify LTE FDD cells from broadcast synchronization in saved IQ.
+    IdentifyLte(lte::Args),
+    /// Identify LTE cells across a carrier grid in one pass over saved IQ.
+    IdentifyLteRaster(lte::raster::Args),
+    /// Identify LTE cells and carrier coverage in a completed sweep or series.
+    IdentifyLteSweep(triage::lte_sweep::Args),
+    /// Identify repeated 5G NR broadcast synchronization in one saved IQ channel.
+    IdentifyNr(nr::Args),
+    /// Identify 5G NR synchronization profiles across a completed sweep or series.
+    IdentifyNrSweep(triage::nr_sweep::Args),
+    /// Decode Morse from keyed RF or a selected narrowband FM tone in saved IQ.
+    IdentifyMorse(morse::Args),
+    /// Decode configured Morse profiles in a completed sweep or series.
+    IdentifyMorseSweep(triage::morse_sweep::Args),
+    /// Recover validated 1090 MHz extended squitter frames from saved IQ.
+    IdentifyAdsb(adsb::Args),
+    /// Recover validated 1090 MHz frames from a completed sweep or series.
+    IdentifyAdsbSweep(triage::adsb_sweep::Args),
+    /// Recover verified 978 MHz UAT airborne frames from saved IQ.
+    IdentifyUat(uat::Args),
+    /// Recover verified 978 MHz UAT airborne frames from a completed sweep or series.
+    IdentifyUatSweep(triage::channel_sweep::CaptureArgs),
     /// Export bounded full-band IQ ranges from a verified dense event report.
     SliceEvents(event_slices::SliceEvents),
     /// Measure candidate modulation features in a saved IQ clip.
@@ -78,6 +199,18 @@ enum Action {
     ProbeBursts(waveform::burst::ProbeBursts),
     /// Search a saved IQ interval for repeated cyclic-prefix structure.
     ProbeOfdm(waveform::ofdm::ProbeOfdm),
+    /// Search a saved IQ channel for repeated LoRa chirps and an opposite-slope delimiter.
+    #[command(name = "probe-lora")]
+    ProbeLoRa(lora::ProbeLoRa),
+    /// Search multiple LoRa profiles across a completed sweep or series.
+    #[command(name = "probe-lora-sweep")]
+    ProbeLoRaSweep(triage::lora_sweep::Args),
+    /// Decode CRC-valid LoRa frames from one channel in a saved IQ interval.
+    #[command(name = "decode-lora")]
+    DecodeLoRa(lora::decode::DecodeLoRa),
+    /// Decode CRC-valid LoRa frames in a completed sweep or series.
+    #[command(name = "decode-lora-sweep")]
+    DecodeLoRaSweep(triage::lora_decode_sweep::Args),
     /// Run the bit-exact and floating reference receivers on saved 20 MSps IQ.
     Receive(Receive),
     /// Generate deterministic multi-carrier FM input for host/HDL experiments.
@@ -297,10 +430,11 @@ fn new_file(path: &Path) -> Result<File> {
 }
 
 fn json_file(path: &Path, value: &impl Serialize) -> Result<()> {
-    let mut file = new_file(path)?;
+    let mut file = BufWriter::new(new_file(path)?);
     serde_json::to_writer_pretty(&mut file, value)?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
+    file.flush()?;
+    file.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -314,7 +448,9 @@ fn budget(seconds: f64, maximum: f64) -> Result<Duration> {
 
 fn center_hz(mhz: f64) -> Result<u64> {
     ensure!(
-        mhz.is_finite() && (70.0..=6000.0).contains(&mhz),
+        mhz.is_finite()
+            && (MIN_CENTER_HZ as f64 / 1_000_000.0..=MAX_CENTER_HZ as f64 / 1_000_000.0)
+                .contains(&mhz),
         "center must be 70..=6000 MHz"
     );
     Ok((mhz * 1_000_000.0).round() as u64)
@@ -344,20 +480,26 @@ fn run(cli: Cli) -> Result<()> {
     let offline = !matches!(
         cli.command,
         Action::Capture(_)
+            | Action::Sweep(_)
             | Action::CaptureFpga(_)
             | Action::CaptureProfile2(_)
             | Action::Doctor
             | Action::VerifyHdl { .. }
             | Action::VerifyProfile2NativeAdapter { .. }
     );
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))?;
+    if let Action::Sweep(args) = &cli.command
+        && args.plan_only
+    {
+        return sweep::print_plan(args, &stop);
+    }
     let root = if offline && cli.workspace.is_none() {
         workspace(None).or_else(|_| std::env::current_dir())?
     } else {
         workspace(cli.workspace)?
     };
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))?;
     match cli.command {
         Action::Doctor => {
             for name in ["ghdl", "quartus_sh", "nios2-bsp"] {
@@ -378,6 +520,107 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Action::Capture(args) => capture(&root, args, &stop)?,
+        Action::Sweep(args) => sweep::run(&root, args, &stop)?,
+        Action::SweepCoverage(args) => triage::coverage::run(&root, args, &stop)?,
+        Action::ReplaySweep(args) => triage::replay::run(&root, args, &stop)?,
+        Action::TriageSweep(args) => triage::run(&root, args, &stop)?,
+        Action::TriageSeries(args) => triage::series::run(&root, args, &stop)?,
+        Action::AnalyzeFollowUp(args) => triage::follow_up::run(&root, args, &stop)?,
+        Action::IdentifyAprs(args) => aprs::identify(&root, args, &stop)?,
+        Action::IdentifyAprsSweep(args) => triage::aprs_sweep::identify(&root, args, &stop)?,
+        Action::IdentifyDmr(args) => dmr::identify(&root, args, &stop)?,
+        Action::IdentifyDmrSweep(args) => {
+            triage::channel_sweep::identify(
+                &root,
+                args,
+                triage::channel_sweep::Protocol::Dmr,
+                &stop,
+            )?;
+        }
+        Action::IdentifyDmrRasterSweep(args) => triage::dmr_raster::identify(&root, args, &stop)?,
+        Action::IdentifyDect(args) => dect::identify(&root, args, &stop)?,
+        Action::IdentifyDectSweep(args) => {
+            triage::channel_sweep::identify(
+                &root,
+                args,
+                triage::channel_sweep::Protocol::Dect,
+                &stop,
+            )?;
+        }
+        Action::IdentifyHalow(args) => halow::identify(&root, args, &stop)?,
+        Action::IdentifyHalowSweep(args) => {
+            triage::channel_sweep::identify(
+                &root,
+                args,
+                triage::channel_sweep::Protocol::Halow,
+                &stop,
+            )?;
+        }
+        Action::IdentifyScm(args) => scm::identify(&root, args, scm::Format::Legacy, &stop)?,
+        Action::IdentifyScmSweep(args) => {
+            triage::channel_sweep::identify(
+                &root,
+                args,
+                triage::channel_sweep::Protocol::Scm,
+                &stop,
+            )?;
+        }
+        Action::IdentifyScmPlus(args) => {
+            scm::identify(&root, args, scm::Format::Plus, &stop)?;
+        }
+        Action::IdentifyScmPlusSweep(args) => {
+            triage::channel_sweep::identify(
+                &root,
+                args,
+                triage::channel_sweep::Protocol::ScmPlus,
+                &stop,
+            )?;
+        }
+        Action::IdentifyAis(args) => ais::identify(&root, args, &stop)?,
+        Action::IdentifyAisSweep(args) => {
+            triage::channel_sweep::identify(
+                &root,
+                args,
+                triage::channel_sweep::Protocol::Ais,
+                &stop,
+            )?;
+        }
+        Action::IdentifyOok(args) => ook::identify(&root, args, &stop)?,
+        Action::IdentifyOokSweep(args) => triage::ook_sweep::run(&root, args, &stop)?,
+        Action::IdentifyEfergy(args) => efergy::identify(&root, args, &stop)?,
+        Action::IdentifyEfergySweep(args) => {
+            triage::sensor_sweep::run(&root, args, triage::sensor_sweep::Sensor::Efergy, &stop)?;
+        }
+        Action::IdentifyWh51(args) => wh51::identify(&root, args, &stop)?,
+        Action::IdentifyWh51Sweep(args) => {
+            triage::sensor_sweep::run(&root, args, triage::sensor_sweep::Sensor::Wh51, &stop)?;
+        }
+        Action::IdentifyWs90(args) => ws90::identify(&root, args, &stop)?,
+        Action::IdentifyWs90Sweep(args) => {
+            triage::sensor_sweep::run(&root, args, triage::sensor_sweep::Sensor::Ws90, &stop)?;
+        }
+        Action::IdentifyTpms(args) => tpms::identify(&root, args, &stop)?,
+        Action::IdentifyTpmsSweep(args) => {
+            triage::sensor_sweep::run(&root, args, triage::sensor_sweep::Sensor::Tpms, &stop)?;
+        }
+        Action::IdentifyRs41(args) => rs41::identify(&root, args, &stop)?,
+        Action::IdentifyRs41Sweep(args) => {
+            triage::sensor_sweep::run(&root, args, triage::sensor_sweep::Sensor::Rs41, &stop)?;
+        }
+        Action::IdentifyRs41RasterSweep(args) => triage::rs41_raster::identify(&root, args, &stop)?,
+        Action::IdentifyRds(args) => rds::identify(&root, args, &stop)?,
+        Action::IdentifyRdsSweep(args) => triage::rds_sweep::identify(&root, args, &stop)?,
+        Action::IdentifyLte(args) => lte::identify(&root, args, &stop)?,
+        Action::IdentifyLteRaster(args) => lte::raster::identify(&root, args, &stop)?,
+        Action::IdentifyLteSweep(args) => triage::lte_sweep::identify(&root, args, &stop)?,
+        Action::IdentifyNr(args) => nr::identify(&root, args, &stop)?,
+        Action::IdentifyNrSweep(args) => triage::nr_sweep::identify(&root, args, &stop)?,
+        Action::IdentifyMorse(args) => morse::identify(&root, args, &stop)?,
+        Action::IdentifyMorseSweep(args) => triage::morse_sweep::identify(&root, args, &stop)?,
+        Action::IdentifyAdsb(args) => adsb::identify(&root, args, &stop)?,
+        Action::IdentifyAdsbSweep(args) => triage::adsb_sweep::identify(&root, args, &stop)?,
+        Action::IdentifyUat(args) => uat::identify(&root, args, &stop)?,
+        Action::IdentifyUatSweep(args) => triage::channel_sweep::identify_uat(&root, args, &stop)?,
         Action::CaptureFpga(args) => fpga_capture::capture(&root, args, &stop)?,
         Action::CaptureProfile2(args) => {
             let receipt = profile2_session::capture(&root, args, Arc::clone(&stop))?;
@@ -461,12 +704,13 @@ fn run(cli: Cli) -> Result<()> {
                 )
             };
             json_file(&output.join("spectrum.json"), &report)?;
-            let mut csv = new_file(&output.join("spectrum.csv"))?;
+            let mut csv = BufWriter::new(new_file(&output.join("spectrum.csv"))?);
             writeln!(csv, "frequency_hz,relative_power_db")?;
             for bin in &report.bins {
                 writeln!(csv, "{:.3},{:.6}", bin.frequency_hz, bin.relative_power_db)?;
             }
-            csv.sync_all()?;
+            csv.flush()?;
+            csv.get_ref().sync_all()?;
             if let Some(events) = events {
                 json_file(&output.join("events.json"), &events)?;
             }
@@ -501,6 +745,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Action::SliceEvents(args) => event_slices::export(&root, &args, &stop)?,
         Action::ProbeWaveform(args) => waveform::probe(&root, &args, &stop)?,
+        Action::ProbeLoRa(args) => lora::probe(&root, args, &stop)?,
+        Action::ProbeLoRaSweep(args) => triage::lora_sweep::probe(&root, args, &stop)?,
+        Action::DecodeLoRa(args) => lora::decode::run(&root, args, &stop)?,
+        Action::DecodeLoRaSweep(args) => triage::lora_decode_sweep::decode(&root, args, &stop)?,
         Action::ProbeBursts(args) => waveform::burst::probe(&root, &args, &stop)?,
         Action::ProbeOfdm(args) => waveform::ofdm::probe(&root, &args, &stop)?,
         Action::Fixture(args) => {
@@ -712,156 +960,33 @@ fn run(cli: Cli) -> Result<()> {
 
 fn capture(root: &Path, args: Capture, stop: &AtomicBool) -> Result<()> {
     let center = center_hz(args.center_mhz)?;
-    budget(args.duration, 10.0)?;
-    ensure!(
-        args.gain.is_finite() && (0.0..=71.0).contains(&args.gain),
-        "gain must be 0..=71 dB"
-    );
-    let samples = (args.duration * f64::from(SAMPLE_RATE)).round() as u64;
-    ensure!(
-        samples >= 8192,
-        "capture requires at least 8192 samples for its spectrum report"
-    );
-    let words = if args.stations.is_empty() {
-        vec![]
-    } else {
-        station_words(center, &args.stations)?
-    };
-    let program = args
-        .receiver
-        .unwrap_or_else(|| root.join("target/release/bladerf-lab"))
-        .canonicalize()?;
-    ensure!(
-        program.is_file() && fs::metadata(&program)?.permissions().mode() & 0o111 != 0,
-        "native acquisition binary must be an executable file"
-    );
+    let settings = acquisition::Settings::new(center, args.duration, args.antenna, args.gain)?;
+    if !args.stations.is_empty() {
+        station_words(center, &args.stations)?;
+    }
+    let program = acquisition::resolve_program(root, args.receiver.as_deref())?;
     let output = directory(root, args.output.as_deref(), "captures/rf-observatory")?;
-    let iq = output.join("wideband.sc16q11");
-    json_file(
-        &output.join("request.json"),
-        &json!({"center_frequency_hz":center,"sample_rate_hz":SAMPLE_RATE,"samples_requested":samples,"antenna_requested":args.antenna,"gain_db_requested":args.gain,"mode":"hosted_iq_capture_not_custom_fpga_channelizer"}),
-    )?;
-    let log = new_file(&output.join("acquisition.log"))?;
-    let mut command = Command::new(program);
-    command
-        .arg("--workspace")
-        .arg(root)
-        .args([
-            "capture",
-            "--frequency",
-            &center.to_string(),
-            "--sample-rate",
-            "20000000",
-            "--channel",
-            &args.antenna.to_string(),
-            "--gain",
-            &args.gain.to_string(),
-            "--duration",
-            &args.duration.to_string(),
-            "--output",
-        ])
-        .arg(&iq)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    let mut child = AcquisitionChild {
-        child: command.spawn().context("start native acquisition")?,
-        reaped: false,
-    };
-    let start = Instant::now();
-    let result = loop {
-        if let Some(status) = child.child.try_wait()? {
-            child.reaped = true;
-            break if status.success() {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "acquisition failed ({status}); see {}",
-                    output.join("acquisition.log").display()
-                ))
-            };
-        }
-        if stop.load(Ordering::Relaxed) || start.elapsed().as_secs_f64() > args.duration + 20.0 {
-            let forced = child.stop()?;
-            json_file(
-                &output.join("acquisition-failure.json"),
-                &json!({"interrupted":stop.load(Ordering::Relaxed),"forced_kill":forced}),
-            )?;
-            break Err(anyhow::anyhow!(
-                "acquisition interrupted or timed out; evidence in {}",
-                output.display()
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    result?;
-    let sidecar = receiver::validate_acquisition(&iq, center, samples, args.antenna, args.gain)
-        .with_context(|| {
-            format!(
-                "validate acquisition; source and logs retained in {}",
-                output.display()
-            )
-        })?;
-    let actual_center = sidecar.frequency_hz();
-    let survey = spectrum::survey(&iq, actual_center, samples, 128, stop)?;
-    json_file(&output.join("spectrum.json"), &survey)?;
-    json_file(&output.join("capture.json"), &sidecar)?;
-    if !words.is_empty() {
-        let words = station_words(actual_center, &args.stations)?;
+    let window = acquisition::record(root, &program, &output, settings, stop)?;
+    if !args.stations.is_empty() {
+        let words = station_words(window.center_hz, &args.stations)?;
         let report = receiver::receive(
-            &iq,
+            &window.iq,
             &output,
             &words,
-            samples,
+            settings.samples,
             Duration::from_secs(120),
             stop,
         )?;
         json_file(&output.join("receive.json"), &report)?;
     }
-    println!(
-        "Recorded {samples} complex samples. Output: {}",
+    let mut stdout = std::io::stdout().lock();
+    writeln!(
+        stdout,
+        "Recorded {} complex samples. Output: {}",
+        settings.samples,
         output.display()
-    );
-    Ok(())
-}
-
-/// Own and reap a synchronous native acquisition process. Explicit stop first
-/// allows native SIGINT cleanup, then kills a stalled worker. Fallback Drop
-/// cleanup kills and waits and may block in operating-system teardown.
-struct AcquisitionChild {
-    child: std::process::Child,
-    reaped: bool,
-}
-impl AcquisitionChild {
-    fn stop(&mut self) -> Result<bool> {
-        if self.child.try_wait()?.is_some() {
-            self.reaped = true;
-            return Ok(false);
-        }
-        let _ = Command::new("kill")
-            .args(["-INT", &self.child.id().to_string()])
-            .status()?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if self.child.try_wait()?.is_some() {
-                self.reaped = true;
-                return Ok(false);
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        self.child.kill()?;
-        self.child.wait()?;
-        self.reaped = true;
-        Ok(true)
-    }
-}
-impl Drop for AcquisitionChild {
-    fn drop(&mut self) {
-        if !self.reaped {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
+    )?;
+    stdout.flush().context("flush capture result")
 }
 
 fn main() -> ExitCode {
@@ -1012,16 +1137,6 @@ mod tests {
         assert!(capture(temp.path(), args, &AtomicBool::new(false)).is_err());
         assert!(!temp.path().join("new-output").exists());
     }
-    #[test]
-    fn native_worker_interrupt_is_reaped() {
-        let mut child = AcquisitionChild {
-            child: Command::new("sleep").arg("5").spawn().unwrap(),
-            reaped: false,
-        };
-        assert!(!child.stop().unwrap());
-        assert!(child.reaped);
-    }
-
     #[test]
     fn native_profile2_action_requires_every_identity_argument() {
         assert!(Cli::try_parse_from(["rf-observatory", "verify-profile2-native-adapter"]).is_err());

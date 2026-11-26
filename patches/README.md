@@ -11,4 +11,5 @@ build you need and follow its patch order.
 | Blue Dragon and ICE9 | [Bluetooth native engines](../projects/bluetooth-monitor/docs/guide.md#build-the-native-engines) |
 | libcrafter and FutureSDR WLAN | [Wi-Fi build guide](../projects/wifi-monitor/README.md) |
 | FutureSDR IEEE 802.15.4 | [IEEE 802.15.4 file worker](../projects/ieee802154-monitor/futuresdr-worker/README.md) |
+| FutureSDR LoRa | [LoRa file worker](../tools/bladerf-lora-worker/README.md) |
 | gr-bladeRF | [Native setup guide](../docs/SETUP.md#inspect-and-run-the-native-setup-plan) |

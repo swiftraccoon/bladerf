@@ -1,9 +1,8 @@
 //! Bounded, receive-only device operations using the safe SoapySDR wrapper.
 //!
 //! Native calls are synchronous. Every activated stream is explicitly deactivated
-//! on success and recoverable errors; the dependency closes stream/device handles
-//! on drop. The wrapper exposes no fallible explicit close operation, so close
-//! errors are not reported to the caller and native teardown may block.
+//! on success and recoverable errors. Ordinary captures explicitly close their
+//! streams before publishing IQ. Native stream or device teardown may block.
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -17,22 +16,31 @@ use chrono::{SecondsFormat, Utc};
 use clap::Args;
 use num_complex::Complex;
 use serde::{Deserialize, Serialize};
-use soapysdr::{Device, Direction::Rx, Format, RxStream, StreamSample};
+use soapysdr::{Device, Direction::Rx, Format, RxReadMetadata, RxStream, StreamSample};
+
+use self::segment_stream::{
+    ReadBlock, SAMPLE_PERIOD_NS, SegmentEvent, SegmentPlan, stream_segments,
+};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod segment_output;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod segment_stream;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod segmented;
+mod sweep;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(crate) use segmented::{SegmentCaptureArgs, capture_segments};
+pub(crate) use sweep::{SweepCaptureArgs, capture_sweep};
 
 const MAX_CAPTURE_SAMPLES: usize = 250_000_000;
 const MAX_DISCARD_INITIAL_SAMPLES: u32 = 20_000_000;
 const MAX_FPGA_VERSION_BYTES: usize = 32;
 const CHUNK_SAMPLES: usize = 65_536;
 const READ_TIMEOUT_US: i64 = 2_000_000;
+const STOCK_FPGA_VERSION: &str = "0.16.0";
+const TIMESTAMPED_SAMPLE_RATE_HZ: f64 = 20_000_000.0;
+const TIMESTAMPED_USB_BUFFER_SAMPLES: u32 = 32_768;
+const END_WITNESS_SAMPLES: usize = 8_192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FpgaVersion(String);
@@ -259,6 +267,10 @@ impl RadioArgs {
         device.set_sample_rate(Rx, self.index(), sample_rate.0)?;
         device.set_frequency(Rx, self.index(), frequency.0, ())?;
         device.set_bandwidth(Rx, self.index(), sample_rate.0.min(56e6))?;
+        self.set_manual_gain(device)
+    }
+
+    fn set_manual_gain(&self, device: &Device) -> Result<()> {
         device.set_gain_mode(Rx, self.index(), false)?;
         let range = device.gain_range(Rx, self.index())?;
         ensure!(
@@ -323,13 +335,16 @@ fn with_active_stream<E: StreamSample, T>(
 ) -> Result<T> {
     stream.activate(None).context("activate receive stream")?;
     let result = operation(stream);
-    let shutdown = stream.deactivate(None).context("deactivate receive stream");
-    match (result, shutdown) {
-        (Err(primary), Err(shutdown)) => {
-            Err(primary.context(format!("stream shutdown also failed: {shutdown:#}")))
+    let deactivation = stream.deactivate(None).context("deactivate receive stream");
+    finish_stream_operation(result, deactivation)
+}
+
+fn finish_stream_operation<T>(operation: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (operation, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("stream cleanup also failed: {cleanup:#}")))
         }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Ok(value), Ok(())) => Ok(value),
     }
 }
@@ -452,7 +467,18 @@ struct CaptureMetadata {
     started_utc: String,
     timestamp_note: String,
     continuity_note: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_timing: Option<CaptureSampleTiming>,
     receive_api: String,
+}
+
+/// Device-clock bounds for one saved extent and the count of its next read.
+/// The witness begins at the exclusive end and remains outside the saved IQ.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CaptureSampleTiming {
+    first_sample_ns: i64,
+    end_sample_exclusive_ns: i64,
+    witness_samples: usize,
 }
 
 fn encode_iq(samples: &[Complex<i16>], bytes: &mut Vec<u8>) -> Result<()> {
@@ -514,6 +540,83 @@ fn read_capture(
     Ok(())
 }
 
+fn timed_read(metadata: RxReadMetadata) -> Result<ReadBlock> {
+    ensure!(
+        !metadata.end_abrupt && !metadata.end_burst,
+        "RX driver marked the read as a stream ending"
+    );
+    let timestamp_ns = metadata
+        .timestamp_ns
+        .context("RX read lacked a timestamp")?;
+    ensure!(timestamp_ns >= 0, "RX timestamp was negative");
+    Ok(ReadBlock {
+        count: metadata.samples,
+        timestamp_ns,
+    })
+}
+
+/// Stream one contiguous dwell to provisional storage, then check its end.
+/// An error leaves staged data for the caller to discard.
+fn read_checked_capture(
+    count: usize,
+    discard_count: usize,
+    buffer: &mut [Complex<i16>],
+    within_deadline: impl Fn() -> bool,
+    interrupted: &AtomicBool,
+    mut read: impl FnMut(&mut [Complex<i16>]) -> Result<ReadBlock>,
+    mut store: impl FnMut(&[Complex<i16>]) -> Result<()>,
+) -> Result<CaptureSampleTiming> {
+    let check = || -> Result<()> {
+        ensure!(
+            !interrupted.load(Ordering::Relaxed),
+            "capture interrupted; incomplete output removed"
+        );
+        ensure!(
+            within_deadline(),
+            "capture exceeded its wall-clock deadline"
+        );
+        Ok(())
+    };
+    let mut verified = None;
+    stream_segments(
+        buffer,
+        SegmentPlan {
+            segment_samples: count,
+            segment_count: Some(1),
+            discard_samples: discard_count,
+            witness_samples: END_WITNESS_SAMPLES,
+        },
+        |buffer| {
+            check()?;
+            let block = read(buffer)?;
+            check()?;
+            Ok(block)
+        },
+        |event| match event {
+            SegmentEvent::Samples(samples) => store(samples),
+            SegmentEvent::Closed {
+                timing,
+                witness_samples,
+                ..
+            } => {
+                let witness_duration_ns = i64::try_from(witness_samples)? * SAMPLE_PERIOD_NS;
+                timing
+                    .end_sample_exclusive_ns
+                    .checked_add(witness_duration_ns)
+                    .context("RX witness timestamp end overflow")?;
+                verified = Some(CaptureSampleTiming {
+                    first_sample_ns: timing.first_sample_ns,
+                    end_sample_exclusive_ns: timing.end_sample_exclusive_ns,
+                    witness_samples,
+                });
+                Ok(())
+            }
+        },
+        || Ok(false),
+    )?;
+    verified.context("completed capture lacked witnessed sample bounds")
+}
+
 fn capture_metadata(
     device: &Device,
     radio: &RadioArgs,
@@ -546,6 +649,7 @@ fn capture_metadata(
         timestamp_note: "Host wall-clock before RX enable, not a hardware timestamp".into(),
         continuity_note:
             "Untimestamped SC16_Q11 output does not certify absence of dropped samples".into(),
+        sample_timing: None,
         receive_api: "Rust soapysdr -> SoapyBladeRF -> libbladeRF".into(),
     })
 }
@@ -562,55 +666,193 @@ fn receive_stream_args() -> soapysdr::Args {
     stream_args
 }
 
+#[derive(Clone, Copy)]
+enum CaptureContinuity {
+    Unchecked,
+    Checked,
+}
+
+/// Reusable host buffers and settings for sequential captures on one device.
+struct CaptureSession<'a> {
+    device: &'a Device,
+    radio: &'a RadioArgs,
+    required_fpga_version: Option<&'a FpgaVersion>,
+    interrupted: &'a AtomicBool,
+    continuity: CaptureContinuity,
+    buffer: Vec<Complex<i16>>,
+    encoded: Vec<u8>,
+}
+
+/// Host timing marks for a completed capture, distinct from sample timestamps.
+struct CaptureTiming {
+    stream_ready: Instant,
+    read_started: Instant,
+    read_finished: Instant,
+    stream_closed: Instant,
+    published: Instant,
+}
+
+struct CompletedCapture {
+    metadata: CaptureMetadata,
+    timing: CaptureTiming,
+}
+
+impl<'a> CaptureSession<'a> {
+    fn new(
+        device: &'a Device,
+        radio: &'a RadioArgs,
+        required_fpga_version: Option<&'a FpgaVersion>,
+        interrupted: &'a AtomicBool,
+        continuity: CaptureContinuity,
+    ) -> Self {
+        Self {
+            device,
+            radio,
+            required_fpga_version,
+            interrupted,
+            continuity,
+            buffer: vec![Complex::new(0, 0); CHUNK_SAMPLES],
+            encoded: Vec::with_capacity(CHUNK_SAMPLES * 4),
+        }
+    }
+
+    /// Publish a dwell only after deactivation and a successful native close.
+    fn record(
+        &mut self,
+        mut files: CaptureFiles,
+        duration: DurationSeconds,
+        discard_initial_samples: u32,
+        validate_readback: impl FnOnce(&CaptureMetadata) -> Result<()>,
+    ) -> Result<CompletedCapture> {
+        ensure!(
+            !self.interrupted.load(Ordering::Relaxed),
+            "capture interrupted before stream setup"
+        );
+        let index = self.radio.index();
+        let rate = SampleRateHz::try_from(self.device.sample_rate(Rx, index)?)?;
+        let count = sample_count(rate, duration)?.get();
+        let discard_count = usize::try_from(discard_initial_samples)?;
+        let mut settings = capture_metadata(
+            self.device,
+            self.radio,
+            rate,
+            count,
+            discard_initial_samples,
+            self.required_fpga_version,
+        )?;
+        let mut stream_args = receive_stream_args();
+        if matches!(self.continuity, CaptureContinuity::Checked) {
+            ensure!(
+                rate.0 == TIMESTAMPED_SAMPLE_RATE_HZ,
+                "timestamp-checked captures require exactly 20 MSps"
+            );
+            stream_args.set("buflen", TIMESTAMPED_USB_BUFFER_SAMPLES.to_string());
+            stream_args.set("meta", "meta");
+        }
+        let mut stream = self
+            .device
+            .rx_stream_args::<Complex<i16>, _>(&[index], stream_args)?;
+        let stream_ready = Instant::now();
+        let discard_seconds = f64::from(discard_initial_samples) / rate.0;
+        let deadline = stream_ready + Duration::from_secs_f64(duration.0 + discard_seconds + 15.0);
+        let receive = (|| {
+            if matches!(self.continuity, CaptureContinuity::Checked) {
+                let mtu = stream.mtu().context("read timestamped RX1 stream MTU")?;
+                ensure!(
+                    mtu == TIMESTAMPED_USB_BUFFER_SAMPLES as usize,
+                    "RX1 stream MTU is {mtu} samples, requested {TIMESTAMPED_USB_BUFFER_SAMPLES}"
+                );
+            }
+            with_active_stream(&mut stream, |stream| {
+                settings.gain_db = self.device.gain(Rx, index)?;
+                validate_readback(&settings)?;
+                let read_started = Instant::now();
+                let within_deadline = || Instant::now() < deadline;
+                let store = |samples: &[Complex<i16>]| {
+                    encode_iq(samples, &mut self.encoded)?;
+                    files
+                        .raw
+                        .write_all(&self.encoded)
+                        .context("write IQ samples")
+                };
+                match self.continuity {
+                    CaptureContinuity::Unchecked => read_capture(
+                        count,
+                        discard_count,
+                        &mut self.buffer,
+                        within_deadline,
+                        self.interrupted,
+                        |buffer| {
+                            stream
+                                .read(&mut [buffer], READ_TIMEOUT_US)
+                                .context("receive IQ")
+                        },
+                        store,
+                    )?,
+                    CaptureContinuity::Checked => {
+                        settings.sample_timing = Some(read_checked_capture(
+                            count,
+                            discard_count,
+                            &mut self.buffer,
+                            within_deadline,
+                            self.interrupted,
+                            |buffer| {
+                                let metadata = stream
+                                    .read_with_metadata(&mut [buffer], READ_TIMEOUT_US)
+                                    .context("receive timestamped IQ")?;
+                                timed_read(metadata)
+                            },
+                            store,
+                        )?);
+                        settings.timestamp_note =
+                            "Host wall clock before stream setup. Sample bounds use device time."
+                                .into();
+                        settings.continuity_note = "Consecutive device timestamps and a successful end witness were checked.".into();
+                    }
+                }
+                Ok((read_started, Instant::now()))
+            })
+        })();
+        // Pinned SoapyBladeRF disables the RX module in closeStream.
+        let close = stream.close().context("close receive stream");
+        let (read_started, read_finished) = finish_stream_operation(receive, close)?;
+        let stream_closed = Instant::now();
+        files.complete(&settings)?;
+        Ok(CompletedCapture {
+            metadata: settings,
+            timing: CaptureTiming {
+                stream_ready,
+                read_started,
+                read_finished,
+                stream_closed,
+                published: Instant::now(),
+            },
+        })
+    }
+}
+
 pub(crate) fn capture(args: CaptureArgs) -> Result<()> {
     args.radio.validate()?;
     let duration = DurationSeconds::try_from(args.duration)?;
     sample_count(SampleRateHz::try_from(args.radio.sample_rate)?, duration)?;
-    let discard_count = usize::try_from(args.discard_initial_samples)?;
     let interrupted = interrupt_flag()?;
-    let mut files = CaptureFiles::create(&args.output)?;
+    let files = CaptureFiles::create(&args.output)?;
     let device = args.radio.open(args.require_fpga_version.as_ref())?;
-    let rate = SampleRateHz::try_from(device.sample_rate(Rx, args.radio.index())?)?;
-    let count = sample_count(rate, duration)?.get();
-    let mut settings = capture_metadata(
+    let settings = CaptureSession::new(
         &device,
         &args.radio,
-        rate,
-        count,
-        args.discard_initial_samples,
         args.require_fpga_version.as_ref(),
-    )?;
-    let mut buffer = vec![Complex::new(0i16, 0); CHUNK_SAMPLES];
-    let mut encoded = Vec::with_capacity(CHUNK_SAMPLES * 4);
-    let mut stream =
-        device.rx_stream_args::<Complex<i16>, _>(&[args.radio.index()], receive_stream_args())?;
-    let discard_seconds = f64::from(args.discard_initial_samples) / rate.0;
-    let deadline = Instant::now() + Duration::from_secs_f64(duration.0 + discard_seconds + 15.0);
-    with_active_stream(&mut stream, |stream| {
-        settings.gain_db = device.gain(Rx, args.radio.index())?;
-        read_capture(
-            count,
-            discard_count,
-            &mut buffer,
-            || Instant::now() < deadline,
-            &interrupted,
-            |buffer| {
-                stream
-                    .read(&mut [buffer], READ_TIMEOUT_US)
-                    .context("receive IQ")
-            },
-            |samples| {
-                encode_iq(samples, &mut encoded)?;
-                files.raw.write_all(&encoded).context("write IQ samples")
-            },
-        )
-    })?;
-    files.complete(&settings)?;
+        &interrupted,
+        CaptureContinuity::Unchecked,
+    )
+    .record(files, duration, args.discard_initial_samples, |_| Ok(()))?
+    .metadata;
     writeln!(
         std::io::stdout().lock(),
-        "Captured {count} complex samples from RX{} at {} S/s\nIQ: {}\nMetadata: {}.json",
+        "Captured {} complex samples from RX{} at {} S/s\nIQ: {}\nMetadata: {}.json",
+        settings.num_samples,
         args.radio.channel,
-        rate.0,
+        settings.sample_rate_hz,
         args.output.display(),
         args.output.display()
     )
@@ -840,6 +1082,134 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("wall-clock deadline"));
+    }
+
+    #[test]
+    fn timestamp_zero_is_valid_and_invalid_metadata_is_rejected() {
+        let metadata = RxReadMetadata {
+            samples: 1,
+            timestamp_ns: Some(0),
+            end_burst: false,
+            end_abrupt: false,
+        };
+        assert_eq!(timed_read(metadata).unwrap().timestamp_ns, 0);
+        for invalid in [
+            RxReadMetadata {
+                timestamp_ns: None,
+                ..metadata
+            },
+            RxReadMetadata {
+                timestamp_ns: Some(-1),
+                ..metadata
+            },
+            RxReadMetadata {
+                end_burst: true,
+                ..metadata
+            },
+            RxReadMetadata {
+                end_abrupt: true,
+                ..metadata
+            },
+        ] {
+            assert!(timed_read(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn checked_capture_keeps_only_saved_samples_and_records_actual_witness_count() {
+        let mut buffer = vec![Complex::new(0, 0); END_WITNESS_SAMPLES];
+        let mut saved = Vec::new();
+        let mut requests = Vec::new();
+        let mut position = 0;
+        let timing = read_checked_capture(
+            5,
+            2,
+            &mut buffer,
+            || true,
+            &AtomicBool::new(false),
+            |buffer| {
+                requests.push(buffer.len());
+                let timestamp_ns = i64::from(position) * SAMPLE_PERIOD_NS;
+                let count = buffer.len().min(3);
+                for sample in &mut buffer[..count] {
+                    *sample = Complex::new(position, -position);
+                    position += 1;
+                }
+                Ok(ReadBlock {
+                    count,
+                    timestamp_ns,
+                })
+            },
+            |samples| {
+                saved.extend_from_slice(samples);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(requests, [2, 5, 2, END_WITNESS_SAMPLES]);
+        assert_eq!(position, 10);
+        assert_eq!(
+            saved,
+            (2..7)
+                .map(|value| Complex::new(value, -value))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(timing).unwrap(),
+            serde_json::json!({
+                "first_sample_ns": 100,
+                "end_sample_exclusive_ns": 350,
+                "witness_samples": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn checked_capture_rejects_a_bad_or_late_witness() {
+        let mut buffer = vec![Complex::new(0, 0); END_WITNESS_SAMPLES];
+        for (first_timestamp_ns, witness_timestamp_ns, witness_error, late, message) in [
+            (0, 0, true, false, "overflow"),
+            (0, 100, false, false, "timestamp discontinuity"),
+            (0, 50, false, true, "wall-clock deadline"),
+            (
+                i64::MAX - 50,
+                i64::MAX,
+                false,
+                false,
+                "witness timestamp end overflow",
+            ),
+        ] {
+            let within_deadline = Cell::new(true);
+            let mut saved_count = 0;
+            let error = read_checked_capture(
+                1,
+                0,
+                &mut buffer,
+                || within_deadline.get(),
+                &AtomicBool::new(false),
+                |request| {
+                    if request.len() == 1 {
+                        return Ok(ReadBlock {
+                            count: 1,
+                            timestamp_ns: first_timestamp_ns,
+                        });
+                    }
+                    ensure!(!witness_error, "overflow");
+                    within_deadline.set(!late);
+                    Ok(ReadBlock {
+                        count: 1,
+                        timestamp_ns: witness_timestamp_ns,
+                    })
+                },
+                |samples| {
+                    saved_count += samples.len();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(message), "{error:#}");
+            assert_eq!(saved_count, 1);
+        }
     }
 
     #[test]

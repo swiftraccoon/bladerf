@@ -8,6 +8,7 @@ description = "Passive bladeRF Bluetooth capture and independent BLE packet vali
 
 [dependencies]
 anyhow = "1"
+bladerf-remote-id = { path = "../../crates/bladerf-remote-id" }
 chrono = { default-features = false, features = ["clock", "std"], version = "0.4" }
 clap = { features = ["derive"], version = "4.5" }
 ctrlc = { features = ["termination"], version = "3.4" }

@@ -198,6 +198,17 @@ ordinary MAC headers, and malformed/truncated states remain explicit. Valid FCS
 checks consistency but does not authenticate a sender, identify Zigbee, decrypt
 content, prove continuity or establish channel occupancy.
 
+For FCS-valid packets with a complete frame control field, `mac.addressing`
+reports the address layout status. An `observed` layout includes the transmitted
+source and destination PAN IDs and addresses when present. The supported layouts
+are beacon, data, acknowledgment and MAC command frames with version codes 0–2.
+Each address has a `mode` and `value`. Short addresses and PAN IDs are 16-bit
+integers. Extended addresses are 16 lowercase hexadecimal digits with leading
+zeros preserved. Use a short address with its PAN context. PAN compression can
+omit fields from the frame. The report retains the compression bit and lists
+only transmitted PAN IDs. A truncated or unsupported layout reports its status
+without address values. Sender attribution requires independent evidence.
+
 ## Compare hard and soft decoder lanes
 
 Run the hard and soft worker lanes separately, retain their explicit lane-bearing

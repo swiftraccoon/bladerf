@@ -20,6 +20,7 @@ pub(super) enum SegmentEvent<'a, T> {
     Closed {
         index: usize,
         timing: SegmentTiming,
+        witness_samples: usize,
         finished_on_request: bool,
     },
 }
@@ -129,6 +130,7 @@ pub(super) fn stream_segments<T>(
                     sink(SegmentEvent::Closed {
                         index: prev_index,
                         timing: prev_timing,
+                        witness_samples: samples.len(),
                         finished_on_request: false,
                     })?;
                 }
@@ -141,7 +143,7 @@ pub(super) fn stream_segments<T>(
         let completed = index.checked_add(1).context("segment ordinal overflow")?;
         let finished_on_request = plan.segment_count.is_none() && finish_requested()?;
         if plan.segment_count == Some(completed) || finished_on_request {
-            read_adjacent(
+            let witness = read_adjacent(
                 &mut buffer[..plan.witness_samples],
                 next_timestamp_ns,
                 &mut read,
@@ -149,6 +151,7 @@ pub(super) fn stream_segments<T>(
             sink(SegmentEvent::Closed {
                 index,
                 timing,
+                witness_samples: witness.count,
                 finished_on_request,
             })?;
             return Ok(completed);
@@ -227,6 +230,7 @@ mod tests {
                         index,
                         timing,
                         finished_on_request,
+                        ..
                     } => {
                         if finished_on_request {
                             Event::Finished(index, timing)

@@ -1,8 +1,7 @@
 //! Stream, verify and publish a slice directory on the destination filesystem.
 
-use std::fs::{self, File, Metadata};
+use std::fs::{File, Metadata};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
@@ -10,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::spectrum::EventStride;
+use crate::{private_output::StagedDirectory, receiver, spectrum::EventStride};
 
 use super::check_stop;
 use super::input::{Input, same_extent_and_times};
@@ -18,21 +17,6 @@ use super::plan::{ALIGNMENT_SAMPLES, Limits, Span};
 
 const COMPLEX_BYTES: u64 = 4;
 const CHUNK_BYTES: usize = 64 * 1024;
-
-#[derive(Serialize)]
-struct SliceSidecar {
-    format: &'static str,
-    dtype: &'static str,
-    interleave: &'static str,
-    complex_scale: u16,
-    frequency_hz: u64,
-    sample_rate_hz: u32,
-    bandwidth_hz: u32,
-    num_samples: u64,
-    source_kind: &'static str,
-    source_start_sample: u64,
-    continuity_guaranteed: bool,
-}
 
 #[derive(Serialize)]
 struct Slice {
@@ -141,25 +125,7 @@ pub(super) fn export(
     stop: &AtomicBool,
 ) -> Result<()> {
     check_stop(stop)?;
-    let output_name = destination
-        .file_name()
-        .context("slice output needs a directory name")?;
-    match destination.symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("inspect slice output path"),
-        Ok(_) => anyhow::bail!("slice output already exists: {}", destination.display()),
-    }
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).context("create slice output parent")?;
-    let parent_dir = File::open(parent).context("open slice output parent")?;
-    let stage = tempfile::Builder::new()
-        .prefix(".event-slices-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(parent)
-        .context("create private slice staging directory")?;
+    let stage = StagedDirectory::new(destination, ".event-slices-")?;
 
     let mut reader = PrefixReader::new(&mut source.iq);
     let mut slices = Vec::with_capacity(spans.len());
@@ -167,7 +133,8 @@ pub(super) fn export(
         check_stop(stop)?;
         reader.consume(span.start_sample, stop, |_| Ok(()))?;
         let iq_file = format!("slice-{:04}.sc16q11", ordinal + 1);
-        let mut file = crate::new_file(&stage.path().join(&iq_file))?;
+        let iq_path = stage.path().join(&iq_file);
+        let mut file = crate::new_file(&iq_path)?;
         let mut digest = Sha256::new();
         reader.consume(span.end_sample_exclusive, stop, |bytes| {
             file.write_all(bytes).context("write IQ slice")?;
@@ -175,21 +142,12 @@ pub(super) fn export(
             Ok(())
         })?;
         file.sync_all().context("sync IQ slice")?;
-        crate::json_file(
-            &stage.path().join(format!("{iq_file}.json")),
-            &SliceSidecar {
-                format: "SC16_Q11",
-                dtype: "<i2",
-                interleave: "I,Q",
-                complex_scale: 2048,
-                frequency_hz: source.center_frequency_hz,
-                sample_rate_hz: crate::SAMPLE_RATE,
-                bandwidth_hz: crate::SAMPLE_RATE,
-                num_samples: span.samples(),
-                source_kind: "derived_event_slice",
-                source_start_sample: span.start_sample,
-                continuity_guaranteed: false,
-            },
+        receiver::write_derived_iq_sidecar(
+            &iq_path,
+            source.center_frequency_hz,
+            "derived_event_slice",
+            span.start_sample,
+            span.samples(),
         )?;
         slices.push(Slice {
             iq_file,
@@ -231,43 +189,5 @@ pub(super) fn export(
         slices,
     };
     crate::json_file(&stage.path().join("slices.json"), &manifest)?;
-    File::open(stage.path())?
-        .sync_all()
-        .context("sync staged slice directory")?;
-    check_stop(stop)?;
-    let stage_name = stage
-        .path()
-        .file_name()
-        .context("slice staging directory needs a name")?;
-    publish(&parent_dir, Path::new(stage_name), Path::new(output_name)).with_context(|| {
-        format!(
-            "publish IQ slices at {} without replacing output",
-            destination.display()
-        )
-    })?;
-    // The staging inode is now owned by the final path. Release cleanup of
-    // the old name before syncing the parent directory entry.
-    let _ = stage.keep();
-    parent_dir
-        .sync_all()
-        .context("slices were published, but syncing the output parent failed")
-}
-
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn publish(parent: &File, stage: &Path, destination: &Path) -> Result<()> {
-    use nix::fcntl::{RenameFlags, renameat2};
-
-    renameat2(
-        parent,
-        stage,
-        parent,
-        destination,
-        RenameFlags::RENAME_NOREPLACE,
-    )?;
-    Ok(())
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn publish(_parent: &File, _stage: &Path, _destination: &Path) -> Result<()> {
-    anyhow::bail!("atomic slice-directory publication requires Linux GNU renameat2 support")
+    stage.publish(|| check_stop(stop))
 }

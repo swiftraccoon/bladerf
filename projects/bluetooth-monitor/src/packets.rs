@@ -4,6 +4,9 @@
 //! [`Summary`] contains aggregate counts only. CRC validity is not authentication,
 //! decryption, receiver calibration, or evidence of complete channel coverage.
 
+mod bthome;
+mod ruuvi;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -51,6 +54,15 @@ pub(crate) struct Summary {
     pub(crate) packets_by_logical_channel: BTreeMap<String, u64>,
     pub(crate) packets_by_pdu_type: BTreeMap<String, u64>,
     pub(crate) advertising_data_types: BTreeMap<String, u64>,
+    /// Recognized BTHome v2 AD structures in CRC-valid packets, including encrypted envelopes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bthome_v2_ad_structures: Option<u64>,
+    /// Complete, recognized Ruuvi RAWv2 AD structures in CRC-valid packets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ruuvi_raw_v2_ad_structures: Option<u64>,
+    /// Remote ID Basic ID messages in CRC-valid advertising data, including repeats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_id_basic_id_observations: Option<u64>,
     pub(crate) validated_packets_by_phy: ValidatedPhySummary,
     pub(crate) duplicate_accounting: DuplicateAccountingSummary,
 }
@@ -510,13 +522,16 @@ fn dewhiten(bytes: &mut [u8], channel: u8) {
     }
 }
 
-fn address(bytes: &[u8], random: bool) -> Value {
-    let formatted = bytes
+fn format_address(bytes: &[u8]) -> String {
+    bytes
         .iter()
         .rev()
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
-        .join(":");
+        .join(":")
+}
+
+fn address(bytes: &[u8], random: bool) -> Value {
     let kind = if !random {
         "public"
     } else {
@@ -527,7 +542,7 @@ fn address(bytes: &[u8], random: bool) -> Value {
             _ => "random_reserved",
         }
     };
-    json!({"address": formatted, "address_type": kind})
+    json!({"address": format_address(bytes), "address_type": kind})
 }
 
 fn uuid(bytes: &[u8]) -> String {
@@ -547,7 +562,12 @@ fn uuid(bytes: &[u8]) -> String {
     }
 }
 
-fn advertising_data(bytes: &[u8], record: &mut PacketRecord, summary: &mut Summary) -> Vec<Value> {
+fn advertising_data(
+    bytes: &[u8],
+    starts_advertising_data: bool,
+    record: &mut PacketRecord,
+    summary: &mut Summary,
+) -> Vec<Value> {
     let mut fields = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -600,6 +620,21 @@ fn advertising_data(bytes: &[u8], record: &mut PacketRecord, summary: &mut Summa
                 if data.len() >= width {
                     field["service_uuid"] = json!(uuid(&data[..width]));
                     field["service_data_hex"] = json!(hex(&data[width..]));
+                    if kind == 0x16
+                        && let Some(v2) = bthome::parse_service_data(data)
+                    {
+                        field["bthome_v2"] = json!(v2);
+                        *summary.bthome_v2_ad_structures.get_or_insert(0) += 1;
+                    }
+                    if kind == 0x16 && starts_advertising_data {
+                        let basic_ids: Vec<_> =
+                            bladerf_remote_id::bluetooth_basic_ids(data).collect();
+                        if !basic_ids.is_empty() {
+                            *summary.remote_id_basic_id_observations.get_or_insert(0) +=
+                                basic_ids.len() as u64;
+                            field["remote_id_basic_ids"] = json!(basic_ids);
+                        }
+                    }
                 } else {
                     record.warnings.push("short_service_data");
                 }
@@ -608,6 +643,10 @@ fn advertising_data(bytes: &[u8], record: &mut PacketRecord, summary: &mut Summa
             0xff if data.len() >= 2 => {
                 field["company_id"] = json!(le16(data));
                 field["manufacturer_data_hex"] = json!(hex(&data[2..]));
+                if let Some(raw_v2) = ruuvi::parse_manufacturer_data(data) {
+                    field["ruuvi_raw_v2"] = json!(raw_v2);
+                    *summary.ruuvi_raw_v2_ad_structures.get_or_insert(0) += 1;
+                }
             }
             0x31 => field["interpretation"] = json!("encrypted_advertising_data_not_decrypted"),
             _ => {}
@@ -630,14 +669,15 @@ fn extended_advertising(
         return Value::Null;
     }
     let length = usize::from(payload[0] & 0x3f);
-    let mut details =
-        json!({"advertising_mode": payload[0] >> 6, "extended_header_length": length});
+    let mode = payload[0] >> 6;
+    let mut details = json!({"advertising_mode": mode, "extended_header_length": length});
     if length > payload.len() - 1 {
         record.warnings.push("truncated_extended_header");
         return details;
     }
     if length == 0 {
-        details["advertising_data"] = json!(advertising_data(&payload[1..], record, summary));
+        details["advertising_data"] =
+            json!(advertising_data(&payload[1..], false, record, summary));
         return details;
     }
     let flags = payload[1];
@@ -674,7 +714,17 @@ fn extended_advertising(
         position += width;
     }
     details["extended_header_remaining_hex"] = json!(hex(&header[position..]));
-    details["advertising_data"] = json!(advertising_data(&payload[1 + length..], record, summary));
+    // Core 6.2 Vol 6 Part B Tables 2.4–2.7 and Section 2.3.4.9. Chain fragments
+    // can start inside an AD structure. AdvA (0x01), TargetA (0x02), SyncInfo
+    // (0x20) and connectable AdvMode are forbidden on continuation packets.
+    let starts_advertising_data = record.logical_channel.is_none_or(|channel| channel < 37)
+        && (mode == 1 || (mode == 0 && flags & 0x23 != 0));
+    details["advertising_data"] = json!(advertising_data(
+        &payload[1 + length..],
+        starts_advertising_data,
+        record,
+        summary,
+    ));
     details
 }
 
@@ -706,7 +756,7 @@ fn decode_advertising(
         .or_default() += 1;
     record.details = match kind {
         0 | 2 | 4 | 6 if (6..=37).contains(&payload.len()) => Some(
-            json!({"advertiser": address(&payload[..6], tx_random), "advertising_data": advertising_data(&payload[6..], record, summary)}),
+            json!({"advertiser": address(&payload[..6], tx_random), "advertising_data": advertising_data(&payload[6..], true, record, summary)}),
         ),
         1 if payload.len() == 12 => Some(
             json!({"advertiser": address(&payload[..6],tx_random), "target": address(&payload[6..],rx_random)}),
@@ -1621,6 +1671,338 @@ mod tests {
             .is_some()
         );
         assert!(record.warnings.contains(&"extended_field_exceeds_header"));
+    }
+
+    #[test]
+    fn pcap_reports_ruuvi_raw_v2_only_after_ble_crc_validation() {
+        // Ruuvi's RAWv2 valid and unavailable test vectors, with a synthetic MAC.
+        const VALID: [u8; 24] = [
+            0x05, 0x12, 0xfc, 0x53, 0x94, 0xc3, 0x7c, 0x00, 0x04, 0xff, 0xfc, 0x04, 0x0c, 0xac,
+            0x36, 0x42, 0x00, 0xcd, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55,
+        ];
+        const UNAVAILABLE: [u8; 24] = [
+            0x05, 0x80, 0x00, 0xff, 0xff, 0xff, 0xff, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let packet = |data: &[u8]| {
+            let mut pdu = vec![
+                0x42,
+                (10 + data.len()) as u8,
+                0x06,
+                0x05,
+                0x04,
+                0x03,
+                0x02,
+                0xc1,
+                (3 + data.len()) as u8,
+                0xff,
+                0x99,
+                0x04,
+            ];
+            pdu.extend_from_slice(data);
+            ble_record(&pdu, 0x555555, ADVERTISING_AA)
+        };
+        let valid = packet(&VALID);
+        let mut bad_crc = valid.clone();
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let packets = [valid, packet(&UNAVAILABLE), packet(&VALID[..23]), bad_crc];
+        let dir = TestDirectory::new();
+        let input = dir.0.join("ruuvi.pcap");
+        let jsonl = dir.0.join("ruuvi.jsonl");
+        fs::write(
+            &input,
+            pcap(ByteOrder::Little, false, DLT_BLE_PHDR, &packets),
+        )
+        .unwrap();
+        let summary = serde_json::to_value(inspect(&input, None, Some(&jsonl)).unwrap()).unwrap();
+        assert_eq!(summary["total_records"], 4);
+        assert_eq!(summary["validated_advertising_packets"], 3);
+        assert_eq!(summary["invalid_crc_packets"], 1);
+        assert_eq!(summary["advertising_data_types"]["0xff"], 3);
+        assert_eq!(summary["ruuvi_raw_v2_ad_structures"], 2);
+        let summary_text = summary.to_string();
+        assert!(!summary_text.contains("02:11:22:33:44:55"));
+        assert!(!summary_text.contains("c1:02:03:04:05:06"));
+
+        let records: Vec<Value> = fs::read_to_string(jsonl)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 4);
+        let details = &records[0]["details"];
+        assert_eq!(
+            details["advertiser"],
+            json!({
+                "address": "c1:02:03:04:05:06", "address_type": "random_static",
+            })
+        );
+        assert_eq!(
+            details["advertising_data"][0],
+            json!({
+                "type_id": 0xff,
+                "data_hex": "99040512fc5394c37c0004fffc040cac364200cd021122334455",
+                "company_id": 0x0499,
+                "manufacturer_data_hex": "0512fc5394c37c0004fffc040cac364200cd021122334455",
+                "ruuvi_raw_v2": {
+                    "sensor_id": "02:11:22:33:44:55",
+                    "temperature_millicelsius": 24_300,
+                    "relative_humidity_ppm": 534_900,
+                    "pressure_pa": 100_044,
+                    "acceleration_mg": [4, -4, 1_036],
+                    "battery_mv": 2_977,
+                    "transmit_power_dbm": 4,
+                    "movement_counter": 66,
+                    "measurement_sequence": 205,
+                },
+            })
+        );
+        assert_eq!(
+            records[1]["details"]["advertising_data"][0]["ruuvi_raw_v2"],
+            json!({
+                "sensor_id": null,
+                "temperature_millicelsius": null,
+                "relative_humidity_ppm": null,
+                "pressure_pa": null,
+                "acceleration_mg": [null, null, null],
+                "battery_mv": null,
+                "transmit_power_dbm": null,
+                "movement_counter": null,
+                "measurement_sequence": null,
+            })
+        );
+
+        let short = &records[2]["details"]["advertising_data"][0];
+        assert_eq!(records[2]["validation"], "advertising_crc_valid");
+        assert_eq!(short["company_id"], 0x0499);
+        assert_eq!(
+            short["manufacturer_data_hex"],
+            "0512fc5394c37c0004fffc040cac364200cd0211223344"
+        );
+        assert!(short.get("ruuvi_raw_v2").is_none());
+        assert_eq!(records[3]["validation"], "crc_invalid");
+        assert!(records[3]["details"].is_null());
+
+        fs::write(
+            &input,
+            pcap(ByteOrder::Little, false, DLT_BLE_PHDR, &packets[2..]),
+        )
+        .unwrap();
+        let negative = serde_json::to_value(inspect(&input, None, None).unwrap()).unwrap();
+        assert!(negative.get("ruuvi_raw_v2_ad_structures").is_none());
+    }
+
+    #[test]
+    fn pcap_reports_remote_id_basic_ids_from_valid_advertising_data() {
+        let mut basic_id = [0; 25];
+        basic_id[..10].copy_from_slice(b"\x02\x12TEST-123");
+        let mut service_data = vec![0xfa, 0xff, 0x0d, 7];
+        service_data.extend_from_slice(&basic_id);
+        let legacy = |data: &[u8]| {
+            let mut pdu = vec![
+                0x42,
+                (8 + data.len()) as u8,
+                6,
+                5,
+                4,
+                3,
+                2,
+                0xc1,
+                (1 + data.len()) as u8,
+                0x16,
+            ];
+            pdu.extend_from_slice(data);
+            ble_record(&pdu, 0x555555, ADVERTISING_AA)
+        };
+        let extended = |header: &[u8], data: &[u8]| {
+            let mut pdu = vec![
+                0x47,
+                (3 + header.len() + data.len()) as u8,
+                header.len() as u8,
+            ];
+            pdu.extend_from_slice(header);
+            pdu.extend_from_slice(&[(1 + data.len()) as u8, 0x16]);
+            pdu.extend_from_slice(data);
+            ble_record(&pdu, 0x555555, ADVERTISING_AA)
+        };
+        let mut pack = vec![0xfa, 0xff, 0x0d, 8, 0xf2, 25, 2];
+        pack.extend_from_slice(&basic_id);
+        basic_id[9] = b'4';
+        pack.extend_from_slice(&basic_id);
+        let primary = extended(&[0x09, 6, 5, 4, 3, 2, 0xc1, 0x01, 0x80], &pack);
+        let mut coded = primary.clone();
+        coded[0] = 20;
+        coded[8..10].copy_from_slice(&(DEWHITENED | (2 << 14)).to_le_bytes());
+        coded.insert(14, 0);
+        let mut continuation = extended(&[0x08, 0x01, 0x80], &pack);
+        continuation[0] = 20;
+        let valid = legacy(&service_data);
+        let mut bad_crc = valid.clone();
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let mut wrong_uuid = service_data.clone();
+        wrong_uuid[0] ^= 1;
+        let mut wrong_application = service_data.clone();
+        wrong_application[2] ^= 1;
+        let packets = [
+            valid,
+            coded,
+            legacy(&wrong_uuid),
+            legacy(&wrong_application),
+            primary,
+            continuation,
+            bad_crc,
+        ];
+        let dir = TestDirectory::new();
+        let input = dir.0.join("remote-id.pcap");
+        let jsonl = dir.0.join("packets.jsonl");
+        fs::write(
+            &input,
+            pcap(ByteOrder::Little, false, DLT_BLE_PHDR, &packets),
+        )
+        .unwrap();
+        let summary = serde_json::to_value(inspect(&input, None, Some(&jsonl)).unwrap()).unwrap();
+        assert_eq!(summary["validated_advertising_packets"], 6);
+        assert_eq!(summary["validated_packets_by_phy"]["le_coded_s8"], 1);
+        assert_eq!(summary["invalid_crc_packets"], 1);
+        assert_eq!(summary["remote_id_basic_id_observations"], 3);
+        assert!(!summary.to_string().contains("TEST-123"));
+
+        let records: Vec<Value> = fs::read_to_string(jsonl)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let field = &records[0]["details"]["advertising_data"][0];
+        assert_eq!(field["service_uuid"], "fffa");
+        assert_eq!(field["service_data_hex"], hex(&service_data[2..]));
+        assert_eq!(
+            field["remote_id_basic_ids"],
+            json!([{
+                "message_counter": 7,
+                "protocol_version": 2,
+                "id_type": 1,
+                "ua_type": 2,
+                "id_hex": "544553542d313233000000000000000000000000",
+                "id_text": "TEST-123",
+            }]),
+        );
+        let observations = records[1]["details"]["advertising_data"][0]["remote_id_basic_ids"]
+            .as_array()
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0]["message_counter"], 8);
+        assert_eq!(observations[0]["id_text"], "TEST-123");
+        assert_eq!(observations[1]["id_text"], "TEST-124");
+        for record in &records[2..6] {
+            let field = &record["details"]["advertising_data"][0];
+            assert!(field["service_data_hex"].is_string());
+            assert!(field.get("remote_id_basic_ids").is_none());
+        }
+        assert!(records[6]["details"].is_null());
+
+        fs::write(
+            &input,
+            pcap(ByteOrder::Little, false, DLT_BLE_PHDR, &packets[2..]),
+        )
+        .unwrap();
+        let negative = serde_json::to_value(inspect(&input, None, None).unwrap()).unwrap();
+        assert!(negative.get("remote_id_basic_id_observations").is_none());
+    }
+
+    #[test]
+    fn pcap_reports_bthome_v2_only_for_crc_valid_16_bit_service_data() {
+        let packet = |ad_kind, data: &[u8]| {
+            let mut pdu = vec![
+                0x42,
+                (8 + data.len()) as u8,
+                0xa6,
+                0xa5,
+                0xa4,
+                0xa3,
+                0xa2,
+                0xc1,
+                (1 + data.len()) as u8,
+                ad_kind,
+            ];
+            pdu.extend_from_slice(data);
+            ble_record(&pdu, 0x555555, ADVERTISING_AA)
+        };
+        let event = [0xd2, 0xfc, 0x44, 0x00, 0xff, 0x2d, 0x01, 0x3a, 0x01];
+        let encrypted = [
+            0xd2, 0xfc, 0x41, 0xe4, 0x45, 0xf3, 0xc9, 0x96, 0x2b, 0x33, 0x22, 0x11, 0x00, 0x6c,
+            0x7c, 0x45, 0x19,
+        ];
+        let valid = packet(0x16, &event);
+        let mut bad_crc = valid.clone();
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let packets = [
+            valid,
+            packet(0x16, &encrypted),
+            packet(0x16, &event[..event.len() - 1]),
+            packet(0x20, &event),
+            bad_crc,
+        ];
+        let dir = TestDirectory::new();
+        let input = dir.0.join("bthome.pcap");
+        let jsonl = dir.0.join("packets.jsonl");
+        fs::write(
+            &input,
+            pcap(ByteOrder::Little, false, DLT_BLE_PHDR, &packets),
+        )
+        .unwrap();
+        let summary = serde_json::to_value(inspect(&input, None, Some(&jsonl)).unwrap()).unwrap();
+        assert_eq!(summary["validated_advertising_packets"], 4);
+        assert_eq!(summary["invalid_crc_packets"], 1);
+        assert_eq!(summary["bthome_v2_ad_structures"], 2);
+        assert!(!summary.to_string().contains("c1:a2:a3:a4:a5:a6"));
+
+        let records: Vec<Value> = fs::read_to_string(jsonl)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let details = &records[0]["details"];
+        assert_eq!(
+            details["advertiser"],
+            json!({"address": "c1:a2:a3:a4:a5:a6", "address_type": "random_static"})
+        );
+        assert_eq!(
+            details["advertising_data"][0],
+            json!({
+                "type_id": 0x16,
+                "data_hex": "d2fc4400ff2d013a01",
+                "service_uuid": "fcd2",
+                "service_data_hex": "4400ff2d013a01",
+                "bthome_v2": {
+                    "trigger_based": true,
+                    "encoding": "unencrypted",
+                    "objects": [
+                        {"kind": "packet_id", "value": 255},
+                        {"kind": "window_open", "value": true},
+                        {"kind": "button", "value": {"code": 1, "event": "press"}},
+                    ],
+                },
+            })
+        );
+        assert_eq!(
+            records[1]["details"]["advertising_data"][0]["bthome_v2"],
+            json!({"trigger_based": false, "encoding": "encrypted"})
+        );
+        for record in &records[2..4] {
+            let field = &record["details"]["advertising_data"][0];
+            assert!(field["service_data_hex"].is_string());
+            assert!(field.get("bthome_v2").is_none());
+        }
+        assert_eq!(records[4]["validation"], "crc_invalid");
+        assert!(records[4]["details"].is_null());
+
+        fs::write(
+            &input,
+            pcap(ByteOrder::Little, false, DLT_BLE_PHDR, &packets[2..]),
+        )
+        .unwrap();
+        let negative = serde_json::to_value(inspect(&input, None, None).unwrap()).unwrap();
+        assert!(negative.get("bthome_v2_ad_structures").is_none());
     }
 }
 

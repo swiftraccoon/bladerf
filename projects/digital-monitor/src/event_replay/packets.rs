@@ -1,8 +1,8 @@
 //! Match private packet observations produced by the bounded offline decoders.
 //!
 //! The caller checks each replay's provenance, sample extent and integrity
-//! summary before loading packets. This module retains only in-memory keys and
-//! source-sample positions, and reports aggregate occurrence counts and deltas.
+//! summary before loading packets. This module retains in-memory keys, packet
+//! positions, and validated BLE frequencies for aggregate reporting.
 
 use std::cmp::Ordering;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -31,6 +31,7 @@ const MAX_BLE_BODY_BYTES: usize = 4 + 1 + 3 + 255 + 3;
 pub(super) struct Packet {
     pub(super) sample: u64,
     pub(super) record_index: u64,
+    pub(super) ble_frequency_mhz: Option<u16>,
     key: [u8; 32],
 }
 
@@ -243,6 +244,10 @@ pub(super) fn read_packets(
             packets.push(Packet {
                 sample: source_sample(&record, protocol, start_sample, samples)?,
                 record_index: record.index,
+                ble_frequency_mhz: match protocol {
+                    Protocol::Bluetooth => record.frequency_mhz,
+                    Protocol::Wifi => None,
+                },
                 key,
             });
         }

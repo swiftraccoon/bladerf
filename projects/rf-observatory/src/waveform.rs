@@ -7,19 +7,24 @@ pub(crate) mod ofdm;
 mod symbols;
 
 use std::f64::consts::TAU;
-use std::fs::File;
-use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use clap::Args;
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::Serialize;
 
 use self::iq::{BASEBAND_RATE, DECIMATION, FILTER_CUTOFF_HZ, FILTER_HALF_TAPS};
 
-const MIN_INPUT_INTERVAL: usize = 8_192;
+/// Minimum number of original-rate complex samples to measure.
+pub(crate) const MIN_INPUT_INTERVAL: usize = 8_192;
+/// Maximum number of original-rate complex samples in a saved clip.
+pub(crate) const MAX_CLIP_SAMPLES: usize = iq::MAX_INPUT_SAMPLES;
+/// Number of saved samples needed before and after the measurement interval.
+pub(crate) const CLIP_CONTEXT_SAMPLES: usize = FILTER_HALF_TAPS;
+
 const MAX_CARRIER_OFFSET_HZ: f64 = 200_000.0;
 const MIN_POWER_LINE_FRACTION: f64 = 0.20;
 const MIN_POWER_LINE_GAIN: f64 = 4.0;
@@ -75,13 +80,22 @@ struct Report {
     filter_cutoff_hz: u64,
     filter_window: &'static str,
     line_window: &'static str,
-    phase_lines: [PhaseLine; 3],
-    phase_order_hint: Option<u32>,
-    frequency_plateaus: Option<fsk::FrequencyPlateaus>,
+    #[serde(flatten)]
+    evidence: NarrowEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     symbol_recovery: Option<symbols::SymbolRecovery>,
     #[serde(skip_serializing_if = "Option::is_none")]
     blind_symbol_recovery: Option<symbols::BlindSymbolRecovery>,
+}
+
+/// Phase symmetry and frequency plateau measurements for a narrow IQ channel.
+///
+/// Qualified hints describe possible modulation and carry no protocol identity.
+#[derive(Serialize)]
+pub(crate) struct NarrowEvidence {
+    phase_lines: [PhaseLine; 3],
+    phase_order_hint: Option<u32>,
+    frequency_plateaus: Option<fsk::FrequencyPlateaus>,
 }
 
 #[derive(Serialize)]
@@ -151,20 +165,22 @@ fn phase_order_hint(lines: &[PhaseLine; 3]) -> Option<u32> {
     })
 }
 
-pub(crate) fn probe(root: &Path, args: &ProbeWaveform, stop: &AtomicBool) -> Result<()> {
-    ensure!(
-        args.modulation.is_none() || args.symbol_rate_hz.is_some() || args.search_symbol_rate,
-        "modulation requires a supplied symbol rate or a symbol rate search"
-    );
-    let interval = args.start_sample..args.end_sample;
+fn read_narrow_measurement(
+    input: iq::ClipInput<'_>,
+    center_hz: u64,
+    target_hz: u64,
+    interval: Range<usize>,
+    expected_sha256: Option<&str>,
+    stop: &AtomicBool,
+) -> Result<(iq::Baseband, NarrowEvidence)> {
     ensure!(
         interval.len() >= MIN_INPUT_INTERVAL,
         "waveform interval requires at least {MIN_INPUT_INTERVAL} complex samples"
     );
-    let baseband = iq::channel(&args.input, args.center_hz, args.target_hz, interval, stop)?;
-    if let Some(expected) = &args.expect_sha256 {
+    let baseband = iq::channel(input, center_hz, target_hz, interval, stop)?;
+    if let Some(expected) = expected_sha256 {
         ensure!(
-            *expected == baseband.source_sha256,
+            expected == baseband.source_sha256,
             "saved IQ does not match the expected SHA-256"
         );
     }
@@ -173,6 +189,86 @@ pub(crate) fn probe(root: &Path, args: &ProbeWaveform, stop: &AtomicBool) -> Res
     let phase_order_hint = phase_order_hint(&phase_lines);
     check_stop(stop)?;
     let frequency_plateaus = fsk::measure(&baseband.samples);
+    check_stop(stop)?;
+    let evidence = NarrowEvidence {
+        phase_lines,
+        phase_order_hint,
+        frequency_plateaus,
+    };
+    Ok((baseband, evidence))
+}
+
+/// Measure a half-open, clip-local sample interval at a selected RF frequency.
+///
+/// The input is a 20 MSps little-endian SC16 Q11 clip with at most
+/// [`MAX_CLIP_SAMPLES`] complex samples. The interval needs at least
+/// [`MIN_INPUT_INTERVAL`] samples with [`CLIP_CONTEXT_SAMPLES`] saved on each
+/// side for the filter. The optional SHA-256 covers the whole clip.
+///
+/// # Errors
+///
+/// Returns an error on interruption, file or sample validation failure, or
+/// digest mismatch. Both frequencies must be positive, and the target must
+/// have at least 500 kHz of margin inside the sampled band.
+pub(crate) fn measure_narrow(
+    path: &Path,
+    center_hz: u64,
+    target_hz: u64,
+    interval: Range<usize>,
+    expected_sha256: Option<&str>,
+    stop: &AtomicBool,
+) -> Result<NarrowEvidence> {
+    read_narrow_measurement(
+        iq::ClipInput::Path(path),
+        center_hz,
+        target_hz,
+        interval,
+        expected_sha256,
+        stop,
+    )
+    .map(|(_, evidence)| evidence)
+}
+
+/// Measure a clip already read into memory, with the same interval as [`measure_narrow`].
+///
+/// Returns the lowercase SHA-256 of the complete input buffer and its narrow
+/// waveform evidence. The caller owns verification of the clip's source identity.
+///
+/// # Errors
+///
+/// Returns an error on interruption, unsupported frequencies, an invalid
+/// SC16 Q11 clip, or an interval without sufficient samples and filter context.
+pub(crate) fn measure_narrow_bytes(
+    bytes: Vec<u8>,
+    center_hz: u64,
+    target_hz: u64,
+    interval: Range<usize>,
+    stop: &AtomicBool,
+) -> Result<(String, NarrowEvidence)> {
+    let (baseband, evidence) = read_narrow_measurement(
+        iq::ClipInput::Bytes(bytes),
+        center_hz,
+        target_hz,
+        interval,
+        None,
+        stop,
+    )?;
+    Ok((baseband.source_sha256, evidence))
+}
+
+pub(crate) fn probe(root: &Path, args: &ProbeWaveform, stop: &AtomicBool) -> Result<()> {
+    ensure!(
+        args.modulation.is_none() || args.symbol_rate_hz.is_some() || args.search_symbol_rate,
+        "modulation requires a supplied symbol rate or a symbol rate search"
+    );
+    let (baseband, evidence) = read_narrow_measurement(
+        iq::ClipInput::Path(&args.input),
+        args.center_hz,
+        args.target_hz,
+        args.start_sample..args.end_sample,
+        args.expect_sha256.as_deref(),
+        stop,
+    )?;
     let symbol_recovery = args
         .modulation
         .zip(args.symbol_rate_hz)
@@ -181,9 +277,9 @@ pub(crate) fn probe(root: &Path, args: &ProbeWaveform, stop: &AtomicBool) -> Res
                 &baseband.samples,
                 modulation,
                 rate,
-                &phase_lines,
-                phase_order_hint,
-                frequency_plateaus.as_ref(),
+                &evidence.phase_lines,
+                evidence.phase_order_hint,
+                evidence.frequency_plateaus.as_ref(),
                 stop,
             )
         })
@@ -194,9 +290,9 @@ pub(crate) fn probe(root: &Path, args: &ProbeWaveform, stop: &AtomicBool) -> Res
             symbols::estimate(
                 &baseband.samples,
                 args.modulation,
-                &phase_lines,
-                phase_order_hint,
-                frequency_plateaus.as_ref(),
+                &evidence.phase_lines,
+                evidence.phase_order_hint,
+                evidence.frequency_plateaus.as_ref(),
                 stop,
             )
         })
@@ -222,9 +318,7 @@ pub(crate) fn probe(root: &Path, args: &ProbeWaveform, stop: &AtomicBool) -> Res
         filter_cutoff_hz: FILTER_CUTOFF_HZ,
         filter_window: "hamming",
         line_window: "hann",
-        phase_lines,
-        phase_order_hint,
-        frequency_plateaus,
+        evidence,
         symbol_recovery,
         blind_symbol_recovery,
     };
@@ -241,27 +335,83 @@ fn publish_report(
 ) -> Result<PathBuf> {
     check_stop(stop)?;
     let output = root.join(output);
-    let parent = output
-        .parent()
-        .context("waveform output needs a parent directory")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temporary, report)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    check_stop(stop)?;
-    temporary.persist_noclobber(&output).with_context(|| {
-        format!(
-            "publish waveform report without replacing {}",
-            output.display()
-        )
-    })?;
-    File::open(parent)?.sync_all()?;
+    crate::private_output::publish_json_file(&output, report, || check_stop(stop))?;
     Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use sha2::{Digest, Sha256};
+
     use super::*;
+
+    #[test]
+    fn narrow_measurement_matches_the_waveform_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("clip.sc16q11");
+        let output = directory.path().join("waveform.json");
+        let center_hz = 100_000_000;
+        let target_hz = center_hz + 250_000;
+        let start_sample = CLIP_CONTEXT_SAMPLES;
+        let end_sample = start_sample + MIN_INPUT_INTERVAL;
+        let mut raw = Vec::new();
+        let mut state = 17_u32;
+        let mut sign = 1.0;
+        for index in 0..end_sample + CLIP_CONTEXT_SAMPLES {
+            if index.is_multiple_of(256) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                sign = 1.0 - 2.0 * f64::from(state & 1);
+            }
+            let phase =
+                TAU * index as f64 * (target_hz - center_hz) as f64 / f64::from(crate::SAMPLE_RATE);
+            for component in [phase.cos(), phase.sin()] {
+                raw.extend_from_slice(&((600.0 * sign * component).round() as i16).to_le_bytes());
+            }
+        }
+        let expected_sha256 = format!("{:x}", Sha256::digest(&raw));
+        std::fs::write(&input, &raw).unwrap();
+        let stop = AtomicBool::new(false);
+        let evidence = measure_narrow(
+            &input,
+            center_hz,
+            target_hz,
+            start_sample..end_sample,
+            Some(&expected_sha256),
+            &stop,
+        )
+        .unwrap();
+        let (digest, bytes_evidence) =
+            measure_narrow_bytes(raw, center_hz, target_hz, start_sample..end_sample, &stop)
+                .unwrap();
+        assert_eq!(digest, expected_sha256);
+        let evidence = serde_json::to_vec(&evidence).unwrap();
+        assert_eq!(serde_json::to_vec(&bytes_evidence).unwrap(), evidence);
+        let evidence: serde_json::Value = serde_json::from_slice(&evidence).unwrap();
+        assert_eq!(evidence["phase_order_hint"], 2);
+        let args = ProbeWaveform {
+            input,
+            center_hz,
+            target_hz,
+            start_sample,
+            end_sample,
+            expect_sha256: Some(expected_sha256),
+            modulation: None,
+            symbol_rate_hz: None,
+            search_symbol_rate: false,
+            output,
+        };
+        probe(directory.path(), &args, &stop).unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_reader(File::open(&args.output).unwrap()).unwrap();
+        assert_eq!(receipt["schema_version"], 1);
+        for (key, field) in evidence.as_object().unwrap() {
+            assert_eq!(&receipt[key], field);
+        }
+    }
 
     #[test]
     fn phase_order_distinguishes_two_and_four_states_from_a_carrier() {

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod event_replay;
+mod identify_sweep;
 mod input;
 mod orchestrate;
 mod process;
@@ -39,6 +40,10 @@ struct Cli {
 enum Action {
     /// Analyze one complete 20 MSps SC16_Q11 capture without opening a radio.
     Analyze(Analyze),
+    /// Identify supported digital protocols in a saved RF observatory sweep.
+    IdentifySweep(identify_sweep::Args),
+    /// Print exact tuning centers for decoder channels the saved sweep missed.
+    PlanSweepFollowUp(identify_sweep::FollowUpArgs),
     /// Inventory recurring waveform-family bins in one terminal watch report.
     InventoryRecurrence(InventoryRecurrence),
     /// Compare two compatible mixed-center recurrence inventories without opening a radio.
@@ -209,6 +214,24 @@ fn print_error(message: fmt::Arguments<'_>) {
 
 fn run(cli: Cli, stop: &AtomicBool) -> Result<ExitCode> {
     match cli.command {
+        Action::PlanSweepFollowUp(args) => {
+            identify_sweep::print_follow_up(args, stop)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Action::IdentifySweep(args) => {
+            let Some((output, state)) = identify_sweep::run(args, stop)? else {
+                return Ok(ExitCode::SUCCESS);
+            };
+            print_status(format_args!(
+                "Terminal sweep identification: {}\nOverall state: {state:?}",
+                output.join("identification.json").display()
+            ))?;
+            Ok(if state == OverallState::Complete {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
         Action::Analyze(args) => {
             let (output, state) = orchestrate::analyze(
                 orchestrate::Request {

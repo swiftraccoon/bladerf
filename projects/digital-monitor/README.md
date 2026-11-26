@@ -19,6 +19,7 @@ the supported sample rate, bandwidth and tuning.
 
 ## Guides
 
+- [Identify channels in a saved sweep](docs/guide.md#identify-channels-in-a-saved-sweep)
 - [Rolling RX1 monitoring](docs/guide.md#segmented-rx1-monitoring)
 - [Finite RX1 snapshots](docs/guide.md#finite-rx1-monitoring)
 - [Recurring waveform observations](docs/guide.md#inventory-recurring-waveform-family-bins)

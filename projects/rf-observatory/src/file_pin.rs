@@ -1,8 +1,9 @@
 //! Linux regular-file pinning shared by offline verification paths.
 
-use std::fs::File;
+use std::fs::{File, Metadata};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -14,6 +15,17 @@ use anyhow::{Context, ensure};
 use nix::fcntl::{OFlag, open};
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{Mode, SFlag, fstat};
+
+/// Compare the identity, extent and modification stamps of an admitted file.
+pub(crate) fn same_file(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
 
 /// Inspect a final path component without opening the underlying object for I/O,
 /// require a nonempty bounded regular file, then open that pinned inode for

@@ -32,6 +32,50 @@ timestamp precedes stream setup and carries no timing for the first saved sample
 The ordinary capture checks its acquisition deadline before and after each
 read, including the final read. A late read fails before file publication.
 
+## Persistent receive sweeps
+
+The [RF observatory sweep](../../../projects/rf-observatory/docs/guide.md#sweep-a-frequency-range)
+uses `capture-sweep` to run up to 500 strictly increasing integer-hertz centers
+on one open stock-image receiver at 20 MSps. Each dwell can save up to ten
+seconds of IQ. The native command accepts repeated `--center-hz` flags and
+requires `--channel`, `--gain`, `--duration`, and an existing mode-0700 `--output`
+directory. It creates `tune-0001`, `tune-0002`, and so on for each dwell's IQ
+and ordinary metadata sidecar.
+
+`--passes N` repeats that center list on the same open receiver, with up to
+16 passes and 2,000 total dwells. For a repeated capture, tune directories
+are numbered independently inside `pass-0001`, `pass-0002`, and so on. The
+shared timing receipt lists dwell rows in pass order on one host clock.
+
+An ordered sweep supplies `--visit-hz HZ` for every visit in one pass. The
+order can repeat centers and must include every declared `--center-hz`.
+Duration overrides apply each time the center is visited. Tune directories
+and host timing rows follow visit order.
+
+The receive stream is deactivated and closed between dwells. The pinned
+driver disables RX at stream close and configures fresh receive buffers at
+stream setup. Before reading each dwell, the receiver checks the tuning,
+sample rate, bandwidth, gain and planned sample count. There is no extra sample
+discard between dwells. Deactivation or close failure stops the sweep before
+publishing that IQ pair. Retune gaps and radio settling can affect the captured
+samples. [Pinned SoapyBladeRF stream implementation](../../../repos/SoapyBladeRF/bladeRF_Streaming.cpp)
+
+The command stops at the first error or interrupt and preserves completed IQ
+and sidecar pairs. It refuses to replace an existing tune directory.
+
+On Linux GNU, use `--check-continuity --channel 1` with FPGA version 0.16.0
+to require device timestamp adjacency at 20 MSps. The receiver reads an
+adjacent block after the final saved sample before closing and publishing a
+dwell. The `sample_timing` sidecar field records the first sample, exclusive
+end and witness sample count. The times are in device-clock nanoseconds.
+
+After a successful batch, `acquisition-timing.json` records nanosecond offsets
+from one monotonic host clock started before device open. Each row marks tuning,
+file preparation, stream setup, the host read loop, stream closure, and file
+publication. Use the read-start offsets to measure host cadence.
+
+## Timestamped segment capture
+
 On Linux GNU, `capture-segments` records one stock FPGA 0.16.0 RX1 stream at
 20 MSps. By default it tunes to 2437 MHz with 20 MHz bandwidth, discards the
 first two million samples, and records four segments. Set `--bandwidth-hz`

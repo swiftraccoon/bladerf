@@ -1,6 +1,7 @@
 //! Localize relative band-power rises on the original-rate IQ sample grid.
 
 use std::f64::consts::TAU;
+use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -14,14 +15,16 @@ use serde::Serialize;
 
 use crate::SAMPLE_RATE;
 
-use super::{iq, publish_report};
+use super::{check_stop, iq, publish_report};
 
 const MAX_INPUT_SAMPLES: usize = SAMPLE_RATE as usize;
-const WINDOW_SAMPLES: usize = 1024;
+pub(crate) const WINDOW_SAMPLES: usize = 1024;
 const MIN_BASELINE_SAMPLES: usize = 8 * WINDOW_SAMPLES;
-const THRESHOLD_DB: f64 = 6.0;
+pub(crate) const THRESHOLD_DB: f64 = 6.0;
 const MINIMUM_WINDOWS: usize = 2;
 const MAX_BANDS: usize = 8;
+const MAX_PINNED_BANDS: usize = 1_280;
+const MAX_BAND_WINDOWS: usize = 8_000_000;
 
 #[derive(Debug, Args)]
 pub(crate) struct ProbeBursts {
@@ -72,10 +75,28 @@ impl FromStr for BandEdges {
 }
 
 #[derive(Debug, Serialize)]
-struct Detection {
-    start_sample: usize,
-    end_sample_exclusive: usize,
-    peak_excess_db: f64,
+pub(crate) struct Detection {
+    pub(crate) start_sample: usize,
+    pub(crate) end_sample_exclusive: usize,
+    pub(crate) peak_excess_db: f64,
+}
+
+/// Evidence from the selected prefix of a pinned IQ file.
+pub(crate) struct Measurement {
+    /// Number of samples included in the digest, including a partial final window.
+    pub(crate) analyzed_samples: usize,
+    pub(crate) iq_sha256: String,
+    /// Results in the order the caller supplied the bands.
+    pub(crate) bands: Vec<MeasuredBand>,
+}
+
+/// Results for a half-open band integrated on the shared FFT grid.
+pub(crate) struct MeasuredBand {
+    pub(crate) baseline_band_power: f64,
+    pub(crate) integrated_fft_bins: usize,
+    pub(crate) detections: Vec<Detection>,
+    /// One threshold result per complete window. A zero baseline gives no hits.
+    pub(crate) above_threshold: Vec<bool>,
 }
 
 #[derive(Serialize)]
@@ -127,16 +148,20 @@ fn median_power(windows: &[f64]) -> f64 {
 
 fn above_threshold_windows(search: &[f64], baseline: f64) -> String {
     let mut bytes = vec![0; search.len().div_ceil(8)];
-    if baseline > 0.0 {
-        let threshold = burst_threshold(baseline);
-        // The first search window is the low bit of the first byte.
-        for (index, &power) in search.iter().enumerate() {
-            if power >= threshold {
-                bytes[index / 8] |= 1 << (index % 8);
-            }
+    // The first search window is the low bit of the first byte.
+    for (index, hit) in threshold_windows(search, baseline).enumerate() {
+        if hit {
+            bytes[index / 8] |= 1 << (index % 8);
         }
     }
     HEXLOWER.encode(&bytes)
+}
+
+fn threshold_windows(search: &[f64], baseline: f64) -> impl Iterator<Item = bool> + '_ {
+    let threshold = burst_threshold(baseline);
+    search
+        .iter()
+        .map(move |&power| baseline > 0.0 && power >= threshold)
 }
 
 fn band_bins(center_hz: u64, lower_hz: u64, upper_hz: u64) -> Result<Range<usize>> {
@@ -163,6 +188,7 @@ fn band_bins(center_hz: u64, lower_hz: u64, upper_hz: u64) -> Result<Range<usize
 
 fn band_powers(
     input: iq::SavedIq,
+    samples: usize,
     bands: &[Range<usize>],
     stop: &AtomicBool,
 ) -> Result<(Vec<Vec<f64>>, String)> {
@@ -176,9 +202,12 @@ fn band_powers(
     let norm = (hann_sum * 2048.0).powi(2);
     let mut powers: Vec<_> = bands
         .iter()
-        .map(|_| Vec::with_capacity(input.source_samples() / WINDOW_SAMPLES))
+        .map(|_| Vec::with_capacity(samples / WINDOW_SAMPLES))
         .collect();
-    let source_sha256 = input.read_windows::<WINDOW_SAMPLES>(stop, |window| {
+    // Cache squared magnitudes when overlapping bands would compute more than
+    // a full spectrum's worth per window. Each band still sums its own bins.
+    let cache_magnitudes = bands.iter().map(Range::len).sum::<usize>() > WINDOW_SAMPLES;
+    let source_sha256 = input.read_windows::<WINDOW_SAMPLES>(samples, stop, |window| {
         let mean: Complex<f64> = window
             .iter()
             .zip(hann.iter())
@@ -189,11 +218,14 @@ fn band_powers(
             *value = (sample - mean) * weight;
         }
         transform.process_with_scratch(&mut buffer, &mut scratch);
+        let bin_power = |bin: usize| buffer[(bin + WINDOW_SAMPLES / 2) % WINDOW_SAMPLES].norm_sqr();
+        let magnitudes: Option<[f64; WINDOW_SAMPLES]> =
+            cache_magnitudes.then(|| std::array::from_fn(bin_power));
         for (bins, powers) in bands.iter().zip(&mut powers) {
-            let power: f64 = bins
-                .clone()
-                .map(|bin| buffer[(bin + WINDOW_SAMPLES / 2) % WINDOW_SAMPLES].norm_sqr())
-                .sum();
+            let power: f64 = match &magnitudes {
+                Some(values) => values[bins.clone()].iter().sum(),
+                None => bins.clone().map(bin_power).sum(),
+            };
             powers.push(power / norm);
         }
     })?;
@@ -237,6 +269,69 @@ fn detections(search: &[f64], first_sample: usize, baseline: f64) -> Vec<Detecti
     runs
 }
 
+/// Measure overlapping half-open RF bands in one pass over a pinned IQ prefix.
+///
+/// The median of each band's complete windows supplies its baseline. The digest
+/// covers the selected prefix, including any partial final window. The shared
+/// file cursor is rewound before reading. Measurements use at most 1,280 bands,
+/// 20 million selected samples and eight million band-window combinations.
+///
+/// # Errors
+///
+/// Returns an error for interrupted, unreadable, changed or invalid IQ, an
+/// invalid band, a budget overrun or fewer than two complete windows.
+pub(crate) fn measure_pinned(
+    file: &File,
+    center_hz: u64,
+    bands: &[Range<u64>],
+    sample_limit: usize,
+    stop: &AtomicBool,
+) -> Result<Measurement> {
+    ensure!(
+        (1..=MAX_PINNED_BANDS).contains(&bands.len()),
+        "pinned burst probe requires 1 through {MAX_PINNED_BANDS} bands"
+    );
+    ensure!(
+        (1..=MAX_INPUT_SAMPLES).contains(&sample_limit),
+        "pinned burst prefix must select 1 through {MAX_INPUT_SAMPLES} samples"
+    );
+    let bins = bands
+        .iter()
+        .map(|band| band_bins(center_hz, band.start, band.end))
+        .collect::<Result<Vec<_>>>()?;
+    let input = iq::SavedIq::from_pinned(file, crate::MAX_SAMPLES as usize, stop)?;
+    let analyzed_samples = input.source_samples().min(sample_limit);
+    let windows = analyzed_samples / WINDOW_SAMPLES;
+    ensure!(
+        windows >= MINIMUM_WINDOWS,
+        "burst search requires at least {MINIMUM_WINDOWS} complete windows"
+    );
+    ensure!(
+        windows * bands.len() <= MAX_BAND_WINDOWS,
+        "pinned burst probe exceeds the {MAX_BAND_WINDOWS}-band-window budget"
+    );
+    let (powers, iq_sha256) = band_powers(input, analyzed_samples, &bins, stop)?;
+    let bands = bins
+        .into_iter()
+        .zip(powers)
+        .map(|(bins, powers)| {
+            check_stop(stop)?;
+            let baseline = median_power(&powers);
+            Ok(MeasuredBand {
+                baseline_band_power: baseline,
+                integrated_fft_bins: bins.len(),
+                detections: detections(&powers, 0, baseline),
+                above_threshold: threshold_windows(&powers, baseline).collect(),
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(Measurement {
+        analyzed_samples,
+        iq_sha256,
+        bands,
+    })
+}
+
 pub(crate) fn probe(root: &Path, args: &ProbeBursts, stop: &AtomicBool) -> Result<()> {
     ensure!(
         args.also_band_hz.len() < MAX_BANDS,
@@ -274,7 +369,7 @@ pub(crate) fn probe(root: &Path, args: &ProbeBursts, stop: &AtomicBool) -> Resul
         analyzed_samples.saturating_sub(search_start) >= MINIMUM_WINDOWS * WINDOW_SAMPLES,
         "burst search requires at least {MINIMUM_WINDOWS} complete windows"
     );
-    let (powers, source_sha256) = band_powers(input, &bins, stop)?;
+    let (powers, source_sha256) = band_powers(input, source_samples, &bins, stop)?;
     if let Some(expected) = &args.expect_sha256 {
         ensure!(
             *expected == source_sha256,
@@ -331,6 +426,7 @@ pub(crate) fn probe(root: &Path, args: &ProbeBursts, stop: &AtomicBool) -> Resul
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Seek, SeekFrom};
 
     use sha2::{Digest, Sha256};
 
@@ -350,6 +446,53 @@ mod tests {
         );
         assert!(band_bins(CENTER_HZ, CENTER_HZ + 1_250_001, CENTER_HZ + 1_269_531).is_err());
         assert!(band_bins(CENTER_HZ, CENTER_HZ - 10_000_001, CENTER_HZ).is_err());
+    }
+
+    #[test]
+    fn pinned_bands_share_windows_and_hash_only_the_selected_prefix() {
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let mut raw = Vec::new();
+        let selected = 5 * WINDOW_SAMPLES + 7;
+        for index in 0..6 * WINDOW_SAMPLES {
+            let amp = if matches!(index / WINDOW_SAMPLES, 2 | 3) {
+                64.0
+            } else {
+                8.0
+            };
+            let sample = Complex::from_polar(amp, TAU * (index % 16) as f64 / 16.0);
+            raw.extend((sample.re.round() as i16).to_le_bytes());
+            raw.extend((sample.im.round() as i16).to_le_bytes());
+        }
+        raw[4 * selected..4 * selected + 2].copy_from_slice(&2048_i16.to_le_bytes());
+        fs::write(input.path(), &raw).unwrap();
+        let mut file = File::open(input.path()).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+
+        let result = measure_pinned(
+            &file,
+            CENTER_HZ,
+            &[
+                CENTER_HZ + 1_250_000..CENTER_HZ + 1_260_000,
+                CENTER_HZ + 1_240_000..CENTER_HZ + 1_270_000,
+            ],
+            selected,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.analyzed_samples, selected);
+        assert_eq!(file.stream_position().unwrap(), (4 * selected) as u64);
+        assert_eq!(
+            result.iq_sha256,
+            format!("{:x}", Sha256::digest(&raw[..4 * selected]))
+        );
+        for (band, bins) in result.bands.iter().zip([1, 2]) {
+            assert!(band.baseline_band_power > 0.0);
+            assert_eq!(band.integrated_fft_bins, bins);
+            assert_eq!(band.above_threshold, [false, false, true, true, false]);
+            assert_eq!(band.detections.len(), 1);
+            assert_eq!(band.detections[0].start_sample, 2 * WINDOW_SAMPLES);
+            assert_eq!(band.detections[0].end_sample_exclusive, 4 * WINDOW_SAMPLES);
+        }
     }
 
     #[test]

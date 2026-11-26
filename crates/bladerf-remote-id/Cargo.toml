@@ -1,0 +1,13 @@
+[package]
+name = "bladerf-remote-id"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Bounded observations of OpenDroneID Basic ID broadcasts"
+
+[dependencies]
+serde = "1"
+
+[dev-dependencies]
+serde_json = "1"
